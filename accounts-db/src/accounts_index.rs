@@ -1223,7 +1223,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             .filter_map(|i|
                 match i  {
                     AccountIndex::Custom(program_address, offset, length) => {
-                        if program_address == account_owner {
+                        if account_data.len() >= offset + length && program_address == account_owner {
                             Some((program_address, offset, length))
                         } else {
                             None
