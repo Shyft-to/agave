@@ -1237,7 +1237,6 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         for (_, offset, length) in custom_indexes {
             let key = bytemuck::from_bytes(&account_data[*offset..*offset+length]);
             self.custom_index.insert(key, pubkey);
-            info!("custom secondary index insert: {:?}, {:?}", key, pubkey);
         }
     }
 
