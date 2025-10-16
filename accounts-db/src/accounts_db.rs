@@ -3703,6 +3703,7 @@ impl AccountsDb {
             IndexKey::ProgramId(key) => key,
             IndexKey::SplTokenMint(key) => key,
             IndexKey::SplTokenOwner(key) => key,
+            IndexKey::Custom(key) => key,
         };
         if !self.account_indexes.include_key(key) {
             // the requested key was not indexed in the secondary index, so do a normal scan

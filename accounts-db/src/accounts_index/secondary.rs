@@ -45,6 +45,7 @@ pub enum AccountIndex {
     ProgramId,
     SplTokenMint,
     SplTokenOwner,
+    Custom(Pubkey, usize, usize), // Program, offset, length
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +53,8 @@ pub enum IndexKey {
     ProgramId(Pubkey),
     SplTokenMint(Pubkey),
     SplTokenOwner(Pubkey),
+    // TODO: add program
+    Custom(Pubkey), // Owner
 }
 
 // The only cases where an inner key should map to a different outer key is

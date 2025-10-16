@@ -294,6 +294,7 @@ pub struct AccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub account_maps: Box<[Arc<InMemAccountsIndex<T, U>>]>,
     pub bin_calculator: PubkeyBinCalculator24,
     program_id_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
+    custom_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     spl_token_mint_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     spl_token_owner_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     pub roots_tracker: RwLock<RootsTracker>,
@@ -341,6 +342,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             bin_calculator,
             program_id_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
                 "program_id_index_stats",
+            ),
+            custom_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
+                "custom_index_stats",
             ),
             spl_token_mint_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
                 "spl_token_mint_index_stats",
@@ -646,6 +650,17 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                     func,
                     &self.spl_token_owner_index,
                     &owner_key,
+                    Some(max_root),
+                    config,
+                );
+            }
+            ScanTypes::Indexed(IndexKey::Custom(key)) => {
+                info!("Looking in custom index for key: {:?}", key);
+                self.do_scan_secondary_index(
+                    ancestors,
+                    func,
+                    &self.custom_index,
+                    &key,
                     Some(max_root),
                     config,
                 );
@@ -1198,9 +1213,38 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         }
     }
 
+    fn update_custom_secondary_indexes(&self,
+        pubkey: &Pubkey,
+        account_owner: &Pubkey,
+        account_data: &[u8],
+        account_indexes: &AccountSecondaryIndexes,
+    ) {
+        let custom_indexes = account_indexes.indexes.iter()
+            .filter_map(|i|
+                match i  {
+                    AccountIndex::Custom(program_address, offset, length) => {
+                        if program_address == account_owner {
+                            Some((program_address, offset, length))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None
+                }
+            );
+
+
+        for (_, offset, length) in custom_indexes {
+            let key = bytemuck::from_bytes(&account_data[*offset..*offset+length]);
+            self.custom_index.insert(key, pubkey);
+            info!("custom secondary index insert: {:?}, {:?}", key, pubkey);
+        }
+    }
+
     pub fn get_index_key_size(&self, index: &AccountIndex, index_key: &Pubkey) -> Option<usize> {
         match index {
             AccountIndex::ProgramId => self.program_id_index.index.get(index_key).map(|x| x.len()),
+            AccountIndex::Custom(_, _, _) => self.custom_index.index.get(index_key).map(|x| x.len()),
             AccountIndex::SplTokenOwner => self
                 .spl_token_owner_index
                 .index
@@ -1248,6 +1292,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         {
             self.program_id_index.insert(account_owner, pubkey);
         }
+
+        self.update_custom_secondary_indexes(pubkey, account_owner, account_data, account_indexes);
+
         // Note because of the below check below on the account data length, when an
         // account hits zero lamports and is reset to AccountSharedData::Default, then we skip
         // the below updates to the secondary indexes.
@@ -1469,17 +1516,15 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         inner_key: &Pubkey,
         account_indexes: &AccountSecondaryIndexes,
     ) {
-        if account_indexes.contains(&AccountIndex::ProgramId) {
-            self.program_id_index.remove_by_inner_key(inner_key);
+        for index in account_indexes.indexes.iter() {
+            match index {
+                AccountIndex::ProgramId => self.program_id_index.remove_by_inner_key(inner_key),
+                AccountIndex::SplTokenOwner => self.spl_token_owner_index.remove_by_inner_key(inner_key),
+                AccountIndex::SplTokenMint => self.spl_token_mint_index.remove_by_inner_key(inner_key),
+                AccountIndex::Custom(_,_,_) => self.custom_index.remove_by_inner_key(inner_key),
+            } 
         }
-
-        if account_indexes.contains(&AccountIndex::SplTokenOwner) {
-            self.spl_token_owner_index.remove_by_inner_key(inner_key);
-        }
-
-        if account_indexes.contains(&AccountIndex::SplTokenMint) {
-            self.spl_token_mint_index.remove_by_inner_key(inner_key);
-        }
+             
     }
 
     /// Returns true if the slot list was completely purged (is empty at the end).
