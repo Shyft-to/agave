@@ -194,7 +194,7 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
         }
 
         if self.stats.last_report.should_update(1000) {
-            let mut index_size = self.index.iter().fold(0, |acc, e| {
+            let index_size = self.index.iter().fold(0, |acc, e| {
                 acc + 32 + (e.value().len() * 32)
             }) + self.reverse_index.iter().fold(0, |acc, e| {
                 acc + 32 + e.value().read().map(|v| v.len() * 32).unwrap_or(0)
