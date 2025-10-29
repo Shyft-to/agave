@@ -207,6 +207,7 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
                     self.reverse_index.len() as i64,
                     i64
                 ),
+                ("index_mem_size", size_of_val(&self), usize),
             );
         }
     }
