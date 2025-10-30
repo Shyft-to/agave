@@ -45,7 +45,7 @@ pub enum AccountIndex {
     ProgramId,
     SplTokenMint,
     SplTokenOwner,
-    Custom(Pubkey, usize, usize), // Program, offset, length
+    Custom(Pubkey, usize), // Program, offset
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,8 +53,7 @@ pub enum IndexKey {
     ProgramId(Pubkey),
     SplTokenMint(Pubkey),
     SplTokenOwner(Pubkey),
-    // TODO: add program
-    Custom(Pubkey), // Owner
+    Custom((Pubkey, usize), Pubkey), // (Program, offset), key
 }
 
 // The only cases where an inner key should map to a different outer key is
@@ -209,7 +208,7 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
                     i64
                 ),
             );
-            if self.stats.last_mem_report.should_update(20000) {
+            if self.stats.last_mem_report.should_update(300000) {
                 let index_size = self.index.iter().fold(0, |acc, e| {
                     acc + 32 + (e.value().len() * 32)
                 }) + self.reverse_index.iter().fold(0, |acc, e| {

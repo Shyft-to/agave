@@ -859,7 +859,7 @@ fn rpc_account_index_from_account_index(account_index: &AccountIndex) -> RpcAcco
         AccountIndex::ProgramId => RpcAccountIndex::ProgramId,
         AccountIndex::SplTokenOwner => RpcAccountIndex::SplTokenOwner,
         AccountIndex::SplTokenMint => RpcAccountIndex::SplTokenMint,
-        AccountIndex::Custom(_,_,_) => RpcAccountIndex::ProgramId,
+        AccountIndex::Custom(_,_) => RpcAccountIndex::ProgramId,
     }
 }
 

@@ -1263,7 +1263,7 @@ impl AccountsDb {
         exit: Arc<AtomicBool>,
     ) -> Self {
         let accounts_index_config = accounts_db_config.index.unwrap_or_default();
-        let accounts_index = AccountsIndex::new(&accounts_index_config, exit);
+        let accounts_index = AccountsIndex::new(&accounts_index_config, accounts_db_config.account_indexes.as_ref(), exit);
 
         let base_working_path = accounts_db_config.base_working_path.clone();
         let (base_working_path, base_working_temp_dir) =
@@ -3703,7 +3703,7 @@ impl AccountsDb {
             IndexKey::ProgramId(key) => key,
             IndexKey::SplTokenMint(key) => key,
             IndexKey::SplTokenOwner(key) => key,
-            IndexKey::Custom(key) => key,
+            IndexKey::Custom(_, key) => key,
         };
         if !self.account_indexes.include_key(key) {
             // the requested key was not indexed in the secondary index, so do a normal scan

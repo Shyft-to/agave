@@ -79,8 +79,7 @@ fn main() {
                     let mut v = s.split("-").skip(1);
                     let key = v.next().map(|k| { println!("key to parse: {}", k);  Pubkey::from_str_const(k)}).expect("ProgramID for custom index not found, expected value custom-pid-offset-length format");
                     let offset = v.next().and_then(|o| o.parse::<usize>().ok()).expect("Offset of data for custom index not found, expected value custom-pid-offset-length format");
-                    let length = v.next().and_then(|l| l.parse::<usize>().ok()).expect("Length of data for custom index not found, expected value custom-pid-offset-length format");
-                    AccountIndex::Custom(key, offset, length)
+                    AccountIndex::Custom(key, offset)
                 } else {
                     unreachable!()
                 }
