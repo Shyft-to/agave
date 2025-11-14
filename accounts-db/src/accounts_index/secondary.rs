@@ -17,6 +17,7 @@ use {
 pub struct AccountSecondaryIndexes {
     pub keys: Option<AccountSecondaryIndexesIncludeExclude>,
     pub indexes: HashSet<AccountIndex>,
+    pub custom_indexes: HashSet<AccountIndex>,
 }
 
 impl AccountSecondaryIndexes {

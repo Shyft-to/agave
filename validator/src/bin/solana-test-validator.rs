@@ -90,6 +90,7 @@ fn main() {
     let account_indexes = AccountSecondaryIndexes {
         keys: None,
         indexes,
+        custom_indexes: HashSet::new(),
     };
 
     if !ledger_path.exists() {

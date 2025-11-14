@@ -802,21 +802,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             if config.is_aborted() {
                 break;
             }
-            let account_fetch_timer = Measure::start("accountfetch");
-
             self.get_with_and_then(
                 &pubkey,
                 Some(ancestors),
                 max_root,
                 true,
-                |(slot, account_info)| {
-                    info!("Account fetch time: {}", account_fetch_timer.end_as_us());
-                    let callback_exe_timer = Measure::start("accountcallback");
-                    let result = func(&pubkey, (&account_info, slot));
-                    info!("Callback exe time: {}", callback_exe_timer.end_as_us());
-
-                    return result;
-                },
+                |(slot, account_info)| func(&pubkey, (&account_info, slot)),
             );
         }
     }
@@ -1830,6 +1821,7 @@ pub mod tests {
         account_indexes.insert(AccountIndex::SplTokenMint);
         AccountSecondaryIndexes {
             indexes: account_indexes,
+            custom_indexes: HashSet::new(),
             keys: None,
         }
     }
@@ -1839,6 +1831,7 @@ pub mod tests {
         account_indexes.insert(AccountIndex::SplTokenOwner);
         AccountSecondaryIndexes {
             indexes: account_indexes,
+            custom_indexes: HashSet::new(),
             keys: None,
         }
     }
