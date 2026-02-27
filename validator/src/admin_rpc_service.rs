@@ -462,7 +462,7 @@ impl AdminRpc for AdminRpcImpl {
 
     fn set_log_filter(&self, filter: String) -> Result<()> {
         debug!("set_log_filter admin rpc request received");
-        solana_logger::setup_with(&filter);
+        agave_logger::setup_with(&filter);
         Ok(())
     }
 
@@ -786,7 +786,7 @@ impl AdminRpc for AdminRpcImpl {
             };
 
             banking_stage
-                .spawn_threads(
+                .spawn_internal_threads(
                     block_production_method,
                     num_workers,
                     SchedulerConfig { scheduler_pacing },

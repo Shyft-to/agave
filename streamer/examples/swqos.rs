@@ -15,7 +15,8 @@ use {
     solana_net_utils::sockets::{bind_to_with_config, SocketConfiguration},
     solana_pubkey::Pubkey,
     solana_streamer::{
-        nonblocking::quic::SpawnNonBlockingServerResult, quic::QuicServerParams,
+        nonblocking::{quic::SpawnNonBlockingServerResult, swqos::SwQosConfig},
+        quic::QuicStreamerConfig,
         streamer::StakedNodes,
     },
     std::{
@@ -72,7 +73,7 @@ struct Cli {
     #[arg(short, long, default_value = "0.0.0.0:8008")]
     bind_to: SocketAddr,
 
-    #[arg(short, long, default_value = "./results/serverlog.bin")]
+    #[arg(short, long, default_value = "serverlog.bin")]
     log_file: String,
 
     #[arg(short, long, value_parser = parse_duration)]
@@ -85,7 +86,7 @@ struct Cli {
 // number of threads as in fn default_num_tpu_transaction_forward_receive_threads
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> anyhow::Result<()> {
-    solana_logger::setup();
+    agave_logger::setup();
     let cli = Cli::parse();
     let socket = bind_to_with_config(
         cli.bind_to.ip(),
@@ -117,10 +118,11 @@ async fn main() -> anyhow::Result<()> {
         &keypair,
         sender,
         staked_nodes,
-        QuicServerParams {
+        QuicStreamerConfig {
             max_connections_per_peer: cli.max_connections_per_peer,
-            ..QuicServerParams::default()
+            ..QuicStreamerConfig::default()
         },
+        SwQosConfig::default(),
         cancel.clone(),
     )?;
     info!("Server listening on {}", socket.local_addr()?);
@@ -153,13 +155,25 @@ async fn main() -> anyhow::Result<()> {
         logfile.flush()?;
         Ok(())
     });
-
-    sleep(cli.test_duration).await;
+    // wait for test to finish, report errors early if they occur
+    let status = tokio::select! {
+        _ = sleep(cli.test_duration)=>{
+            info!("Test duration expired");
+            Ok(())
+        },
+        _ = run_thread => {
+            Err(anyhow::anyhow!("Server thread exited too early"))
+        },
+        v = logger_thread => {
+            match v {
+                Ok(Err(v))=>Err(v.context("Logger thread error")),
+                _=>Err(anyhow::anyhow!("Logger thread exited too early"))
+            }
+        }
+    };
     info!("Server terminating");
     cancel.cancel();
     drop(endpoints);
-    run_thread.await?;
-    logger_thread.await??;
     stats.report("final_stats");
-    Ok(())
+    status
 }

@@ -60,6 +60,12 @@ type Error = Box<dyn std::error::Error>;
 const SUCCESS: u64 = 0;
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
+///SIMD-0339 based calculation of AccountInfo translation byte size. Fixed size of **80 bytes** for each AccountInfo broken down as:
+/// - 32 bytes for account address
+/// - 32 bytes for owner address
+/// - 8 bytes for lamport balance
+/// - 8 bytes for data length
+const ACCOUNT_INFO_BYTE_SIZE: usize = 80;
 
 /// Rust representation of C's SolInstruction
 #[derive(Debug)]
@@ -114,6 +120,8 @@ struct SolSignerSeedsC {
 
 /// Maximum number of account info structs that can be used in a single CPI invocation
 const MAX_CPI_ACCOUNT_INFOS: usize = 128;
+/// Maximum number of account info structs that can be used in a single CPI invocation with SIMD-0339 active
+const MAX_CPI_ACCOUNT_INFOS_SIMD_0339: usize = 255;
 
 /// Check that an account info pointer field points to the expected address
 fn check_account_info_pointer(
@@ -158,6 +166,11 @@ fn check_account_infos(
     invoke_context: &mut InvokeContext,
 ) -> Result<(), Error> {
     let max_cpi_account_infos = if invoke_context
+        .get_feature_set()
+        .increase_cpi_account_info_limit
+    {
+        MAX_CPI_ACCOUNT_INFOS_SIMD_0339
+    } else if invoke_context
         .get_feature_set()
         .increase_tx_account_lock_limit
     {
@@ -370,8 +383,6 @@ impl<'a> CallerAccount<'a> {
                     return Err(Box::new(CpiError::InvalidPointer));
                 }
             }
-            let ref_to_len_in_vm =
-                translate_type_mut_for_cpi::<u64>(memory_mapping, vm_len_addr, false)?;
             let vm_data_addr = data.as_ptr() as u64;
             let serialized_data = CallerAccount::get_serialized_data(
                 memory_mapping,
@@ -380,6 +391,8 @@ impl<'a> CallerAccount<'a> {
                 stricter_abi_and_runtime_constraints,
                 account_data_direct_mapping,
             )?;
+            let ref_to_len_in_vm =
+                translate_type_mut_for_cpi::<u64>(memory_mapping, vm_len_addr, false)?;
             (serialized_data, vm_data_addr, ref_to_len_in_vm)
         };
 
@@ -531,17 +544,29 @@ pub fn translate_instruction_rust(
         ix.data.as_vaddr(),
         ix.data.len(),
         check_aligned,
-    )?
-    .to_vec();
+    )?;
 
     check_instruction_size(account_metas.len(), data.len())?;
 
-    consume_compute_meter(
-        invoke_context,
-        (data.len() as u64)
-            .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
-            .unwrap_or(u64::MAX),
-    )?;
+    let mut total_cu_translation_cost: u64 = (data.len() as u64)
+        .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+        .unwrap_or(u64::MAX);
+
+    if invoke_context
+        .get_feature_set()
+        .increase_cpi_account_info_limit
+    {
+        // Each account meta is 34 bytes (32 for pubkey, 1 for is_signer, 1 for is_writable)
+        let account_meta_translation_cost =
+            (account_metas.len().saturating_mul(size_of::<AccountMeta>()) as u64)
+                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX);
+
+        total_cu_translation_cost =
+            total_cu_translation_cost.saturating_add(account_meta_translation_cost);
+    }
+
+    consume_compute_meter(invoke_context, total_cu_translation_cost)?;
 
     let mut accounts = Vec::with_capacity(account_metas.len());
     #[allow(clippy::needless_range_loop)]
@@ -559,7 +584,7 @@ pub fn translate_instruction_rust(
 
     Ok(Instruction {
         accounts,
-        data,
+        data: data.to_vec(),
         program_id: ix.program_id,
     })
 }
@@ -580,7 +605,7 @@ pub fn translate_accounts_rust<'a>(
         check_aligned,
     )?;
 
-    translate_and_update_accounts(
+    translate_accounts_common(
         &account_info_keys,
         account_infos,
         account_infos_addr,
@@ -650,17 +675,30 @@ pub fn translate_instruction_c(
         ix_c.accounts_len,
         check_aligned,
     )?;
-    let data = translate_slice::<u8>(memory_mapping, ix_c.data_addr, ix_c.data_len, check_aligned)?
-        .to_vec();
+    let data = translate_slice::<u8>(memory_mapping, ix_c.data_addr, ix_c.data_len, check_aligned)?;
 
     check_instruction_size(ix_c.accounts_len as usize, data.len())?;
 
-    consume_compute_meter(
-        invoke_context,
-        (data.len() as u64)
-            .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
-            .unwrap_or(u64::MAX),
-    )?;
+    let mut total_cu_translation_cost: u64 = (data.len() as u64)
+        .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+        .unwrap_or(u64::MAX);
+
+    if invoke_context
+        .get_feature_set()
+        .increase_cpi_account_info_limit
+    {
+        // Each account meta is 34 bytes (32 for pubkey, 1 for is_signer, 1 for is_writable)
+        let account_meta_translation_cost = (ix_c
+            .accounts_len
+            .saturating_mul(size_of::<AccountMeta>() as u64))
+        .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+        .unwrap_or(u64::MAX);
+
+        total_cu_translation_cost =
+            total_cu_translation_cost.saturating_add(account_meta_translation_cost);
+    }
+
+    consume_compute_meter(invoke_context, total_cu_translation_cost)?;
 
     let mut accounts = Vec::with_capacity(ix_c.accounts_len as usize);
     #[allow(clippy::needless_range_loop)]
@@ -684,7 +722,7 @@ pub fn translate_instruction_c(
 
     Ok(Instruction {
         accounts,
-        data,
+        data: data.to_vec(),
         program_id: *program_id,
     })
 }
@@ -705,7 +743,7 @@ pub fn translate_accounts_c<'a>(
         check_aligned,
     )?;
 
-    translate_and_update_accounts(
+    translate_accounts_common(
         &account_info_keys,
         account_infos,
         account_infos_addr,
@@ -770,8 +808,6 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
     signers_seeds_len: u64,
     memory_mapping: &mut MemoryMapping,
 ) -> Result<u64, Error> {
-    let check_aligned = invoke_context.get_check_aligned();
-
     // CPI entry.
     //
     // Translate the inputs to the syscall and synchronize the caller's account
@@ -784,6 +820,11 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
         execute_time.stop();
         invoke_context.timings.execute_us += execute_time.as_us();
     }
+    let stricter_abi_and_runtime_constraints = invoke_context
+        .get_feature_set()
+        .stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
+    let check_aligned = invoke_context.get_check_aligned();
 
     let instruction = S::translate_instruction(
         instruction_addr,
@@ -812,6 +853,29 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
         check_aligned,
     )?;
 
+    if stricter_abi_and_runtime_constraints {
+        // before initiating CPI, the caller may have modified the
+        // account (caller_account). We need to update the corresponding
+        // BorrowedAccount (callee_account) so the callee can see the
+        // changes.
+        let transaction_context = &invoke_context.transaction_context;
+        let instruction_context = transaction_context.get_current_instruction_context()?;
+        for translated_account in accounts.iter_mut() {
+            let callee_account = instruction_context
+                .try_borrow_instruction_account(translated_account.index_in_caller)?;
+            let update_caller = update_callee_account(
+                memory_mapping,
+                check_aligned,
+                &translated_account.caller_account,
+                callee_account,
+                stricter_abi_and_runtime_constraints,
+                account_data_direct_mapping,
+            )?;
+            translated_account.update_caller_account_region =
+                translated_account.update_caller_account_info || update_caller;
+        }
+    }
+
     // Process the callee instruction
     let mut compute_units_consumed = 0;
     invoke_context
@@ -824,20 +888,15 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
     // CPI exit.
     //
     // Synchronize the callee's account changes so the caller can see them.
-    let stricter_abi_and_runtime_constraints = invoke_context
-        .get_feature_set()
-        .stricter_abi_and_runtime_constraints;
-    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
-
-    for translate_account in accounts.iter_mut() {
+    for translated_account in accounts.iter_mut() {
         let mut callee_account = instruction_context
-            .try_borrow_instruction_account(translate_account.index_in_caller)?;
-        if translate_account.update_caller_account_info {
+            .try_borrow_instruction_account(translated_account.index_in_caller)?;
+        if translated_account.update_caller_account_info {
             update_caller_account(
                 invoke_context,
                 memory_mapping,
                 check_aligned,
-                &mut translate_account.caller_account,
+                &mut translated_account.caller_account,
                 &mut callee_account,
                 stricter_abi_and_runtime_constraints,
                 account_data_direct_mapping,
@@ -846,14 +905,14 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
     }
 
     if stricter_abi_and_runtime_constraints {
-        for translate_account in accounts.iter() {
+        for translated_account in accounts.iter() {
             let mut callee_account = instruction_context
-                .try_borrow_instruction_account(translate_account.index_in_caller)?;
-            if translate_account.update_caller_account_region {
+                .try_borrow_instruction_account(translated_account.index_in_caller)?;
+            if translated_account.update_caller_account_region {
                 update_caller_account_region(
                     memory_mapping,
                     check_aligned,
-                    &translate_account.caller_account,
+                    &translated_account.caller_account,
                     &mut callee_account,
                     account_data_direct_mapping,
                 )?;
@@ -906,6 +965,21 @@ where
         check_aligned,
     )?;
     check_account_infos(account_infos.len(), invoke_context)?;
+
+    if invoke_context
+        .get_feature_set()
+        .increase_cpi_account_info_limit
+    {
+        let account_infos_bytes = account_infos.len().saturating_mul(ACCOUNT_INFO_BYTE_SIZE);
+
+        consume_compute_meter(
+            invoke_context,
+            (account_infos_bytes as u64)
+                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX),
+        )?;
+    }
+
     let mut account_info_keys = Vec::with_capacity(account_infos_len as usize);
     #[allow(clippy::needless_range_loop)]
     for account_index in 0..account_infos_len as usize {
@@ -920,9 +994,8 @@ where
     Ok((account_infos, account_info_keys))
 }
 
-// Finish translating accounts, build CallerAccount values and update callee
-// accounts in preparation of executing the callee.
-fn translate_and_update_accounts<'a, T, F>(
+// Finish translating accounts and build TranslatedAccount from CallerAccount.
+fn translate_accounts_common<'a, T, F>(
     account_info_keys: &[&Pubkey],
     account_infos: &[T],
     account_infos_addr: u64,
@@ -1017,17 +1090,22 @@ where
                     serialized_metadata,
                 )?;
 
-            // before initiating CPI, the caller may have modified the
-            // account (caller_account). We need to update the corresponding
-            // BorrowedAccount (callee_account) so the callee can see the
-            // changes.
-            let update_caller = update_callee_account(
-                check_aligned,
-                &caller_account,
-                callee_account,
-                stricter_abi_and_runtime_constraints,
-                account_data_direct_mapping,
-            )?;
+            let update_caller = if stricter_abi_and_runtime_constraints {
+                true
+            } else {
+                // before initiating CPI, the caller may have modified the
+                // account (caller_account). We need to update the corresponding
+                // BorrowedAccount (callee_account) so the callee can see the
+                // changes.
+                update_callee_account(
+                    memory_mapping,
+                    check_aligned,
+                    &caller_account,
+                    callee_account,
+                    stricter_abi_and_runtime_constraints,
+                    account_data_direct_mapping,
+                )?
+            };
 
             accounts.push(TranslatedAccount {
                 index_in_caller,
@@ -1065,9 +1143,10 @@ fn consume_compute_meter(invoke_context: &InvokeContext, amount: u64) -> Result<
 // When true is returned, the caller account must be updated after CPI. This
 // is only set for stricter_abi_and_runtime_constraints when the pointer may have changed.
 fn update_callee_account(
+    memory_mapping: &MemoryMapping,
     check_aligned: bool,
     caller_account: &CallerAccount,
-    mut callee_account: BorrowedInstructionAccount<'_>,
+    mut callee_account: BorrowedInstructionAccount<'_, '_>,
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
 ) -> Result<bool, Error> {
@@ -1091,6 +1170,21 @@ fn update_callee_account(
             };
             if post_len > address_space_reserved_for_account {
                 return Err(InstructionError::InvalidRealloc.into());
+            }
+            if !account_data_direct_mapping && post_len < prev_len {
+                // If the account has been shrunk, we're going to zero the unused memory
+                // *that was previously used*.
+                let serialized_data = CallerAccount::get_serialized_data(
+                    memory_mapping,
+                    caller_account.vm_data_addr,
+                    prev_len as u64,
+                    stricter_abi_and_runtime_constraints,
+                    account_data_direct_mapping,
+                )?;
+                serialized_data
+                    .get_mut(post_len..)
+                    .ok_or_else(|| Box::new(InstructionError::AccountDataTooSmall))?
+                    .fill(0);
             }
             callee_account.set_data_length(post_len)?;
             // pointer to data may have changed, so caller must be updated
@@ -1124,7 +1218,7 @@ fn update_caller_account_region(
     memory_mapping: &mut MemoryMapping,
     check_aligned: bool,
     caller_account: &CallerAccount,
-    callee_account: &mut BorrowedInstructionAccount<'_>,
+    callee_account: &mut BorrowedInstructionAccount<'_, '_>,
     account_data_direct_mapping: bool,
 ) -> Result<(), Error> {
     let is_caller_loader_deprecated = !check_aligned;
@@ -1174,7 +1268,7 @@ fn update_caller_account(
     memory_mapping: &MemoryMapping<'_>,
     check_aligned: bool,
     caller_account: &mut CallerAccount<'_>,
-    callee_account: &mut BorrowedInstructionAccount<'_>,
+    callee_account: &mut BorrowedInstructionAccount<'_, '_>,
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
 ) -> Result<(), Error> {
@@ -1423,7 +1517,7 @@ mod tests {
             }
         }
 
-        fn caller_account(&mut self) -> CallerAccount {
+        fn caller_account(&mut self) -> CallerAccount<'_> {
             let data = if self.stricter_abi_and_runtime_constraints {
                 &mut []
             } else {
@@ -1452,7 +1546,7 @@ mod tests {
     }
 
     impl MockAccountInfo<'_> {
-        fn new(key: Pubkey, account: &AccountSharedData) -> MockAccountInfo {
+        fn new(key: Pubkey, account: &AccountSharedData) -> MockAccountInfo<'_> {
             MockAccountInfo {
                 key,
                 is_signer: false,
@@ -2104,7 +2198,16 @@ mod tests {
 
         let mut mock_caller_account =
             MockCallerAccount::new(1234, *account.owner(), account.data(), false);
-
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let memory_mapping = MemoryMapping::new(
+            mock_caller_account.regions.clone(),
+            &config,
+            SBPFVersion::V3,
+        )
+        .unwrap();
         let caller_account = mock_caller_account.caller_account();
 
         borrow_instruction_account!(callee_account, invoke_context, 0);
@@ -2113,6 +2216,7 @@ mod tests {
         *caller_account.owner = Pubkey::new_unique();
 
         update_callee_account(
+            &memory_mapping,
             true, // check_aligned
             &caller_account,
             callee_account,
@@ -2143,13 +2247,23 @@ mod tests {
 
         let mut mock_caller_account =
             MockCallerAccount::new(1234, *account.owner(), account.data(), false);
-
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let memory_mapping = MemoryMapping::new(
+            mock_caller_account.regions.clone(),
+            &config,
+            SBPFVersion::V3,
+        )
+        .unwrap();
         let mut caller_account = mock_caller_account.caller_account();
         borrow_instruction_account!(callee_account, invoke_context, 0);
 
         // stricter_abi_and_runtime_constraints does not copy data in update_callee_account()
         caller_account.serialized_data[0] = b'b';
         update_callee_account(
+            &memory_mapping,
             true, // check_aligned
             &caller_account,
             callee_account,
@@ -2166,6 +2280,7 @@ mod tests {
         caller_account.serialized_data = &mut data;
         assert_eq!(
             update_callee_account(
+                &memory_mapping,
                 true, // check_aligned
                 &caller_account,
                 callee_account,
@@ -2183,6 +2298,7 @@ mod tests {
         borrow_instruction_account!(callee_account, invoke_context, 0);
         assert_eq!(
             update_callee_account(
+                &memory_mapping,
                 true, // check_aligned
                 &caller_account,
                 callee_account,
@@ -2201,6 +2317,7 @@ mod tests {
         caller_account.owner = &mut owner;
         borrow_instruction_account!(callee_account, invoke_context, 0);
         update_callee_account(
+            &memory_mapping,
             true, // check_aligned
             &caller_account,
             callee_account,
@@ -2214,6 +2331,7 @@ mod tests {
         // growing beyond address_space_reserved_for_account
         *caller_account.ref_to_len_in_vm = (7 + MAX_PERMITTED_DATA_INCREASE) as u64;
         let result = update_callee_account(
+            &memory_mapping,
             true, // check_aligned
             &caller_account,
             callee_account,
@@ -2247,6 +2365,16 @@ mod tests {
 
         let mut mock_caller_account =
             MockCallerAccount::new(1234, *account.owner(), account.data(), false);
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let memory_mapping = MemoryMapping::new(
+            mock_caller_account.regions.clone(),
+            &config,
+            SBPFVersion::V3,
+        )
+        .unwrap();
         let mut caller_account = mock_caller_account.caller_account();
         borrow_instruction_account!(callee_account, invoke_context, 0);
 
@@ -2254,6 +2382,7 @@ mod tests {
         caller_account.serialized_data[0] = b'b';
         assert_matches!(
             update_callee_account(
+                &memory_mapping,
                 true, // check_aligned
                 &caller_account,
                 callee_account,
@@ -2270,6 +2399,7 @@ mod tests {
         borrow_instruction_account!(callee_account, invoke_context, 0);
         assert_matches!(
             update_callee_account(
+                &memory_mapping,
                 true, // check_aligned
                 &caller_account,
                 callee_account,
@@ -2286,6 +2416,7 @@ mod tests {
         borrow_instruction_account!(callee_account, invoke_context, 0);
         assert_matches!(
             update_callee_account(
+                &memory_mapping,
                 true, // check_aligned
                 &caller_account,
                 callee_account,

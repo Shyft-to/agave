@@ -383,7 +383,7 @@ impl Consumer {
 
         let (record_transactions_summary, record_us) = measure_us!(self
             .transaction_recorder
-            .record_transactions(bank.slot(), processed_transactions));
+            .record_transactions(bank.bank_id(), processed_transactions));
         execute_and_commit_timings.record_us = record_us;
 
         let RecordTransactionsSummary {
@@ -562,6 +562,7 @@ mod tests {
         solana_transaction_status::{TransactionStatusMeta, VersionedTransactionWithStatusMeta},
         std::{
             borrow::Cow,
+            slice,
             sync::{
                 atomic::{AtomicBool, AtomicU64},
                 Arc,
@@ -578,7 +579,7 @@ mod tests {
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -636,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_bank_process_and_record_transactions() {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -658,7 +659,7 @@ mod tests {
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -691,7 +692,7 @@ mod tests {
         record_receiver.shutdown();
 
         let record = record_receiver.drain().next().unwrap();
-        assert_eq!(record.slot, bank.slot());
+        assert_eq!(record.bank_id, bank.bank_id());
         assert_eq!(record.transaction_batches.len(), 1);
         let transaction_batch = record.transaction_batches[0].clone();
         assert_eq!(transaction_batch.len(), 1);
@@ -738,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_bank_nonce_update_blockhash_queried_before_transaction_record() {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -777,7 +778,7 @@ mod tests {
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
 
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         while bank.tick_height() != bank.max_tick_height() - 1 {
             bank.register_default_tick_for_test();
@@ -821,7 +822,7 @@ mod tests {
 
     #[test]
     fn test_bank_process_and_record_transactions_all_unexecuted() {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -840,7 +841,7 @@ mod tests {
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -885,7 +886,7 @@ mod tests {
     fn test_bank_process_and_record_transactions_cost_tracker(
         relax_intrabatch_account_locks: bool,
     ) {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -901,7 +902,7 @@ mod tests {
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -1035,7 +1036,7 @@ mod tests {
         relax_intrabatch_account_locks: bool,
         use_duplicate_transaction: bool,
     ) {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -1070,7 +1071,7 @@ mod tests {
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -1127,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_process_transactions_instruction_error() {
-        solana_logger::setup();
+        agave_logger::setup();
         let lamports = 10_000;
         let GenesisConfigInfo {
             genesis_config,
@@ -1191,7 +1192,7 @@ mod tests {
         relax_intrabatch_account_locks: bool,
         use_duplicate_transaction: bool,
     ) {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -1279,7 +1280,7 @@ mod tests {
 
     #[test]
     fn test_process_transactions_returns_unprocessed_txs() {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -1354,7 +1355,7 @@ mod tests {
 
     #[test]
     fn test_write_persist_transaction_status() {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             mut genesis_config,
             mint_keypair,
@@ -1397,7 +1398,7 @@ mod tests {
         let blockstore = Arc::new(blockstore);
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let shreds = entries_to_test_shreds(
             &entries,
@@ -1462,7 +1463,7 @@ mod tests {
 
     #[test]
     fn test_write_persist_loaded_addresses() {
-        solana_logger::setup();
+        agave_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -1521,7 +1522,7 @@ mod tests {
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
-        record_receiver.restart(bank.slot());
+        record_receiver.restart(bank.bank_id());
 
         let shreds = entries_to_test_shreds(
             &entries,
@@ -1558,7 +1559,7 @@ mod tests {
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
         let consumer_output =
-            consumer.process_and_record_transactions(&bank, &[sanitized_tx.clone()]);
+            consumer.process_and_record_transactions(&bank, slice::from_ref(&sanitized_tx));
         let CommitTransactionDetails::Committed {
             compute_units,
             loaded_accounts_data_size,

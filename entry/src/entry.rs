@@ -35,7 +35,11 @@ use {
         thread::{self, JoinHandle},
         time::Instant,
     },
-    wincode::{containers::Pod, SchemaRead, SchemaWrite},
+    wincode::{
+        containers::{Elem, Pod, Vec as WincodeVec},
+        len::BincodeLen,
+        SchemaRead, SchemaWrite,
+    },
 };
 
 pub type EntrySender = Sender<Vec<Entry>>;
@@ -91,6 +95,10 @@ pub struct Api<'a> {
         Symbol<'a, unsafe extern "C" fn(hashes: *mut u8, num_hashes: *const u64)>,
 }
 
+const MAX_DATA_SHREDS_PER_SLOT: usize = 32_768;
+pub const MAX_DATA_SHREDS_SIZE: usize = MAX_DATA_SHREDS_PER_SLOT * solana_packet::PACKET_DATA_SIZE;
+pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
+
 /// Each Entry contains three pieces of data. The `num_hashes` field is the number
 /// of hashes performed since the previous entry.  The `hash` field is the result
 /// of hashing `hash` from the previous entry `num_hashes` times.  The `transactions`
@@ -130,7 +138,7 @@ pub struct Entry {
     /// An unordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
-    #[wincode(with = "Vec<crate::wincode::VersionedTransaction>")]
+    #[wincode(with = "WincodeVec<Elem<crate::wincode::VersionedTransaction>, MaxDataShredsLen>")]
     pub transactions: Vec<VersionedTransaction>,
 }
 
@@ -1202,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1224,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1251,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes_and_transactions() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1404,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_poh_verify_fuzz() {
-        solana_logger::setup();
+        agave_logger::setup();
         for _ in 0..100 {
             let mut time = Measure::start("ticks");
             let num_ticks = thread_rng().gen_range(1..100);

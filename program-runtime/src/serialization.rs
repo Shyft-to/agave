@@ -21,7 +21,7 @@ use {
 
 /// Modifies the memory mapping in serialization and CPI return for stricter_abi_and_runtime_constraints
 pub fn modify_memory_region_of_account(
-    account: &mut BorrowedInstructionAccount<'_>,
+    account: &mut BorrowedInstructionAccount<'_, '_>,
     region: &mut MemoryRegion,
 ) {
     region.len = account.get_data().len() as u64;
@@ -36,7 +36,7 @@ pub fn modify_memory_region_of_account(
 
 /// Creates the memory mapping in serialization and CPI return for account_data_direct_mapping
 pub fn create_memory_region_of_account(
-    account: &mut BorrowedInstructionAccount<'_>,
+    account: &mut BorrowedInstructionAccount<'_, '_>,
     vaddr: u64,
 ) -> Result<MemoryRegion, InstructionError> {
     let can_data_be_changed = account.can_data_be_changed().is_ok();
@@ -52,8 +52,8 @@ pub fn create_memory_region_of_account(
 }
 
 #[allow(dead_code)]
-enum SerializeAccount<'a> {
-    Account(IndexOfAccount, BorrowedInstructionAccount<'a>),
+enum SerializeAccount<'a, 'ix_data> {
+    Account(IndexOfAccount, BorrowedInstructionAccount<'a, 'ix_data>),
     Duplicate(IndexOfAccount),
 }
 
@@ -127,7 +127,7 @@ impl Serializer {
 
     fn write_account(
         &mut self,
-        account: &mut BorrowedInstructionAccount<'_>,
+        account: &mut BorrowedInstructionAccount<'_, '_>,
     ) -> Result<u64, InstructionError> {
         if !self.stricter_abi_and_runtime_constraints {
             let vm_data_addr = self.vaddr.saturating_add(self.buffer.len() as u64);
@@ -683,6 +683,7 @@ mod tests {
             InstructionAccount, TransactionContext, MAX_ACCOUNTS_PER_TRANSACTION,
         },
         std::{
+            borrow::Cow,
             cell::RefCell,
             mem::transmute,
             rc::Rc,
@@ -784,14 +785,14 @@ mod tests {
                     // Special case implementation of configure_next_instruction_for_tests()
                     // which avoids the overflow when constructing the dedup_map
                     // by simply not filling it.
-                    let dedup_map = vec![u8::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
+                    let dedup_map = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
                     invoke_context
                         .transaction_context
                         .configure_next_instruction(
                             0,
                             instruction_accounts,
                             dedup_map,
-                            instruction_data.clone(),
+                            Cow::Owned(instruction_data.clone()),
                         )
                         .unwrap();
                 } else {
@@ -1543,7 +1544,7 @@ mod tests {
         // Writing to shared writable account makes it unique (CoW logic)
         assert!(transaction_context
             .accounts()
-            .try_borrow(1)
+            .try_borrow_mut(1)
             .unwrap()
             .is_shared());
         memory_mapping
@@ -1551,7 +1552,7 @@ mod tests {
             .unwrap();
         assert!(!transaction_context
             .accounts()
-            .try_borrow(1)
+            .try_borrow_mut(1)
             .unwrap()
             .is_shared());
         assert_eq!(

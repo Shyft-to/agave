@@ -22,7 +22,7 @@ use {
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_cluster_type::ClusterType,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, ping_pong::Pong},
-    solana_keypair::{signable::Signable, Keypair},
+    solana_keypair::{signable::Signable, Keypair, Signer},
     solana_ledger::blockstore::Blockstore,
     solana_perf::{
         packet::{deserialize_from_with_limit, PacketBatch, PacketFlags, PacketRef},
@@ -257,7 +257,7 @@ impl AncestorHashesService {
                 let mut stats = AncestorHashesResponsesStats::default();
                 let mut packet_threshold = DynamicPacketToProcessThreshold::default();
                 while !exit.load(Ordering::Relaxed) {
-                    let keypair = cluster_info.keypair().clone();
+                    let keypair = cluster_info.keypair();
                     let result = Self::process_new_packets_from_channel(
                         &ancestor_hashes_request_statuses,
                         &response_receiver,
@@ -525,12 +525,12 @@ impl AncestorHashesService {
         for update in ancestor_hashes_replay_update_receiver.try_iter() {
             let slot = update.slot();
             if slot <= root_slot || ancestor_hashes_request_statuses.contains_key(&slot) {
-                return;
+                continue;
             }
             match update {
                 AncestorHashesReplayUpdate::Dead(dead_slot) => {
                     if repairable_dead_slot_pool.contains(&dead_slot) {
-                        return;
+                        continue;
                     } else if popular_pruned_slot_pool.contains(&dead_slot) {
                         // If `dead_slot` is also part of a popular pruned fork, this implies that the slot has
                         // become `EpochSlotsFrozen` as 52% had to have frozen some version of this slot in order
@@ -722,7 +722,7 @@ impl AncestorHashesService {
         // Keep around the last second of requests in the throttler.
         request_throttle.retain(|request_time| *request_time > (timestamp() - 1000));
 
-        let identity_keypair: &Keypair = &repair_info.cluster_info.keypair().clone();
+        let identity_keypair: &Keypair = &repair_info.cluster_info.keypair();
 
         let number_of_allowed_requests =
             MAX_ANCESTOR_HASHES_SLOT_REQUESTS_PER_SECOND.saturating_sub(request_throttle.len());
@@ -843,6 +843,7 @@ impl AncestorHashesService {
             cluster_slots,
             repair_validators,
             repair_protocol,
+            &identity_keypair.pubkey(),
         ) else {
             return false;
         };
@@ -1914,7 +1915,7 @@ mod test {
         {
             let mut w_bank_forks = bank_forks.write().unwrap();
             w_bank_forks.insert(new_root_bank);
-            w_bank_forks.set_root(new_root_slot, None, None).unwrap();
+            w_bank_forks.set_root(new_root_slot, None, None);
         }
         popular_pruned_slot_pool.insert(dead_duplicate_confirmed_slot);
         assert!(!dead_slot_pool.is_empty());
@@ -2251,5 +2252,44 @@ mod test {
         assert!(dead_slot_pool.is_empty());
         assert!(repairable_dead_slot_pool.is_empty());
         assert!(popular_pruned_slot_pool.contains(&request_slot));
+    }
+
+    #[test]
+    fn test_process_replay_updates_continue_after_skipped_update() {
+        let (sender, receiver) = unbounded();
+        let ancestor_hashes_request_statuses = DashMap::new();
+        let mut dead_slot_pool = HashSet::new();
+        let mut repairable_dead_slot_pool = HashSet::new();
+        let mut popular_pruned_slot_pool = HashSet::new();
+
+        let root_slot: Slot = 15;
+        let skipped_slot = root_slot; // should be skipped due to slot <= root
+        let actionable_slot = root_slot + 2; // should be processed
+
+        sender
+            .send(AncestorHashesReplayUpdate::Dead(skipped_slot))
+            .unwrap();
+        sender
+            .send(AncestorHashesReplayUpdate::DeadDuplicateConfirmed(
+                actionable_slot,
+            ))
+            .unwrap();
+
+        // Run processing; previously, an early return would have aborted after the first
+        // (skipped) update and ignored the actionable second update in the same batch.
+        AncestorHashesService::process_replay_updates(
+            &receiver,
+            &ancestor_hashes_request_statuses,
+            &mut dead_slot_pool,
+            &mut repairable_dead_slot_pool,
+            &mut popular_pruned_slot_pool,
+            root_slot,
+        );
+
+        // The skipped update should not pollute pools
+        assert!(!dead_slot_pool.contains(&skipped_slot));
+
+        // The actionable update must have been processed in the same call
+        assert!(repairable_dead_slot_pool.contains(&actionable_slot));
     }
 }

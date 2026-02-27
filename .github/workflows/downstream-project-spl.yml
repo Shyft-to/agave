@@ -14,8 +14,8 @@ on:
       - "rust-toolchain.toml"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "cargo-build-sbf"
-      - "cargo-test-sbf"
+      - "platform-tools-sdk/cargo-build-sbf"
+      - "platform-tools-sdk/cargo-test-sbf"
       - "ci/downstream-projects/run-spl.sh"
       - ".github/workflows/downstream-project-spl.yml"
       - ".github/scripts/downstream-project-spl-common.sh"
@@ -40,7 +40,7 @@ jobs:
   check:
     #if: github.repository == 'anza-xyz/agave'
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -79,7 +79,7 @@ jobs:
   test_cli:
     #if: github.repository == 'anza-xyz/agave'
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -110,7 +110,7 @@ jobs:
   cargo-test-sbf:
     #if: github.repository == 'anza-xyz/agave'
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -170,13 +170,4 @@ jobs:
           cd "${{ matrix.programs }}"
           rm -rf target/deploy target/sbpf*
           $CARGO_BUILD_SBF --arch v2 --manifest-path program/Cargo.toml
-          RUSTFLAGS="-Awarnings" SBF_OUT_DIR="../target/deploy"  cargo test --features test-sbf --manifest-path program/Cargo.toml
-
-      - name: Test SBPFv3
-        shell: bash
-        run: |
-          source ci/downstream-projects/common.sh
-          cd "${{ matrix.programs }}"
-          rm -rf target/deploy target/sbpf*
-          $CARGO_BUILD_SBF --arch v3 --manifest-path program/Cargo.toml
           RUSTFLAGS="-Awarnings" SBF_OUT_DIR="../target/deploy"  cargo test --features test-sbf --manifest-path program/Cargo.toml

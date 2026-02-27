@@ -1,12 +1,17 @@
 use {
-    crate::commands,
-    agave_snapshots::DEFAULT_ARCHIVE_COMPRESSION,
-    clap::{crate_description, crate_name, App, AppSettings, Arg, ArgMatches, SubCommand},
-    solana_accounts_db::{
-        accounts_db::{
-            DEFAULT_ACCOUNTS_SHRINK_OPTIMIZE_TOTAL_SPACE, DEFAULT_ACCOUNTS_SHRINK_RATIO,
+    crate::{commands, commands::run::args::pub_sub_config},
+    agave_snapshots::{
+        snapshot_config::{
+            DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
+            DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
         },
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        SnapshotVersion, DEFAULT_ARCHIVE_COMPRESSION,
+    },
+    clap::{crate_description, crate_name, App, AppSettings, Arg, ArgMatches, SubCommand},
+    solana_accounts_db::accounts_db::{
+        DEFAULT_ACCOUNTS_SHRINK_OPTIMIZE_TOTAL_SPACE, DEFAULT_ACCOUNTS_SHRINK_RATIO,
     },
     solana_clap_utils::{
         hidden_unless_forced,
@@ -23,14 +28,6 @@ use {
     solana_hash::Hash,
     solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE},
     solana_quic_definitions::QUIC_PORT_OFFSET,
-    solana_rpc::rpc::MAX_REQUEST_BODY_SIZE,
-    solana_rpc_client_api::request::{DELINQUENT_VALIDATOR_SLOT_DISTANCE, MAX_MULTIPLE_ACCOUNTS},
-    solana_runtime::snapshot_utils::{
-        SnapshotVersion, DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
-        DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
-        DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-        DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-    },
     solana_send_transaction_service::send_transaction_service::{self},
     solana_streamer::quic::{
         DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE, DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER,
@@ -182,6 +179,24 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
             ),
             usage_warning: "The accounts hash cache is obsolete",
     );
+    add_arg!(
+        // deprecated in v3.1.1
+        Arg::with_name("cuda")
+            .long("cuda")
+            .takes_value(false)
+            .help("Use CUDA"),
+        usage_warning: "CUDA support will be dropped"
+    );
+    add_arg!(
+        // deprecated in v3.1.3
+        Arg::with_name("dev_halt_at_slot")
+            .long("dev-halt-at-slot")
+            .value_name("SLOT")
+            .validator(is_slot)
+            .takes_value(true)
+            .help("Halt the validator when it reaches the given slot"),
+        usage_warning: "--dev-halt-at-slot will be removed in the future"
+    );
     add_arg!(Arg::with_name("disable_accounts_disk_index")
         // (actually) deprecated in v3.1.0
         .long("disable-accounts-disk-index")
@@ -198,6 +213,16 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
             .validator(solana_net_utils::is_host),
             replaced_by : "bind-address",
             usage_warning:"Use --bind-address instead",
+    );
+    add_arg!(
+        // deprecated in v3.1.0
+        Arg::with_name("tpu_coalesce_ms")
+            .long("tpu-coalesce-ms")
+            .value_name("MILLISECS")
+            .takes_value(true)
+            .validator(is_parsable::<u64>)
+            .help("Milliseconds to wait in the TPU receiver for packet coalescing."),
+            usage_warning:"tpu_coalesce will be dropped (currently ignored)",
     );
     add_arg!(
         // deprecated in v3.0.0
@@ -222,7 +247,6 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
             .value_name("STRUCT")
             .takes_value(true)
             .possible_values(TransactionStructure::cli_names())
-            .default_value(TransactionStructure::default().into())
             .help(TransactionStructure::cli_message()),
         usage_warning: "Transaction structure is no longer configurable"
     );
@@ -272,27 +296,8 @@ pub struct DefaultArgs {
     pub dynamic_port_range: String,
     pub ledger_path: String,
 
-    pub genesis_archive_unpacked_size: String,
-    pub health_check_slot_distance: String,
     pub tower_storage: String,
-    pub etcd_domain_name: String,
     pub send_transaction_service_config: send_transaction_service::Config,
-
-    pub rpc_max_multiple_accounts: String,
-    pub rpc_send_transaction_retry_ms: String,
-    pub rpc_send_transaction_batch_ms: String,
-    pub rpc_send_transaction_leader_forward_count: String,
-    pub rpc_send_transaction_service_max_retries: String,
-    pub rpc_send_transaction_batch_size: String,
-    pub rpc_send_transaction_retry_pool_max_size: String,
-    pub rpc_threads: String,
-    pub rpc_blocking_threads: String,
-    pub rpc_niceness_adjustment: String,
-    pub rpc_bigtable_timeout: String,
-    pub rpc_bigtable_instance_name: String,
-    pub rpc_bigtable_app_profile_id: String,
-    pub rpc_bigtable_max_message_size: String,
-    pub rpc_max_request_body_size: String,
 
     pub maximum_local_snapshot_age: String,
     pub maximum_full_snapshot_archives_to_retain: String,
@@ -338,46 +343,13 @@ pub struct DefaultArgs {
 
 impl DefaultArgs {
     pub fn new() -> Self {
-        let default_send_transaction_service_config = send_transaction_service::Config::default();
-
         DefaultArgs {
             bind_address: "0.0.0.0".to_string(),
             ledger_path: "ledger".to_string(),
             dynamic_port_range: format!("{}-{}", VALIDATOR_PORT_RANGE.0, VALIDATOR_PORT_RANGE.1),
             maximum_local_snapshot_age: "2500".to_string(),
-            genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE.to_string(),
-            rpc_max_multiple_accounts: MAX_MULTIPLE_ACCOUNTS.to_string(),
-            health_check_slot_distance: DELINQUENT_VALIDATOR_SLOT_DISTANCE.to_string(),
             tower_storage: "file".to_string(),
-            etcd_domain_name: "localhost".to_string(),
             send_transaction_service_config: send_transaction_service::Config::default(),
-            rpc_send_transaction_retry_ms: default_send_transaction_service_config
-                .retry_rate_ms
-                .to_string(),
-            rpc_send_transaction_batch_ms: default_send_transaction_service_config
-                .batch_send_rate_ms
-                .to_string(),
-            rpc_send_transaction_leader_forward_count: default_send_transaction_service_config
-                .leader_forward_count
-                .to_string(),
-            rpc_send_transaction_service_max_retries: default_send_transaction_service_config
-                .service_max_retries
-                .to_string(),
-            rpc_send_transaction_batch_size: default_send_transaction_service_config
-                .batch_size
-                .to_string(),
-            rpc_send_transaction_retry_pool_max_size: default_send_transaction_service_config
-                .retry_pool_max_size
-                .to_string(),
-            rpc_threads: num_cpus::get().to_string(),
-            rpc_blocking_threads: 1.max(num_cpus::get() / 4).to_string(),
-            rpc_niceness_adjustment: "0".to_string(),
-            rpc_bigtable_timeout: "30".to_string(),
-            rpc_bigtable_instance_name: solana_storage_bigtable::DEFAULT_INSTANCE_NAME.to_string(),
-            rpc_bigtable_app_profile_id: solana_storage_bigtable::DEFAULT_APP_PROFILE_ID
-                .to_string(),
-            rpc_bigtable_max_message_size: solana_storage_bigtable::DEFAULT_MAX_MESSAGE_SIZE
-                .to_string(),
             maximum_full_snapshot_archives_to_retain: DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN
                 .to_string(),
             maximum_incremental_snapshot_archives_to_retain:
@@ -415,7 +387,6 @@ impl DefaultArgs {
             tpu_max_fwd_unstaked_connections: 0.to_string(),
             tpu_max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS.to_string(),
             num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
-            rpc_max_request_body_size: MAX_REQUEST_BODY_SIZE.to_string(),
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
             block_production_pacing_fill_time_millis: BankingStage::default_fill_time_millis()
                 .to_string(),
@@ -601,18 +572,6 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .help("Application profile id to use in Bigtable requests"),
         )
         .arg(
-            Arg::with_name("rpc_pubsub_enable_vote_subscription")
-                .long("rpc-pubsub-enable-vote-subscription")
-                .takes_value(false)
-                .help("Enable the unstable RPC PubSub `voteSubscribe` subscription"),
-        )
-        .arg(
-            Arg::with_name("rpc_pubsub_enable_block_subscription")
-                .long("rpc-pubsub-enable-block-subscription")
-                .takes_value(false)
-                .help("Enable the unstable RPC PubSub `blockSubscribe` subscription"),
-        )
-        .arg(
             Arg::with_name("bpf_program")
                 .long("bpf-program")
                 .value_names(&["ADDRESS_OR_KEYPAIR", "SBF_PROGRAM.SO"])
@@ -775,6 +734,23 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                      AdminRPC: Gossip switches to send/receive from the new interface, while \
                      TVU/TPU continue receiving from ALL interfaces but send from the new \
                      interface only.",
+                ),
+        )
+        .arg(
+            Arg::with_name("advertised_ip")
+                .long("advertised-ip")
+                .value_name("HOST")
+                .takes_value(true)
+                .validator(solana_net_utils::is_host)
+                .hidden(hidden_unless_forced())
+                .help(
+                    "Use when running a validator behind a NAT. DNS name or IP address for this \
+                     validator to advertise in gossip. This address will be used as the target \
+                     desination address for peers trying to contact this node. [default: the \
+                     first --bind-address, or ask --entrypoint when --bind-address is not \
+                     provided, or 127.0.0.1 when --entrypoint is not provided]. Note: this \
+                     argument cannot be used in a multihoming context (when multiple \
+                     --bind-address values are provided).",
                 ),
         )
         .arg(
@@ -948,6 +924,7 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                      silently ignored",
                 ),
         )
+        .args(&pub_sub_config::args(/*test_validator:*/ true))
 }
 
 pub struct DefaultTestArgs {

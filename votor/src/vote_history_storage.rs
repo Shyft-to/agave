@@ -108,8 +108,7 @@ pub struct NullVoteHistoryStorage {}
 
 impl VoteHistoryStorage for NullVoteHistoryStorage {
     fn load(&self, _node_pubkey: &Pubkey) -> Result<VoteHistory> {
-        Err(VoteHistoryError::IoError(io::Error::new(
-            io::ErrorKind::Other,
+        Err(VoteHistoryError::IoError(io::Error::other(
             "NullVoteHistoryStorage::load() not available",
         )))
     }
@@ -173,11 +172,11 @@ impl VoteHistoryStorage for FileVoteHistoryStorage {
 
 #[cfg(test)]
 mod test {
-    use {super::*, solana_keypair::Keypair, solana_votor_messages::vote::Vote, tempfile::TempDir};
+    use {super::*, agave_votor_messages::vote::Vote, solana_keypair::Keypair, tempfile::TempDir};
 
     #[test]
     fn test_file_vote_history_storage() {
-        solana_logger::setup();
+        agave_logger::setup();
         let tmp_dir = TempDir::new().unwrap();
         let storage = FileVoteHistoryStorage::new(tmp_dir.path().to_path_buf());
         let keypair = Keypair::new();

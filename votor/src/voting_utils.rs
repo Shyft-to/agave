@@ -8,6 +8,10 @@ use {
         vote_history_storage::{SavedVoteHistory, SavedVoteHistoryVersions},
         voting_service::BLSOp,
     },
+    agave_votor_messages::{
+        consensus_message::{ConsensusMessage, VoteMessage, BLS_KEYPAIR_DERIVE_SEED},
+        vote::Vote,
+    },
     crossbeam_channel::{SendError, Sender},
     parking_lot::RwLock as PlRwLock,
     solana_bls_signatures::{
@@ -20,10 +24,6 @@ use {
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     solana_signer::Signer,
     solana_transaction::Transaction,
-    solana_votor_messages::{
-        consensus_message::{ConsensusMessage, VoteMessage, BLS_KEYPAIR_DERIVE_SEED},
-        vote::Vote,
-    },
     std::{collections::HashMap, sync::Arc},
     thiserror::Error,
 };
@@ -176,14 +176,11 @@ fn generate_vote_tx(vote: &Vote, bank: &Bank, context: &mut VotingContext) -> Ge
             );
             return GenerateVoteTxResult::HotSpare;
         }
-        let bls_pubkey_serialized = match vote_state_view.bls_pubkey_compressed() {
-            None => {
-                panic!(
-                    "No BLS pubkey in vote account {}",
-                    context.identity_keypair.pubkey()
-                );
-            }
-            Some(key) => key,
+        let Some(bls_pubkey_serialized) = vote_state_view.bls_pubkey_compressed() else {
+            panic!(
+                "No BLS pubkey in vote account {}",
+                context.identity_keypair.pubkey()
+            );
         };
         bls_pubkey_in_vote_account =
             (bincode::deserialize::<BLSPubkeyCompressed>(&bls_pubkey_serialized).unwrap())
@@ -575,7 +572,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "The bank 0 doesn't have its own epoch_stakes for")]
     fn test_panic_on_future_slot() {
-        solana_logger::setup();
+        agave_logger::setup();
         let (own_vote_sender, _own_vote_receiver) = crossbeam_channel::unbounded();
         // Create 10 node validatorvotekeypairs vec
         let validator_keypairs = (0..10)
@@ -592,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_zero_staked_validator_fails_voting() {
-        solana_logger::setup();
+        agave_logger::setup();
         let (own_vote_sender, _own_vote_receiver) = crossbeam_channel::unbounded();
         // Create 10 node validatorvotekeypairs vec
         let validator_keypairs = (0..10)
