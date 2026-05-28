@@ -17,6 +17,7 @@ use {
 pub struct AccountSecondaryIndexes {
     pub keys: Option<AccountSecondaryIndexesIncludeExclude>,
     pub indexes: HashSet<AccountIndex>,
+    pub custom_indexes: HashSet<AccountIndex>,
 }
 
 impl AccountSecondaryIndexes {
@@ -45,6 +46,7 @@ pub enum AccountIndex {
     ProgramId,
     SplTokenMint,
     SplTokenOwner,
+    Custom(Pubkey, usize), //Program, offset
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +54,7 @@ pub enum IndexKey {
     ProgramId(Pubkey),
     SplTokenMint(Pubkey),
     SplTokenOwner(Pubkey),
+    Custom((Pubkey, usize), Pubkey), // (Program, offset), key
 }
 
 // The only cases where an inner key should map to a different outer key is

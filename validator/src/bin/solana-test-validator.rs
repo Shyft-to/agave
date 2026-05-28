@@ -83,13 +83,23 @@ fn main() {
             "program-id" => AccountIndex::ProgramId,
             "spl-token-mint" => AccountIndex::SplTokenMint,
             "spl-token-owner" => AccountIndex::SplTokenOwner,
-            _ => unreachable!(),
+            s => {
+                if s.starts_with("custom-") {
+                    let mut v = s.split("-").skip(1);
+                    let key = v.next().map(|k| { println!("key to parse: {}", k);  Pubkey::from_str_const(k)}).expect("ProgramID for custom index not found, expected value custom-pid-offset-length format");
+                    let offset = v.next().and_then(|o| o.parse::<usize>().ok()).expect("Offset of data for custom index not found, expected value custom-pid-offset-length format");
+                    AccountIndex::Custom(key, offset)
+                } else {
+                    unreachable!()
+                }
+            }
         })
         .collect();
 
     let account_indexes = AccountSecondaryIndexes {
         keys: None,
         indexes,
+        custom_indexes: HashSet::new(),
     };
 
     if !ledger_path.exists() {

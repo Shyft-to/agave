@@ -316,6 +316,7 @@ impl JsonRpcRequestProcessor {
         let bank = Arc::clone(bank);
         let index_key = index_key.to_owned();
         let program_id = program_id.to_owned();
+        info!("Found custom index {:?} for scan, try to use it,", index_key);
         self.runtime
             .spawn_blocking(move || {
                 bank.get_filtered_indexed_accounts(
@@ -2229,11 +2230,37 @@ impl JsonRpcRequestProcessor {
         sort_results: bool,
     ) -> RpcCustomResult<Vec<(Pubkey, AccountSharedData)>> {
         optimize_filters(&mut filters);
-        if self
-            .config
-            .account_indexes
-            .contains(&AccountIndex::ProgramId)
-        {
+
+        let custom_index: Option<IndexKey> = filters.iter().find_map(|f| {
+            if let RpcFilterType::Memcmp(memcmp) = f {
+                if self.config.account_indexes.contains(
+                    &AccountIndex::Custom(
+                        program_id,
+                        memcmp.offset(),
+                    ),
+                ) {
+                    let pubkey: [u8; 32] = memcmp.bytes().unwrap().as_slice().try_into().unwrap();
+                    Some(IndexKey::Custom((program_id, memcmp.offset()), Pubkey::new_from_array(pubkey)))
+                } else {
+                    None
+                }
+            } else { None }
+        });
+
+        if let Some(index_key) = custom_index {
+            self.get_filtered_indexed_accounts(
+                &bank,
+                &index_key,
+                &program_id,
+                filters,
+                sort_results,
+            )
+            .await
+            .map_err(|e| RpcCustomError::ScanError {
+                message: e.to_string(),
+            })
+        } else if self.config.account_indexes.contains(&AccountIndex::ProgramId) {
+
             if !self.config.account_indexes.include_key(&program_id) {
                 return Err(RpcCustomError::KeyExcludedFromSecondaryIndex {
                     index_key: program_id.to_string(),

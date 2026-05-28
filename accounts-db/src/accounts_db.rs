@@ -1062,7 +1062,7 @@ impl AccountsDb {
         exit: Arc<AtomicBool>,
     ) -> Self {
         let accounts_index_config = accounts_db_config.index.unwrap_or_default();
-        let accounts_index = AccountsIndex::new(&accounts_index_config, exit);
+        let accounts_index = AccountsIndex::new(&accounts_index_config, accounts_db_config.account_indexes.as_ref(), exit);
 
         let (paths, temp_paths) = if paths.is_empty() {
             // Create a temporary set of accounts directories, used primarily
@@ -3443,6 +3443,7 @@ impl AccountsDb {
             IndexKey::ProgramId(key) => key,
             IndexKey::SplTokenMint(key) => key,
             IndexKey::SplTokenOwner(key) => key,
+            IndexKey::Custom(_, key) => key,
         };
         if !self.account_indexes.include_key(key) {
             // the requested key was not indexed in the secondary index, so do a normal scan
