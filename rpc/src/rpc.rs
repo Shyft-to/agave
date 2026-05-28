@@ -316,7 +316,6 @@ impl JsonRpcRequestProcessor {
         let bank = Arc::clone(bank);
         let index_key = index_key.to_owned();
         let program_id = program_id.to_owned();
-        info!("Found custom index {:?} for scan, try to use it,", index_key);
         self.runtime
             .spawn_blocking(move || {
                 bank.get_filtered_indexed_accounts(
@@ -2248,6 +2247,7 @@ impl JsonRpcRequestProcessor {
         });
 
         if let Some(index_key) = custom_index {
+            info!("Found custom index {:?} for scan, try to use it,", index_key);
             self.get_filtered_indexed_accounts(
                 &bank,
                 &index_key,
