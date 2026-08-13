@@ -34,7 +34,7 @@ use {
     solana_pubkey::Pubkey,
     stats::Stats,
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fmt::Debug,
         num::NonZeroUsize,
         path::PathBuf,
@@ -223,6 +223,7 @@ pub struct AccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub account_maps: Box<[Arc<InMemAccountsIndex<T, U>>]>,
     pub bin_calculator: PubkeyBinCalculator,
     program_id_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
+    custom_indexes: HashMap<(Pubkey, usize), SecondaryIndex<RwLockSecondaryIndexEntry>>,
     spl_token_mint_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     spl_token_owner_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     pub roots_tracker: RwLock<RootsTracker>,
@@ -239,12 +240,28 @@ pub struct AccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     pub fn default_for_tests() -> Self {
-        Self::new(&ACCOUNTS_INDEX_CONFIG_FOR_TESTING, Arc::default())
+        Self::new(&ACCOUNTS_INDEX_CONFIG_FOR_TESTING, None, Arc::default())
     }
 
-    pub fn new(config: &AccountsIndexConfig, exit: Arc<AtomicBool>) -> Self {
+    pub fn new(config: &AccountsIndexConfig, account_indexes: Option<&AccountSecondaryIndexes>, exit: Arc<AtomicBool>) -> Self {
         let (account_maps, bin_calculator, storage) = Self::allocate_accounts_index(config, exit);
         info!("AccountsIndex bin calculator: {bin_calculator:?}");
+        let custom_indexes = match account_indexes {
+            None => HashMap::new(),
+            Some(index_config) => index_config
+                .indexes
+                .iter()
+                .fold(HashMap::new(), |mut acc, e| {
+                    if let AccountIndex::Custom(program, offset) = e {
+                        acc.insert(
+                            (*program, *offset),
+                            SecondaryIndex::<RwLockSecondaryIndexEntry>::new("custom_index_stats"),
+                        );
+                    }
+                    acc
+                }),
+        };
+
         Self {
             purge_older_root_entries_one_slot_list: AtomicUsize::default(),
             account_maps,
@@ -258,6 +275,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             spl_token_owner_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
                 "spl_token_owner_index_stats",
             ),
+            custom_indexes,
             roots_tracker: RwLock::<RootsTracker>::default(),
             storage,
             roots_added: AtomicUsize::default(),
@@ -418,6 +436,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             IndexKey::ProgramId(key) => self.program_id_index.get(key),
             IndexKey::SplTokenMint(key) => self.spl_token_mint_index.get(key),
             IndexKey::SplTokenOwner(key) => self.spl_token_owner_index.get(key),
+            IndexKey::Custom(program_key, key) => self
+                .custom_indexes
+                .get(program_key)
+                .and_then(|index| Some(index.get(key)))
+                .unwrap_or(Vec::new()),
         }
     }
 
@@ -695,6 +718,33 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         }
     }
 
+    fn update_custom_secondary_indexes(
+        &self,
+        pubkey: &Pubkey,
+        account_owner: &Pubkey,
+        account_data: &[u8],
+        account_indexes: &AccountSecondaryIndexes,
+    ) {
+        let custom_indexes = account_indexes.indexes.iter().filter_map(|i| match i {
+            AccountIndex::Custom(program_address, offset) => {
+                if account_data.len() >= offset + 32 && program_address == account_owner {
+                    Some((program_address, offset))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+
+        for (program, offset) in custom_indexes {
+            if let Ok(key) = Pubkey::try_from(&account_data[*offset..*offset + 32]) {
+                self.custom_indexes
+                    .get(&(*program, *offset))
+                    .map(|i| i.insert(&key, pubkey));
+            }
+        }
+    }
+
     pub fn get_index_key_size(&self, index: &AccountIndex, index_key: &Pubkey) -> Option<usize> {
         match index {
             AccountIndex::ProgramId => self.program_id_index.index.get(index_key).map(|x| x.len()),
@@ -707,6 +757,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 .spl_token_mint_index
                 .index
                 .get(index_key)
+                .map(|x| x.len()),
+            AccountIndex::Custom(program, offset) => self
+                .custom_indexes
+                .get(&(*program, *offset))
+                .and_then(|i| i.index.get(index_key))
                 .map(|x| x.len()),
         }
     }
@@ -773,6 +828,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             account_data,
             account_indexes,
         );
+        self.update_custom_secondary_indexes(pubkey, account_owner, account_data, account_indexes);
     }
 
     pub(crate) fn get_bin(&self, pubkey: &Pubkey) -> &InMemAccountsIndex<T, U> {
@@ -976,19 +1032,38 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         account_indexes: &AccountSecondaryIndexes,
         should_remove: impl Fn() -> bool,
     ) {
-        if account_indexes.contains(&AccountIndex::ProgramId) {
-            self.program_id_index
-                .remove_by_inner_key_if(inner_key, &should_remove);
-        }
+        // if account_indexes.contains(&AccountIndex::ProgramId) {
+        //     self.program_id_index
+        //         .remove_by_inner_key_if(inner_key, &should_remove);
+        // }
 
-        if account_indexes.contains(&AccountIndex::SplTokenOwner) {
-            self.spl_token_owner_index
-                .remove_by_inner_key_if(inner_key, &should_remove);
-        }
+        // if account_indexes.contains(&AccountIndex::SplTokenOwner) {
+        //     self.spl_token_owner_index
+        //         .remove_by_inner_key_if(inner_key, &should_remove);
+        // }
 
-        if account_indexes.contains(&AccountIndex::SplTokenMint) {
-            self.spl_token_mint_index
-                .remove_by_inner_key_if(inner_key, &should_remove);
+        // if account_indexes.contains(&AccountIndex::SplTokenMint) {
+        //     self.spl_token_mint_index
+        //         .remove_by_inner_key_if(inner_key, &should_remove);
+        // }
+
+        for index in account_indexes.indexes.iter() {
+            match index {
+                AccountIndex::ProgramId => self.program_id_index.remove_by_inner_key_if(inner_key, &should_remove),
+                AccountIndex::SplTokenOwner => {
+                    self.spl_token_owner_index
+                        .remove_by_inner_key_if(inner_key, &should_remove);
+                }
+                AccountIndex::SplTokenMint => {
+                    self.spl_token_mint_index
+                        .remove_by_inner_key_if(inner_key, &should_remove);
+                }
+                AccountIndex::Custom(program, offset) => {
+                    self.custom_indexes
+                        .get(&(*program, *offset))
+                        .map(|i| i.remove_by_inner_key_if(inner_key, &should_remove));
+                }
+            }
         }
     }
 
@@ -1224,6 +1299,7 @@ pub(crate) mod test_utils {
         account_indexes.insert(AccountIndex::ProgramId);
         AccountSecondaryIndexes {
             indexes: account_indexes,
+            custom_indexes: HashSet::new(),
             keys: None,
         }
     }
@@ -1232,6 +1308,7 @@ pub(crate) mod test_utils {
         account_indexes.insert(AccountIndex::SplTokenMint);
         AccountSecondaryIndexes {
             indexes: account_indexes,
+            custom_indexes: HashSet::new(),
             keys: None,
         }
     }
@@ -1240,6 +1317,7 @@ pub(crate) mod test_utils {
         account_indexes.insert(AccountIndex::SplTokenOwner);
         AccountSecondaryIndexes {
             indexes: account_indexes,
+            custom_indexes: HashSet::new(),
             keys: None,
         }
     }
@@ -1665,7 +1743,7 @@ mod tests {
         } else {
             IndexLimit::InMemOnly
         };
-        let index = AccountsIndex::<T, T>::new(&config, Arc::default());
+        let index = AccountsIndex::<T, T>::new(&config, None, Arc::default());
         let mut gc = ReclaimsSlotList::new();
 
         match upsert_method {
