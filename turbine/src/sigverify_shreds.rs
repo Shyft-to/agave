@@ -156,6 +156,7 @@ fn run_shred_sigverify<const K: usize>(
     shred_buffer: &mut Vec<PacketBatch>,
 ) -> Result<(), ShredSigverifyError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
+    let recv_start = Instant::now();
     let packets = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
     stats.num_packets += packets.len();
     shred_buffer.push(packets);
@@ -166,6 +167,7 @@ fn run_shred_sigverify<const K: usize>(
         stats.num_packets += packets.len();
         shred_buffer.push(packets);
     }
+    stats.recv_micros += recv_start.elapsed().as_micros() as u64;
 
     let now = Instant::now();
     stats.num_iters += 1;
@@ -202,6 +204,7 @@ fn run_shred_sigverify<const K: usize>(
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
+    let sigverify_start = Instant::now();
     verify_packets(
         thread_pool,
         &keypair.pubkey(),
@@ -210,6 +213,7 @@ fn run_shred_sigverify<const K: usize>(
         shred_buffer,
         cache,
     );
+    stats.sigverify_micros += sigverify_start.elapsed().as_micros() as u64;
     stats.num_discards_post += count_discards(shred_buffer);
     // Verify retransmitter's signature, and resign shreds
     // Merkle root as the retransmitter node.
@@ -503,6 +507,8 @@ struct ShredSigVerifyStats {
     num_unknown_slot_leader: AtomicUsize,
     num_unknown_turbine_parent: AtomicUsize,
     elapsed_micros: u64,
+    recv_micros: u64,
+    sigverify_micros: u64,
     resign_micros: u64,
 }
 
@@ -528,6 +534,8 @@ impl ShredSigVerifyStats {
             num_unknown_slot_leader: AtomicUsize::default(),
             num_unknown_turbine_parent: AtomicUsize::default(),
             elapsed_micros: 0u64,
+            recv_micros: 0u64,
+            sigverify_micros: 0u64,
             resign_micros: 0u64,
         }
     }
@@ -584,6 +592,8 @@ impl ShredSigVerifyStats {
                 i64
             ),
             ("elapsed_micros", self.elapsed_micros, i64),
+            ("recv_micros", self.recv_micros, i64),
+            ("sigverify_micros", self.sigverify_micros, i64),
             ("resign_micros", self.resign_micros, i64),
         );
         *self = Self::new(Instant::now());

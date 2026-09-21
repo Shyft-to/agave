@@ -49,8 +49,9 @@ struct WindowServiceMetrics {
     run_insert_count: u64,
     num_repairs: AtomicUsize,
     num_shreds_received: usize,
-    handle_packets_elapsed_us: u64,
+    shred_deserialize_elapsed_us: u64,
     shred_receiver_elapsed_us: u64,
+    blockstore_insert_elapsed_us: u64,
     num_errors: u64,
     num_errors_blockstore: u64,
     num_errors_cross_beam_recv_timeout: u64,
@@ -65,8 +66,8 @@ impl WindowServiceMetrics {
         datapoint_info!(
             Self::NAME,
             (
-                "handle_packets_elapsed_us",
-                self.handle_packets_elapsed_us,
+                "shred_deserialize_elapsed_us",
+                self.shred_deserialize_elapsed_us,
                 i64
             ),
             ("run_insert_count", self.run_insert_count as i64, i64),
@@ -75,6 +76,11 @@ impl WindowServiceMetrics {
             (
                 "shred_receiver_elapsed_us",
                 self.shred_receiver_elapsed_us as i64,
+                i64
+            ),
+            (
+                "blockstore_insert_elapsed_us",
+                self.blockstore_insert_elapsed_us as i64,
                 i64
             ),
             ("num_errors", self.num_errors, i64),
@@ -253,9 +259,10 @@ where
             .filter_map(handle_shred)
             .collect()
     });
-    ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
+    ws_metrics.shred_deserialize_elapsed_us += now.elapsed().as_micros() as u64;
     ws_metrics.num_shreds_received += shreds.len();
-    let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
+    let mut blockstore_insert_elapsed = Measure::start("blockstore_insert_elapsed");
+    let insert_result = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         false, // is_trusted
         shred_recovery_context,
@@ -263,7 +270,10 @@ where
         write_batch,
         &handle_duplicate,
         metrics,
-    )?;
+    );
+    blockstore_insert_elapsed.stop();
+    ws_metrics.blockstore_insert_elapsed_us += blockstore_insert_elapsed.as_us();
+    let completed_data_sets = insert_result?;
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;

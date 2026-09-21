@@ -4269,6 +4269,8 @@ impl ReplayStage {
                         .unwrap_or_default();
                     let commission_rate_in_basis_points =
                         bank.feature_set.snapshot().commission_rate_in_basis_points;
+                    let mut notify_block_metadata_elapsed =
+                        Measure::start("notify_block_metadata_elapsed");
                     block_metadata_notifier.notify_block_metadata(
                         bank.parent_slot(),
                         &parent_blockhash.to_string(),
@@ -4281,7 +4283,17 @@ impl ReplayStage {
                         bank.executed_transaction_count(),
                         r_replay_progress.num_entries as u64,
                         commission_rate_in_basis_points,
-                    )
+                    );
+                    notify_block_metadata_elapsed.stop();
+                    datapoint_info!(
+                        "geyser-notify-block-metadata",
+                        ("slot", bank_slot, i64),
+                        (
+                            "elapsed_us",
+                            notify_block_metadata_elapsed.as_us() as i64,
+                            i64
+                        ),
+                    );
                 }
                 bank_complete_time.stop();
 

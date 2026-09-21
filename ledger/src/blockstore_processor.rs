@@ -663,6 +663,12 @@ pub struct ConfirmationTiming {
 
     /// Number of times this slot was switched from an alternate location.
     pub num_bank_switches: u64,
+
+    /// Wall clock time spent scheduling entry/block-footer notifications onto the Geyser
+    /// entry-notifier channel (i.e. the `entry_notification_sender.send(..)` calls). Does not
+    /// include the time it takes the entry notifier service to actually dispatch the
+    /// notification to plugins, only the cost of enqueuing it. In microseconds.
+    pub entry_notify_schedule_elapsed_us: u64,
 }
 
 impl Default for ConfirmationTiming {
@@ -677,6 +683,7 @@ impl Default for ConfirmationTiming {
             fetch_fail_elapsed: 0,
             batch_execute: BatchExecutionTiming::default(),
             num_bank_switches: 0,
+            entry_notify_schedule_elapsed_us: 0,
         }
     }
 }
@@ -840,6 +847,11 @@ impl ReplaySlotStats {
                 (replay_elapsed, self.replay_elapsed as i64, i64),
                 ("execute_batches_us", execute_batches_us, Option<i64>),
                 ("num_bank_switches", self.num_bank_switches as i64, i64),
+                (
+                    "notifier_schedule_elapsed_us",
+                    self.entry_notify_schedule_elapsed_us as i64,
+                    i64
+                ),
                 (
                     "replay_total_elapsed",
                     self.started.elapsed().as_micros() as i64,
@@ -1495,17 +1507,22 @@ pub fn confirm_slot(
                         })?;
                     if let Some(block_footer) = block_footer
                         && let Some(entry_notification_sender) = entry_notification_sender
-                        && let Err(err) =
+                    {
+                        let send_start = Instant::now();
+                        let send_result =
                             entry_notification_sender.send(EntryNotification::BlockFooter {
                                 slot,
                                 bank_id: bank.bank_id(),
                                 block_footer: Box::new(block_footer),
-                            })
-                    {
-                        warn!(
-                            "Slot {slot} block footer entry_notification_sender send failed: \
-                             {err:?}"
-                        );
+                            });
+                        timing.entry_notify_schedule_elapsed_us +=
+                            send_start.elapsed().as_micros() as u64;
+                        if let Err(err) = send_result {
+                            warn!(
+                                "Slot {slot} block footer entry_notification_sender send \
+                                 failed: {err:?}"
+                            );
+                        }
                     }
                 }
                 progress.num_shreds += num_shreds as u64;
@@ -1540,6 +1557,7 @@ fn confirm_slot_entries(
         replay_elapsed,
         poh_verify_elapsed,
         transaction_verify_elapsed,
+        entry_notify_schedule_elapsed_us,
         ..
     } = timing;
 
@@ -1563,13 +1581,16 @@ fn confirm_slot_entries(
         .map(|(i, entry)| {
             if let Some(entry_notification_sender) = entry_notification_sender {
                 let entry_index = progress.num_entries.saturating_add(i);
-                if let Err(err) = entry_notification_sender.send(EntryNotification::Entry {
+                let send_start = Instant::now();
+                let send_result = entry_notification_sender.send(EntryNotification::Entry {
                     slot,
                     bank_id,
                     index: entry_index,
                     entry: entry.into(),
                     starting_transaction_index: entry_tx_starting_index,
-                }) {
+                });
+                *entry_notify_schedule_elapsed_us += send_start.elapsed().as_micros() as u64;
+                if let Err(err) = send_result {
                     warn!(
                         "Slot {slot}, entry {entry_index} entry_notification_sender send failed: \
                          {err:?}"

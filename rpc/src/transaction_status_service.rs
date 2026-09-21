@@ -9,6 +9,7 @@ use {
     itertools::izip,
     solana_clock::Slot,
     solana_ledger::blockstore::{Blockstore, BlockstoreError},
+    solana_measure::measure::Measure,
     solana_runtime::{
         bank::{Bank, KeyedRewardsAndNumPartitions},
         dependency_tracker::DependencyTracker,
@@ -25,10 +26,50 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     },
     thiserror::Error,
 };
+
+const METRICS_REPORTING_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct TransactionStatusServiceMetrics {
+    batch_count: u64,
+    transaction_count: u64,
+    notify_transaction_count: u64,
+    notify_transaction_elapsed_us: u64,
+    write_batch_elapsed_us: u64,
+    max_receiver_len: usize,
+}
+
+impl TransactionStatusServiceMetrics {
+    const NAME: &str = "transaction-status-service-timing";
+
+    fn report(&self) {
+        datapoint_info!(
+            Self::NAME,
+            ("batch_count", self.batch_count as i64, i64),
+            ("transaction_count", self.transaction_count as i64, i64),
+            (
+                "notify_transaction_count",
+                self.notify_transaction_count as i64,
+                i64
+            ),
+            (
+                "notify_transaction_elapsed_us",
+                self.notify_transaction_elapsed_us as i64,
+                i64
+            ),
+            (
+                "write_batch_elapsed_us",
+                self.write_batch_elapsed_us as i64,
+                i64
+            ),
+            ("max_receiver_len", self.max_receiver_len as i64, i64),
+        );
+    }
+}
 
 #[derive(Error, Debug)]
 enum Error {
@@ -71,6 +112,8 @@ impl TransactionStatusService {
                 let transaction_status_receiver = transaction_status_receiver.clone();
                 move || {
                     info!("{} has started", Self::SERVICE_NAME);
+                    let mut metrics = TransactionStatusServiceMetrics::default();
+                    let mut last_report = Instant::now();
                     loop {
                         if exit.load(Ordering::Relaxed) {
                             break;
@@ -88,6 +131,9 @@ impl TransactionStatusService {
                                 continue;
                             }
                         };
+                        metrics.max_receiver_len = metrics
+                            .max_receiver_len
+                            .max(transaction_status_receiver.len());
 
                         match Self::write_transaction_status_batch(
                             message,
@@ -97,6 +143,7 @@ impl TransactionStatusService {
                             &blockstore,
                             enable_extended_tx_metadata_storage,
                             depenency_tracker.clone(),
+                            &mut metrics,
                         ) {
                             Ok(_) => {}
                             Err(err) => {
@@ -104,6 +151,12 @@ impl TransactionStatusService {
                                 exit.store(true, Ordering::Relaxed);
                                 break;
                             }
+                        }
+
+                        if last_report.elapsed() > METRICS_REPORTING_INTERVAL {
+                            metrics.report();
+                            metrics = TransactionStatusServiceMetrics::default();
+                            last_report = Instant::now();
                         }
                     }
                     info!("{} has stopped", Self::SERVICE_NAME);
@@ -125,6 +178,7 @@ impl TransactionStatusService {
         blockstore: &Blockstore,
         enable_extended_tx_metadata_storage: bool,
         dependency_tracker: Option<Arc<DependencyTracker>>,
+        metrics: &mut TransactionStatusServiceMetrics,
     ) -> Result<()> {
         match transaction_status_message {
             TransactionStatusMessage::Batch((
@@ -146,6 +200,7 @@ impl TransactionStatusService {
                     None
                 };
 
+                metrics.batch_count += 1;
                 for (
                     transaction,
                     commit_result,
@@ -168,6 +223,7 @@ impl TransactionStatusService {
                     let Ok(committed_tx) = commit_result else {
                         continue;
                     };
+                    metrics.transaction_count += 1;
 
                     let CommittedTransaction {
                         status,
@@ -209,6 +265,8 @@ impl TransactionStatusService {
                         let message_hash = transaction.message_hash();
                         let signature = transaction.signature();
                         let transaction = transaction.to_versioned_transaction();
+                        let mut notify_transaction_elapsed =
+                            Measure::start("notify_transaction_elapsed");
                         transaction_notifier.notify_transaction(
                             slot,
                             bank_id,
@@ -219,6 +277,9 @@ impl TransactionStatusService {
                             &transaction_status_meta,
                             &transaction,
                         );
+                        notify_transaction_elapsed.stop();
+                        metrics.notify_transaction_count += 1;
+                        metrics.notify_transaction_elapsed_us += notify_transaction_elapsed.as_us();
                     }
 
                     if !(enable_extended_tx_metadata_storage || transaction_notifier.is_some()) {
@@ -256,7 +317,11 @@ impl TransactionStatusService {
                 }
 
                 if let Some(batch) = status_and_memos_batch {
-                    blockstore.write_batch(batch)?;
+                    let mut write_batch_elapsed = Measure::start("write_batch_elapsed");
+                    let write_result = blockstore.write_batch(batch);
+                    write_batch_elapsed.stop();
+                    metrics.write_batch_elapsed_us += write_batch_elapsed.as_us();
+                    write_result?;
                 }
 
                 if let Some(dependency_tracker) = dependency_tracker.as_ref()

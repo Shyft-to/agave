@@ -3,15 +3,66 @@ use {
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     solana_clock::{BankId, Slot},
     solana_entry::{block_component::VersionedBlockFooter, entry::EntrySummary},
+    solana_measure::measure::Measure,
     std::{
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
+
+const METRICS_REPORTING_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct EntryNotifierServiceMetrics {
+    notify_entry_count: u64,
+    notify_entry_elapsed_us: u64,
+    notify_block_footer_count: u64,
+    notify_block_footer_elapsed_us: u64,
+    notify_update_parent_count: u64,
+    notify_update_parent_elapsed_us: u64,
+    max_receiver_len: usize,
+}
+
+impl EntryNotifierServiceMetrics {
+    const NAME: &str = "entry-notifier-service-timing";
+
+    fn report(&self) {
+        datapoint_info!(
+            Self::NAME,
+            ("notify_entry_count", self.notify_entry_count as i64, i64),
+            (
+                "notify_entry_elapsed_us",
+                self.notify_entry_elapsed_us as i64,
+                i64
+            ),
+            (
+                "notify_block_footer_count",
+                self.notify_block_footer_count as i64,
+                i64
+            ),
+            (
+                "notify_block_footer_elapsed_us",
+                self.notify_block_footer_elapsed_us as i64,
+                i64
+            ),
+            (
+                "notify_update_parent_count",
+                self.notify_update_parent_count as i64,
+                i64
+            ),
+            (
+                "notify_update_parent_elapsed_us",
+                self.notify_update_parent_elapsed_us as i64,
+                i64
+            ),
+            ("max_receiver_len", self.max_receiver_len as i64, i64),
+        );
+    }
+}
 
 pub enum EntryNotification {
     Entry {
@@ -43,15 +94,25 @@ impl EntryNotifierService {
         let thread_hdl = Builder::new()
             .name("solEntryNotif".to_string())
             .spawn(move || {
+                let mut metrics = EntryNotifierServiceMetrics::default();
+                let mut last_report = Instant::now();
                 loop {
                     if exit.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    if let Err(RecvTimeoutError::Disconnected) =
-                        Self::notify(&entry_notification_receiver, entry_notifier.clone())
-                    {
+                    if let Err(RecvTimeoutError::Disconnected) = Self::notify(
+                        &entry_notification_receiver,
+                        entry_notifier.clone(),
+                        &mut metrics,
+                    ) {
                         break;
+                    }
+
+                    if last_report.elapsed() > METRICS_REPORTING_INTERVAL {
+                        metrics.report();
+                        metrics = EntryNotifierServiceMetrics::default();
+                        last_report = Instant::now();
                     }
                 }
             })
@@ -65,8 +126,13 @@ impl EntryNotifierService {
     fn notify(
         entry_notification_receiver: &EntryNotifierReceiver,
         entry_notifier: EntryNotifierArc,
+        metrics: &mut EntryNotifierServiceMetrics,
     ) -> Result<(), RecvTimeoutError> {
-        match entry_notification_receiver.recv_timeout(Duration::from_secs(1))? {
+        let notification = entry_notification_receiver.recv_timeout(Duration::from_secs(1))?;
+        metrics.max_receiver_len = metrics
+            .max_receiver_len
+            .max(entry_notification_receiver.len());
+        match notification {
             EntryNotification::Entry {
                 slot,
                 bank_id,
@@ -74,6 +140,7 @@ impl EntryNotifierService {
                 entry,
                 starting_transaction_index,
             } => {
+                let mut notify_entry_elapsed = Measure::start("notify_entry_elapsed");
                 entry_notifier.notify_entry(
                     slot,
                     bank_id,
@@ -81,14 +148,28 @@ impl EntryNotifierService {
                     &entry,
                     starting_transaction_index,
                 );
+                notify_entry_elapsed.stop();
+                metrics.notify_entry_count += 1;
+                metrics.notify_entry_elapsed_us += notify_entry_elapsed.as_us();
             }
             EntryNotification::BlockFooter {
                 slot,
                 bank_id,
                 block_footer,
-            } => entry_notifier.notify_block_footer(slot, bank_id, block_footer.as_ref()),
+            } => {
+                let mut notify_block_footer_elapsed = Measure::start("notify_block_footer_elapsed");
+                entry_notifier.notify_block_footer(slot, bank_id, block_footer.as_ref());
+                notify_block_footer_elapsed.stop();
+                metrics.notify_block_footer_count += 1;
+                metrics.notify_block_footer_elapsed_us += notify_block_footer_elapsed.as_us();
+            }
             EntryNotification::UpdateParent(update_parent) => {
-                entry_notifier.notify_entry_update_parent(&update_parent)
+                let mut notify_update_parent_elapsed =
+                    Measure::start("notify_update_parent_elapsed");
+                entry_notifier.notify_entry_update_parent(&update_parent);
+                notify_update_parent_elapsed.stop();
+                metrics.notify_update_parent_count += 1;
+                metrics.notify_update_parent_elapsed_us += notify_update_parent_elapsed.as_us();
             }
         }
         Ok(())
@@ -218,9 +299,10 @@ mod tests {
             })
             .unwrap();
 
-        EntryNotifierService::notify(&receiver, notifier.clone()).unwrap();
-        EntryNotifierService::notify(&receiver, notifier.clone()).unwrap();
-        EntryNotifierService::notify(&receiver, notifier.clone()).unwrap();
+        let mut metrics = EntryNotifierServiceMetrics::default();
+        EntryNotifierService::notify(&receiver, notifier.clone(), &mut metrics).unwrap();
+        EntryNotifierService::notify(&receiver, notifier.clone(), &mut metrics).unwrap();
+        EntryNotifierService::notify(&receiver, notifier.clone(), &mut metrics).unwrap();
 
         assert_eq!(
             *notifier.events.lock().unwrap(),
