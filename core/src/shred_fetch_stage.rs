@@ -7,6 +7,7 @@ use {
         self,
         filter::{ShredFilterContext, TurbineMode},
     },
+    solana_measure::measure::Measure,
     solana_perf::packet::{PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef},
     solana_runtime::bank_forks::{BankForks, SharableBanks},
     solana_streamer::{
@@ -15,7 +16,10 @@ use {
     },
     std::{
         net::UdpSocket,
-        sync::{Arc, RwLock, atomic::AtomicBool},
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
+        },
         thread::{self, Builder, JoinHandle},
         time::Duration,
     },
@@ -66,6 +70,7 @@ impl ShredFetchStage {
         );
 
         for mut packet_batch in recvr {
+            let mut modifier_measure = Measure::start("modifier");
             shred_filter_ctx.maybe_update(sharable_banks.root());
             shred_filter_ctx.stats.shred_count += packet_batch.len();
 
@@ -107,6 +112,12 @@ impl ShredFetchStage {
                 } else {
                     packet.meta_mut().flags.insert(flags);
                 }
+            }
+            modifier_measure.stop();
+            if let Some(stats) = recvr_stats.as_ref() {
+                stats
+                    .modifier_elapsed_us
+                    .fetch_add(modifier_measure.as_us(), Ordering::Relaxed);
             }
             if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
                 && let Some(stats) = recvr_stats.as_ref()

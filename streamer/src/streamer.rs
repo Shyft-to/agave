@@ -25,7 +25,7 @@ use {
         net::{IpAddr, SocketAddr, UdpSocket},
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         thread::{Builder, JoinHandle},
         time::{Duration, Instant},
@@ -101,6 +101,15 @@ pub struct StreamerReceiveStats {
     pub full_packet_batches_count: AtomicUsize,
     pub max_channel_len: AtomicUsize,
     pub num_packets_dropped: AtomicUsize,
+    /// Wall clock time spent in the packet fetcher, i.e. blocked in the
+    /// socket `recv_from` call inside [`recv_loop`]. In microseconds.
+    pub fetch_elapsed_us: AtomicU64,
+    /// Wall clock time spent in the packet modifier processing a batch (from
+    /// receiving it off the fetcher's channel to sending it downstream).
+    /// Only populated when a modifier stage shares this `StreamerReceiveStats`
+    /// instance with its fetcher, e.g. `ShredFetchStage::modify_packets`. In
+    /// microseconds.
+    pub modifier_elapsed_us: AtomicU64,
 }
 
 impl StreamerReceiveStats {
@@ -112,6 +121,8 @@ impl StreamerReceiveStats {
             full_packet_batches_count: AtomicUsize::default(),
             max_channel_len: AtomicUsize::default(),
             num_packets_dropped: AtomicUsize::default(),
+            fetch_elapsed_us: AtomicU64::default(),
+            modifier_elapsed_us: AtomicU64::default(),
         }
     }
 
@@ -141,6 +152,16 @@ impl StreamerReceiveStats {
             (
                 "num_packets_dropped",
                 self.num_packets_dropped.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "fetch_elapsed_us",
+                self.fetch_elapsed_us.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "modifier_elapsed_us",
+                self.modifier_elapsed_us.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
         );
@@ -191,10 +212,15 @@ fn recv_loop<P: SocketProvider>(
                 return Ok(());
             }
 
+            let mut fetch_measure = Measure::start("fetch");
             #[cfg(unix)]
             let result = packet::recv_from(&mut packet_batch, socket, coalesce, &mut poll_fd);
             #[cfg(not(unix))]
             let result = packet::recv_from(&mut packet_batch, socket, coalesce);
+            fetch_measure.stop();
+            stats
+                .fetch_elapsed_us
+                .fetch_add(fetch_measure.as_us(), Ordering::Relaxed);
 
             if let Ok(len) = result {
                 if len > 0 {
