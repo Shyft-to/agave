@@ -161,7 +161,7 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
-    // CPU cores for the turbine shred fetch receiver threads (round-robin)
+    // Pool of CPU cores for shred fetch threads; each thread gets a distinct core
     pub shred_fetch_pinned_cpu_cores: Vec<usize>,
     // CPU core for the main replay stage thread
     pub replay_pinned_cpu_core: Option<usize>,

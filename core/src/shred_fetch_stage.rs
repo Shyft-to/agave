@@ -153,7 +153,7 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_mode: TurbineMode,
-        pinned_cpu_cores: &[usize],
+        cpu_cores: &mut impl Iterator<Item = usize>,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let (packet_sender, packet_receiver) =
@@ -164,8 +164,8 @@ impl ShredFetchStage {
             .enumerate()
             .map(|(i, socket)| {
                 let thread_name = format!("{receiver_thread_name}{i:02}");
-                // Receiver i is pinned to cores[i % len], if any cores were given.
-                let pinned_cpu_core = pinned_cpu_cores.iter().cycle().nth(i).copied();
+                // Each thread takes its own core; unpinned once cores run out.
+                let pinned_cpu_core = cpu_cores.next();
                 let thread_desc = thread_name.clone();
                 streamer::receiver_with_thread_init(
                     thread_name,
@@ -185,9 +185,13 @@ impl ShredFetchStage {
                 )
             })
             .collect();
+        let modifier_cpu_core = cpu_cores.next();
         let modifier_hdl = Builder::new()
             .name(modifier_thread_name.to_string())
             .spawn(move || {
+                if let Some(cpu_core) = modifier_cpu_core {
+                    pin_current_thread(cpu_core, modifier_thread_name);
+                }
                 Self::modify_packets(
                     packet_receiver,
                     Some(receiver_stats),
@@ -224,6 +228,18 @@ impl ShredFetchStage {
             outstanding_repair_requests,
         };
 
+        // Every thread in this stage (turbine + repair receivers and their
+        // modifier threads) is pinned to a distinct core from the pool.
+        let num_threads = sockets.len() + 3;
+        if !pinned_cpu_cores.is_empty() && pinned_cpu_cores.len() < num_threads {
+            warn!(
+                "Shred fetch stage has {num_threads} threads but only {} CPU cores are available \
+                 for pinning; remaining threads will be unpinned",
+                pinned_cpu_cores.len()
+            );
+        }
+        let mut cpu_cores = pinned_cpu_cores.iter().copied();
+
         let (mut tvu_threads, tvu_filter) = Self::packet_modifier(
             "solRcvrShred",
             "solTvuPktMod",
@@ -238,7 +254,7 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_mode.clone(),
-            pinned_cpu_cores,
+            &mut cpu_cores,
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -255,7 +271,7 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_mode.clone(),
-            &[], // repair receiver is not pinned
+            &mut cpu_cores,
         );
 
         tvu_threads.extend(repair_receiver);
