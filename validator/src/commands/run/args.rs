@@ -907,6 +907,28 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Specify which CPU core PoH is pinned to. Defaults to CPU 0 on Linux"),
     )
     .arg(
+        Arg::with_name("shred_fetch_pinned_cpu_cores")
+            .long("shred-fetch-pinned-cpu-cores")
+            .takes_value(true)
+            .value_name("CPU_LIST")
+            .validator(|value| validate_cpu_ranges(value, "--shred-fetch-pinned-cpu-cores"))
+            .help(
+                "CPU cores to pin the turbine shred fetch receiver threads to (e.g. \"2-4,7\"). \
+                 Receiver threads are assigned round-robin. Linux only. Defaults to unpinned",
+            ),
+    )
+    .arg(
+        Arg::with_name("replay_pinned_cpu_core")
+            .long("replay-pinned-cpu-core")
+            .takes_value(true)
+            .value_name("CPU_ID")
+            .validator(is_parsable::<usize>)
+            .help(
+                "CPU core to pin the main replay stage thread to. Linux only. Defaults to \
+                 unpinned",
+            ),
+    )
+    .arg(
         Arg::with_name("poh_hashes_per_batch")
             .hidden(hidden_unless_forced())
             .long("poh-hashes-per-batch")

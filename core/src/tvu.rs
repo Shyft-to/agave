@@ -161,6 +161,10 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
+    // CPU cores for the turbine shred fetch receiver threads (round-robin)
+    pub shred_fetch_pinned_cpu_cores: Vec<usize>,
+    // CPU core for the main replay stage thread
+    pub replay_pinned_cpu_core: Option<usize>,
 }
 
 impl Default for TvuConfig {
@@ -177,6 +181,8 @@ impl Default for TvuConfig {
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
+            shred_fetch_pinned_cpu_cores: Vec::new(),
+            replay_pinned_cpu_core: None,
         }
     }
 }
@@ -392,6 +398,7 @@ impl Tvu {
             cluster_info.clone(),
             outstanding_repair_requests.clone(),
             turbine_mode,
+            &tvu_config.shred_fetch_pinned_cpu_cores,
             exit.clone(),
         );
 
@@ -607,6 +614,7 @@ impl Tvu {
             wait_to_vote_slot,
             replay_forks_threads: tvu_config.replay_forks_threads,
             replay_transactions_threads: tvu_config.replay_transactions_threads,
+            pinned_cpu_core: tvu_config.replay_pinned_cpu_core,
             blockstore: blockstore.clone(),
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),

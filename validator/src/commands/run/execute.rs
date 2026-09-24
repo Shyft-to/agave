@@ -437,6 +437,9 @@ pub fn execute(
     #[cfg(not(target_os = "linux"))]
     let poh_pinned_cpu_core = None;
 
+    let (shred_fetch_pinned_cpu_cores, replay_pinned_cpu_core) =
+        tvu_pinned_cpu_cores(matches, poh_pinned_cpu_core)?;
+
     solana_core::validator::report_target_features();
 
     let authorized_voter_keypairs = keypairs_of(matches, "authorized_voter_keypairs")
@@ -843,6 +846,8 @@ pub fn execute(
         // permission to do so in order to fail quickly and give a direct error
         enforce_ulimit_nofile: true,
         poh_pinned_cpu_core,
+        shred_fetch_pinned_cpu_cores,
+        replay_pinned_cpu_core,
         poh_hashes_per_batch: value_of(matches, "poh_hashes_per_batch")
             .unwrap_or(poh_service::DEFAULT_HASHES_PER_BATCH),
         process_ledger_before_services: matches.is_present("process_ledger_before_services"),
@@ -1395,6 +1400,77 @@ fn new_snapshot_config(
     }
 
     Ok(snapshot_config)
+}
+
+/// Parses `--shred-fetch-pinned-cpu-cores` and `--replay-pinned-cpu-core`,
+/// rejecting cores that are unavailable to this process or already claimed by
+/// PoH, XDP, or each other.
+#[cfg(target_os = "linux")]
+fn tvu_pinned_cpu_cores(
+    matches: &ArgMatches,
+    poh_pinned_cpu_core: Option<usize>,
+) -> Result<(Vec<usize>, Option<usize>), String> {
+    let shred_fetch_cores = matches
+        .value_of("shred_fetch_pinned_cpu_cores")
+        .map(|cpu_str| {
+            parse_cpu_ranges(cpu_str).expect("clap validator already accepted this CPU list")
+        })
+        .unwrap_or_default();
+    let replay_core: Option<usize> = value_of(matches, "replay_pinned_cpu_core");
+    if shred_fetch_cores.is_empty() && replay_core.is_none() {
+        return Ok((shred_fetch_cores, replay_core));
+    }
+
+    let allowed = cpu_affinity(None).map_err(|e| format!("failed to query CPU affinity: {e}"))?;
+    let xdp_cores = matches
+        .value_of("xdp_cpu_cores")
+        .or_else(|| matches.value_of("experimental_retransmit_xdp_cpu_cores"))
+        .map(|cpu_str| {
+            parse_cpu_ranges(cpu_str).expect("clap validator already accepted this CPU list")
+        })
+        .unwrap_or_default();
+    let check = |core: usize, arg: &str| -> Result<(), String> {
+        if !allowed.iter().any(|cpu| **cpu == core) {
+            return Err(format!(
+                "{arg}: CPU {core} is not in this process's allowed CPU set"
+            ));
+        }
+        if poh_pinned_cpu_core == Some(core) {
+            return Err(format!("{arg}: CPU {core} is already used by PoH"));
+        }
+        if xdp_cores.contains(&core) {
+            return Err(format!("{arg}: CPU {core} is already used by XDP"));
+        }
+        Ok(())
+    };
+    for &core in &shred_fetch_cores {
+        check(core, "--shred-fetch-pinned-cpu-cores")?;
+    }
+    if let Some(core) = replay_core {
+        check(core, "--replay-pinned-cpu-core")?;
+        if shred_fetch_cores.contains(&core) {
+            return Err(format!(
+                "--replay-pinned-cpu-core: CPU {core} is also in --shred-fetch-pinned-cpu-cores"
+            ));
+        }
+    }
+    info!(
+        "TVU CPU pinning: shred fetch receivers {shred_fetch_cores:?}, replay stage {replay_core:?}"
+    );
+    Ok((shred_fetch_cores, replay_core))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tvu_pinned_cpu_cores(
+    matches: &ArgMatches,
+    _poh_pinned_cpu_core: Option<usize>,
+) -> Result<(Vec<usize>, Option<usize>), String> {
+    if matches.is_present("shred_fetch_pinned_cpu_cores")
+        || matches.is_present("replay_pinned_cpu_core")
+    {
+        warn!("TVU CPU pinning is only supported on Linux; ignoring pinning flags");
+    }
+    Ok((Vec::new(), None))
 }
 
 #[cfg(target_os = "linux")]

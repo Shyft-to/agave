@@ -279,9 +279,39 @@ pub fn receiver(
     use_pinned_memory: bool,
     is_staked_service: bool,
 ) -> JoinHandle<()> {
+    receiver_with_thread_init(
+        thread_name,
+        socket,
+        exit,
+        packet_batch_sender,
+        recycler,
+        stats,
+        coalesce,
+        use_pinned_memory,
+        is_staked_service,
+        || {},
+    )
+}
+
+/// Same as [`receiver`], but runs `thread_init` on the receiver thread before
+/// entering the receive loop (e.g. to set CPU affinity).
+#[allow(clippy::too_many_arguments)]
+pub fn receiver_with_thread_init(
+    thread_name: String,
+    socket: Arc<UdpSocket>,
+    exit: Arc<AtomicBool>,
+    packet_batch_sender: impl ChannelSend<PacketBatch>,
+    recycler: PacketBatchRecycler,
+    stats: Arc<StreamerReceiveStats>,
+    coalesce: Option<Duration>,
+    use_pinned_memory: bool,
+    is_staked_service: bool,
+    thread_init: impl FnOnce() + Send + 'static,
+) -> JoinHandle<()> {
     Builder::new()
         .name(thread_name)
         .spawn(move || {
+            thread_init();
             let mut provider = FixedSocketProvider::new(socket);
             let _ = recv_loop(
                 &mut provider,

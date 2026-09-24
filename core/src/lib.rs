@@ -18,6 +18,7 @@ pub mod cluster_slots_service;
 pub mod commitment_service;
 pub mod completed_data_sets_service;
 pub mod consensus;
+mod cpu_pinning;
 pub mod cost_update_service;
 pub mod drop_bank_service;
 pub mod epoch_specs;

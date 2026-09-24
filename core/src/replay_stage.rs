@@ -20,6 +20,7 @@ use {
             tower_vote_state::TowerVoteState,
         },
         cost_update_service::CostUpdate,
+        cpu_pinning::pin_current_thread,
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -430,6 +431,7 @@ pub struct ReplayStageConfig {
     pub wait_to_vote_slot: Option<Slot>,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
+    pub pinned_cpu_core: Option<usize>,
     pub blockstore: Arc<Blockstore>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub cluster_info: Arc<ClusterInfo>,
@@ -751,6 +753,7 @@ impl ReplayStage {
             wait_to_vote_slot,
             replay_forks_threads,
             replay_transactions_threads,
+            pinned_cpu_core,
             blockstore,
             bank_forks,
             cluster_info,
@@ -903,6 +906,11 @@ impl ReplayStage {
             };
             let replay_verification_worker_pool =
                 ReplayVerificationWorkerPool::new(replay_transactions_threads.get());
+            // Pin only after the pools above are spawned; on Linux, child
+            // threads inherit this thread's affinity mask.
+            if let Some(cpu_core) = pinned_cpu_core {
+                pin_current_thread(cpu_core, "solReplayStage");
+            }
 
             let process_active_banks_context = ProcessActiveBanksContext {
                 bank_forks: bank_forks.clone(),

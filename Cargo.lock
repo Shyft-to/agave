@@ -1401,7 +1401,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -1417,8 +1417,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes 0.14.100",
- "rand 0.7.3",
- "rand_core 0.5.1",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
  "serde",
  "unicode-normalization",
 ]
@@ -8033,6 +8033,7 @@ dependencies = [
  "agave-banking-stage-ingress-types",
  "agave-bls-cert-verify",
  "agave-bls-sigverify",
+ "agave-cpu-utils",
  "agave-feature-set",
  "agave-fs",
  "agave-logger",
