@@ -1,10 +1,7 @@
 //! The `shred_fetch_stage` pulls shreds from UDP sockets and sends it to a channel.
 
 use {
-    crate::{
-        cpu_pinning::pin_current_thread,
-        repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
-    },
+    crate::repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::shred::{
         self,
@@ -153,7 +150,6 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_mode: TurbineMode,
-        pinned_cpu_cores: &[usize],
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let (packet_sender, packet_receiver) =
@@ -163,12 +159,8 @@ impl ShredFetchStage {
             .into_iter()
             .enumerate()
             .map(|(i, socket)| {
-                let thread_name = format!("{receiver_thread_name}{i:02}");
-                // Receiver i is pinned to cores[i % len], if any cores were given.
-                let pinned_cpu_core = pinned_cpu_cores.iter().cycle().nth(i).copied();
-                let thread_desc = thread_name.clone();
-                streamer::receiver_with_thread_init(
-                    thread_name,
+                streamer::receiver(
+                    format!("{receiver_thread_name}{i:02}"),
                     socket,
                     exit.clone(),
                     packet_sender.clone(),
@@ -177,11 +169,6 @@ impl ShredFetchStage {
                     Some(Duration::from_millis(5)), // coalesce
                     true,                           // use_pinned_memory
                     false,                          // is_staked_service
-                    move || {
-                        if let Some(cpu_core) = pinned_cpu_core {
-                            pin_current_thread(cpu_core, &thread_desc);
-                        }
-                    },
                 )
             })
             .collect();
@@ -214,7 +201,6 @@ impl ShredFetchStage {
         cluster_info: Arc<ClusterInfo>,
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_mode: TurbineMode,
-        pinned_cpu_cores: &[usize],
         exit: Arc<AtomicBool>,
     ) -> Self {
         let recycler = PacketBatchRecycler::new();
@@ -238,7 +224,6 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_mode.clone(),
-            pinned_cpu_cores,
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -255,7 +240,6 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_mode.clone(),
-            &[], // repair receiver is not pinned
         );
 
         tvu_threads.extend(repair_receiver);
