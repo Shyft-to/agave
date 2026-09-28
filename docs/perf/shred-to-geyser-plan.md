@@ -240,4 +240,4 @@ Stage busy vs idle (per second): `shred_fetch_receiver`: `fetch_elapsed_us`, `fe
 | 2026-09-28 | Phase 1a: busy/wait split of shred pipeline metrics | compiles, not yet deployed | 03293d1c3a |
 | 2026-09-28 | Phase 1b (deshred path): sampled end-to-end latency tracker, 6 unit tests pass | compiles, not yet deployed | c15c4ca3c3 |
 | 2026-09-28 | Phase 1c: plugin callback timings (account update, slot status, deshred tx) | 20 geyser-manager tests pass, not yet deployed | ebb4382aa6 |
-| 2026-09-28 | Phase 1b (per-slot): `slot-geyser-latency` covering executed txs and slot status; 5 new unit tests | compiles, 11 tracker + 20 geyser tests pass, not yet deployed | (next commit) |
+| 2026-09-28 | Phase 1b (per-slot): `slot-geyser-latency` covering executed txs and slot status; 5 new unit tests | compiles, 11 tracker + 20 geyser tests pass, not yet deployed | bf617caa77 |
