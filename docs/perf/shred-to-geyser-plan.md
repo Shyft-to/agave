@@ -196,6 +196,11 @@ For each candidate: one commit or branch, a before/after comparison on the same 
 - **Crate feature:** `solana-geyser-plugin-manager` tests need `--features agave-unstable-api`, otherwise they silently run 0 tests.
 
 ### Influx queries (InfluxQL)
+
+
+```sql
+ WHERE ("host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp') AND
+```
 Deshred end-to-end latency, percentiles per stage (stack the p50/p90 series):
 ```sql
 SELECT mean("total_p50_us"), mean("total_p90_us"), mean("total_p99_us"), max("total_max_us")
@@ -288,6 +293,42 @@ SELECT max("max_receiver_len") FROM "transaction-status-service-timing" WHERE ti
 
 If the first hour has too few samples, rerun with `AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE=1`.
 
+## Phase 2 baseline results (test node, 2026-09-28 ~16:30, "last 1h" queries, pull #2 with headers)
+Note: the Grafana table dropped the first selected column of every query, so a query's first field was not available; that is why some fields below are missing. Put a throwaway first column in future queries (e.g. `SELECT count("x"), ...`) or use `influx -format csv`. An earlier pull at 16:12 gave somewhat higher values (total p90 2.7ms, p99 4.7ms), so numbers move by tens of percent between windows.
+
+**Deshred path (from the fetch modifier, last arriving shred of each data set), µs**
+| | p50 | p90 | p99 (mean of 10s windows) | max |
+|---|---|---|---|---|
+| total | 1074 | 1564 | 3060 | 386789 |
+| fetch → sigverify done | | 904 | 1911 | 18675 |
+| sigverify → insert done | | 502 | 1262 | **386107** |
+| insert → service dequeue | | 14 | | 1809 |
+| dequeue → entries loaded (RocksDB re-read) | | 151 | | 5182 |
+| loaded → notified | | 228 | | 1339 |
+| data-set arrival spread | | 8587 | | |
+
+115,610 data sets tracked, 21,767 untracked (16%; recovered/repaired last shred or missing timestamps, so the tail is probably understated).
+
+**Stage ranking by p90 contribution:** fetch→sigverify 50%, sigverify→insert 28%, notify 13%, RocksDB re-read 8%, channel 1%.
+
+**Sigverify thread (sums over the window):** `recv_wait` 3064s (idle), `sigverify` (ed25519 verify) 172s, `resign` (retransmit-signature check + resign) **6152s = 97% of its busy time, 36x the verify cost**. Caveat: these three add up to more than 1h of a single thread's wall time, so the query window or series is not what we assumed (multiple reporters? longer window?). Ratios within the datapoint are still valid.
+
+**Window insert thread:** waiting 3373s, deserialize 7s, blockstore insert 209s. Not saturated.
+
+**Receive:** 53.7M batches, 59.5% full (64 packets); mean time per batch call = 3577s/53.7M = 67µs, so the 5ms coalesce window is not costing us on average (independent of the time window). Longest single call 35.6ms. No dropped packets, no overflow_shreds. Sigverify saw 2.68B packets of which **1.65B (62%) were duplicates**; window insert received 1.002B shreds. Average 49.7 packets per batch.
+
+**Per slot (6716 slots with all stages), p90:** first fetch → first tx notified 16.9ms; first fetch → last tx 262ms; slot completed → last tx 12.0ms; created bank → replay start 153µs; replay start → first tx 5.2ms; frozen → Processed 44µs; Processed → Confirmed 205ms (consensus, not ours).
+
+**Plugin / queues:** account-update callbacks: 42.2M calls, worst 10.6ms, average not captured. Slot-status and deshred plugin timings not yet collected. Peak queue lengths: entry notifier 226, tx status 525.
+
+**Conclusions and re-ranking of Phase 3**
+1. The pipeline after the fetch modifier is already fast (p90 1.6ms). The big-ticket item is sigverify, and inside it the resign step (97% of the thread's busy time, in the critical path before shreds reach window insert). Candidate 2 becomes first: shrink or decouple resign.
+2. Cheap no-code experiment first: `--tvu-shred-sigverify-threads` (pool size; `validator.rs` default is 2, the CLI default is the CPU count).
+3. The single 386ms outlier is in sigverify → insert (window insert / blockstore side), not sigverify. Investigate with `blockstore-insert-shreds` (write_batch, insert_lock) around that time.
+4. Candidate 1 (coalesce) is deprioritized: mean per-batch time is 67µs. Candidate 4 (RocksDB re-read, 151µs p90) is now low value.
+5. 62% duplicate packets: find out where they come from (extra feeds?). Each still costs receive, fetch-modifier and channel work before dedup.
+6. Executed-tx and slot-status paths are not bottlenecks at this point.
+
 ## Progress Log
 | Date | Step | Result | Commit |
 |---|---|---|---|
@@ -296,3 +337,4 @@ If the first hour has too few samples, rerun with `AGAVE_PIPELINE_LATENCY_SLOT_S
 | 2026-09-28 | Phase 1b (deshred path): sampled end-to-end latency tracker, 6 unit tests pass | compiles, not yet deployed | c15c4ca3c3 |
 | 2026-09-28 | Phase 1c: plugin callback timings (account update, slot status, deshred tx) | 20 geyser-manager tests pass, not yet deployed | ebb4382aa6 |
 | 2026-09-28 | Phase 1b (per-slot): `slot-geyser-latency` covering executed txs and slot status; 5 new unit tests | compiles, 11 tracker + 20 geyser tests pass, not yet deployed | bf617caa77 |
+| 2026-09-28 | Phase 2 baseline collected on the test node (see "Phase 2 baseline results") | total deshred p90 1.56ms, p99 3.06ms; sigverify/resign dominates; one 386ms outlier in sigverify→insert | — |
