@@ -181,7 +181,44 @@ For each candidate: one commit or branch, a before/after comparison on the same 
 - **Correctness:** no increase in the `shred_sigverify` discard, `blockstore-insert-shreds` error or `overflow_shreds` counters. Replay keeps up (the root distance to the cluster is unchanged). The geyser plugin receives the same transaction count per slot (compare `deshred_geyser_timing.transactions_count` against the executed count).
 - **Outcome:** a documented p90 reduction in shred-recv → deshred-notify, and in first-shred → tx-notified per slot, with each change attributed in the Progress Log.
 
+## Phase 1 status (updated 2026-09-28)
+- [x] 1a: busy/wait split of `fetch_elapsed_us`, `recv_micros`, `shred_receiver_elapsed_us`; `modifier_elapsed_us` now includes the send; `handle_packets_elapsed_us` re-emitted as an alias.
+- [x] 1b (deshred path): `ledger/src/pipeline_latency.rs`, datapoint `shred-geyser-latency`.
+- [ ] 1b (per-slot): first shred → bank created → replay start → first tx executed → frozen → last tx notified in TSS → Processed/Confirmed/Rooted. **Not implemented yet.**
+- [x] 1c: `geyser-notify-account-update`, `geyser-notify-slot-status`, `geyser-notify-deshred-transaction` (count/total_us/avg_us/max_us every 2s).
+- [ ] Deploy to the test node and run the Phase 2 baseline.
+
+### Notes and deviations from the plan text above
+- **Coalescing:** in `streamer/src/packet.rs` `recv_from_coalesce`, the deadline is computed at call start, not at first packet arrival. If the socket was idle for longer than `max_wait`, the batch is forwarded immediately. Under load the call starts right after the previous batch, so a batch can wait up to the full 5ms. New metrics: `fetch_max_batch_us` (upper bound on batching delay), `fetch_idle_us`.
+- **Tracker start point:** `t_fetch` is taken when the modifier dequeues the batch, so socket batching and the `solRcvrShred*` → `solTvuPktMod` queue wait are not in `shred-geyser-latency`. Read `fetch_max_batch_us` and `channel_len` alongside it.
+- **Tracker method:** every data shred of every N-th slot is tracked (`AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE`, default 2, 0 disables). Per completed data set the timeline of the *last arriving* shred is reported, so network arrival spread is excluded (reported separately as `arrival_spread_*`). Data sets with no fetch/sigverify timestamps (recovered or repaired shreds) count as `untracked_data_sets`.
+- **Legacy shreds:** this tree only parses Merkle shred variants (`ShredVariant::try_from` rejects legacy), which matters for hand-built test shreds.
+- **Crate feature:** `solana-geyser-plugin-manager` tests need `--features agave-unstable-api`, otherwise they silently run 0 tests.
+
+### Influx queries (InfluxQL)
+Deshred end-to-end latency, percentiles per stage (stack the p50/p90 series):
+```sql
+SELECT mean("total_p50_us"), mean("total_p90_us"), mean("total_p99_us"), max("total_max_us")
+FROM "shred-geyser-latency" WHERE $timeFilter GROUP BY time($__interval) fill(null)
+
+SELECT mean("fetch_to_sigverify_p90_us"), mean("sigverify_to_insert_p90_us"), mean("insert_to_dequeue_p90_us"),
+       mean("dequeue_to_loaded_p90_us"), mean("loaded_to_notified_p90_us")
+FROM "shred-geyser-latency" WHERE $timeFilter GROUP BY time($__interval) fill(null)
+```
+Sample health (should be mostly tracked): `SELECT sum("data_sets"), sum("untracked_data_sets") FROM "shred-geyser-latency" WHERE $timeFilter GROUP BY time($__interval)`
+
+Plugin cost (average and worst call per 2s window):
+```sql
+SELECT sum("total_us")/sum("count") AS avg_us, max("max_us") FROM "geyser-notify-account-update" WHERE $timeFilter GROUP BY time($__interval)
+SELECT sum("total_us")/sum("count") AS avg_us, max("max_us") FROM "geyser-notify-slot-status" WHERE $timeFilter GROUP BY time($__interval)
+SELECT sum("total_us")/sum("count") AS avg_us, max("max_us") FROM "geyser-notify-deshred-transaction" WHERE $timeFilter GROUP BY time($__interval)
+```
+Stage busy vs idle (per second): `shred_fetch_receiver`: `fetch_elapsed_us`, `fetch_idle_us`, `fetch_max_batch_us`, `modifier_elapsed_us`, `channel_len`; `shred_sigverify`: `recv_micros`, `recv_wait_micros`, `sigverify_micros`, `resign_micros`; `recv-window-insert-shreds`: `shred_receiver_elapsed_us`, `shred_receiver_wait_us`, `shred_deserialize_elapsed_us`, `blockstore_insert_elapsed_us`.
+
 ## Progress Log
 | Date | Step | Result | Commit |
 |---|---|---|---|
 | 2026-09-28 | Phase 0: plan created, pipeline mapped, doc committed | — | (this commit) |
+| 2026-09-28 | Phase 1a: busy/wait split of shred pipeline metrics | compiles, not yet deployed | 03293d1c3a |
+| 2026-09-28 | Phase 1b (deshred path): sampled end-to-end latency tracker, 6 unit tests pass | compiles, not yet deployed | c15c4ca3c3 |
+| 2026-09-28 | Phase 1c: plugin callback timings (account update, slot status, deshred tx) | 20 geyser-manager tests pass, not yet deployed | ebb4382aa6 |
