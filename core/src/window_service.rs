@@ -51,6 +51,9 @@ struct WindowServiceMetrics {
     num_shreds_received: usize,
     shred_deserialize_elapsed_us: u64,
     shred_receiver_elapsed_us: u64,
+    // Portion of `shred_receiver_elapsed_us` spent blocked waiting for the
+    // first batch of shreds, i.e. idle time.
+    shred_receiver_wait_us: u64,
     blockstore_insert_elapsed_us: u64,
     num_errors: u64,
     num_errors_blockstore: u64,
@@ -70,12 +73,23 @@ impl WindowServiceMetrics {
                 self.shred_deserialize_elapsed_us,
                 i64
             ),
+            // Legacy name, kept so existing dashboards keep working.
+            (
+                "handle_packets_elapsed_us",
+                self.shred_deserialize_elapsed_us,
+                i64
+            ),
             ("run_insert_count", self.run_insert_count as i64, i64),
             ("num_repairs", self.num_repairs.load(Ordering::Relaxed), i64),
             ("num_shreds_received", self.num_shreds_received, i64),
             (
                 "shred_receiver_elapsed_us",
                 self.shred_receiver_elapsed_us as i64,
+                i64
+            ),
+            (
+                "shred_receiver_wait_us",
+                self.shred_receiver_wait_us as i64,
                 i64
             ),
             (
@@ -238,8 +252,10 @@ where
     F: Fn(PossibleDuplicateShred),
 {
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+    let receiver_start = Instant::now();
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
+    ws_metrics.shred_receiver_wait_us += receiver_start.elapsed().as_micros() as u64;
     shreds.extend(verified_receiver.try_iter().flatten());
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();

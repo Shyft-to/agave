@@ -113,12 +113,6 @@ impl ShredFetchStage {
                     packet.meta_mut().flags.insert(flags);
                 }
             }
-            modifier_measure.stop();
-            if let Some(stats) = recvr_stats.as_ref() {
-                stats
-                    .modifier_elapsed_us
-                    .fetch_add(modifier_measure.as_us(), Ordering::Relaxed);
-            }
             if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
                 && let Some(stats) = recvr_stats.as_ref()
             {
@@ -131,6 +125,12 @@ impl ShredFetchStage {
                     }
                     _ => unreachable!("EvictingSender holds on to both ends of the channel"),
                 }
+            }
+            modifier_measure.stop();
+            if let Some(stats) = recvr_stats.as_ref() {
+                stats
+                    .modifier_elapsed_us
+                    .fetch_add(modifier_measure.as_us(), Ordering::Relaxed);
             }
         }
     }

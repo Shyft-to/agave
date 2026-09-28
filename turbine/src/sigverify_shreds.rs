@@ -158,6 +158,8 @@ fn run_shred_sigverify<const K: usize>(
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
     let recv_start = Instant::now();
     let packets = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
+    // Time spent blocked waiting for the first batch, i.e. idle time.
+    stats.recv_wait_micros += recv_start.elapsed().as_micros() as u64;
     stats.num_packets += packets.len();
     shred_buffer.push(packets);
     for packets in shred_fetch_receiver
@@ -507,7 +509,10 @@ struct ShredSigVerifyStats {
     num_unknown_slot_leader: AtomicUsize,
     num_unknown_turbine_parent: AtomicUsize,
     elapsed_micros: u64,
+    // Total time in the receive phase, including `recv_wait_micros`.
     recv_micros: u64,
+    // Portion of `recv_micros` spent blocked waiting for the first batch.
+    recv_wait_micros: u64,
     sigverify_micros: u64,
     resign_micros: u64,
 }
@@ -535,6 +540,7 @@ impl ShredSigVerifyStats {
             num_unknown_turbine_parent: AtomicUsize::default(),
             elapsed_micros: 0u64,
             recv_micros: 0u64,
+            recv_wait_micros: 0u64,
             sigverify_micros: 0u64,
             resign_micros: 0u64,
         }
@@ -593,6 +599,7 @@ impl ShredSigVerifyStats {
             ),
             ("elapsed_micros", self.elapsed_micros, i64),
             ("recv_micros", self.recv_micros, i64),
+            ("recv_wait_micros", self.recv_wait_micros, i64),
             ("sigverify_micros", self.sigverify_micros, i64),
             ("resign_micros", self.resign_micros, i64),
         );

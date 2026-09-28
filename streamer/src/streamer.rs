@@ -101,9 +101,18 @@ pub struct StreamerReceiveStats {
     pub full_packet_batches_count: AtomicUsize,
     pub max_channel_len: AtomicUsize,
     pub num_packets_dropped: AtomicUsize,
-    /// Wall clock time spent in the packet fetcher, i.e. blocked in the
-    /// socket `recv_from` call inside [`recv_loop`]. In microseconds.
+    /// Wall clock time spent in `recv_from` calls inside [`recv_loop`] that
+    /// returned at least one packet. Includes waiting for the first packet
+    /// and the coalescing window, so it is an upper bound on the time spent
+    /// batching. Idle waits are reported in `fetch_idle_us`. In microseconds.
     pub fetch_elapsed_us: AtomicU64,
+    /// Wall clock time spent in `recv_from` calls that returned no packets
+    /// (socket idle, poll timeout). In microseconds.
+    pub fetch_idle_us: AtomicU64,
+    /// Longest single `recv_from` call that returned packets since the last
+    /// report. Upper bound on how long the oldest packet of a batch waited to
+    /// be forwarded. In microseconds.
+    pub fetch_max_batch_us: AtomicU64,
     /// Wall clock time spent in the packet modifier processing a batch (from
     /// receiving it off the fetcher's channel to sending it downstream).
     /// Only populated when a modifier stage shares this `StreamerReceiveStats`
@@ -122,6 +131,8 @@ impl StreamerReceiveStats {
             max_channel_len: AtomicUsize::default(),
             num_packets_dropped: AtomicUsize::default(),
             fetch_elapsed_us: AtomicU64::default(),
+            fetch_idle_us: AtomicU64::default(),
+            fetch_max_batch_us: AtomicU64::default(),
             modifier_elapsed_us: AtomicU64::default(),
         }
     }
@@ -157,6 +168,16 @@ impl StreamerReceiveStats {
             (
                 "fetch_elapsed_us",
                 self.fetch_elapsed_us.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "fetch_idle_us",
+                self.fetch_idle_us.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "fetch_max_batch_us",
+                self.fetch_max_batch_us.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
             (
@@ -218,9 +239,17 @@ fn recv_loop<P: SocketProvider>(
             #[cfg(not(unix))]
             let result = packet::recv_from(&mut packet_batch, socket, coalesce);
             fetch_measure.stop();
-            stats
-                .fetch_elapsed_us
-                .fetch_add(fetch_measure.as_us(), Ordering::Relaxed);
+            let fetch_us = fetch_measure.as_us();
+            if matches!(result, Ok(len) if len > 0) {
+                stats
+                    .fetch_elapsed_us
+                    .fetch_add(fetch_us, Ordering::Relaxed);
+                stats
+                    .fetch_max_batch_us
+                    .fetch_max(fetch_us, Ordering::Relaxed);
+            } else {
+                stats.fetch_idle_us.fetch_add(fetch_us, Ordering::Relaxed);
+            }
 
             if let Ok(len) = result {
                 if len > 0 {
