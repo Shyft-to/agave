@@ -233,6 +233,61 @@ How to read `slot-geyser-latency` (things that can mislead):
 
 Stage busy vs idle (per second): `shred_fetch_receiver`: `fetch_elapsed_us`, `fetch_idle_us`, `fetch_max_batch_us`, `modifier_elapsed_us`, `channel_len`; `shred_sigverify`: `recv_micros`, `recv_wait_micros`, `sigverify_micros`, `resign_micros`; `recv-window-insert-shreds`: `shred_receiver_elapsed_us`, `shred_receiver_wait_us`, `shred_deserialize_elapsed_us`, `blockstore_insert_elapsed_us`.
 
+### Phase 2 baseline: what to collect and paste
+Run after at least 1 hour on the instrumented build, with the time range set to the last hour. Use Grafana Explore or the `influx` CLI against the database the validator reports to (`SOLANA_METRICS_CONFIG` must be set on the node). Paste the results into the Progress Log, or into the next session. Groups 1 and 2 are enough to rank the stages; 3 and 4 explain the ranking.
+
+Sanity check first: `SELECT count("total_p50_us") FROM "shred-geyser-latency" WHERE time > now() - 10m` must be non-zero. If it is zero, the node isn't sending metrics to that database, isn't running the new build, or has no completed-data-sets service (needs RPC full API or a deshred plugin).
+
+**1. Deshred end-to-end and per-stage delay** (p50/p90/p99 fields are means of per-10s percentiles, so approximate; enough for ranking)
+```sql
+SELECT mean("total_p50_us"), mean("total_p90_us"), mean("total_p99_us"), max("total_max_us"),
+       mean("fetch_to_sigverify_p90_us"), mean("sigverify_to_insert_p90_us"),
+       mean("insert_to_dequeue_p90_us"), mean("dequeue_to_loaded_p90_us"),
+       mean("loaded_to_notified_p90_us"), mean("arrival_spread_p90_us"),
+       sum("data_sets"), sum("untracked_data_sets")
+FROM "shred-geyser-latency" WHERE time > now() - 1h
+```
+
+**2. Per-slot delays (executed txs and slot status)**. The `>= 0` filter drops slots with a missing stage; report `count("slot")` too.
+```sql
+SELECT percentile("first_fetched_to_first_tx_us", 50) AS first_tx_p50, percentile("first_fetched_to_first_tx_us", 90) AS first_tx_p90,
+       percentile("first_fetched_to_last_tx_us", 90) AS last_tx_p90,
+       percentile("completed_to_last_tx_us", 90) AS completed_to_last_tx_p90,
+       percentile("created_bank_to_replay_start_us", 90) AS bank_to_replay_p90,
+       percentile("replay_start_to_first_tx_us", 90) AS replay_to_first_tx_p90,
+       percentile("frozen_to_processed_us", 90) AS frozen_to_processed_p90,
+       percentile("processed_to_confirmed_us", 90) AS proc_to_conf_p90,
+       count("slot")
+FROM "slot-geyser-latency" WHERE time > now() - 1h AND "first_fetched_to_last_tx_us" >= 0
+```
+
+**3. Plugin cost** (run once per measurement: `geyser-notify-account-update`, `geyser-notify-slot-status`, `geyser-notify-deshred-transaction`). An empty result means the plugin doesn't receive that kind of event.
+```sql
+SELECT sum("total_us")/sum("count") AS avg_us, max("max_us"), sum("count")
+FROM "geyser-notify-account-update" WHERE time > now() - 1h
+```
+
+**4. Queue, drop and idle health**
+```sql
+SELECT max("channel_len"), sum("num_packets_dropped"), max("fetch_max_batch_us"), sum("fetch_elapsed_us"), sum("fetch_idle_us")
+FROM "shred_fetch_receiver" WHERE time > now() - 1h
+
+SELECT sum("overflow_shreds") FROM "shred_fetch" WHERE time > now() - 1h
+
+SELECT sum("num_retransmit_stage_overflow_shreds"), sum("recv_micros"), sum("recv_wait_micros"), sum("sigverify_micros"), sum("resign_micros")
+FROM "shred_sigverify" WHERE time > now() - 1h
+
+SELECT sum("shred_receiver_elapsed_us"), sum("shred_receiver_wait_us"), sum("shred_deserialize_elapsed_us"), sum("blockstore_insert_elapsed_us")
+FROM "recv-window-insert-shreds" WHERE time > now() - 1h
+
+SELECT max("max_receiver_len") FROM "entry-notifier-service-timing" WHERE time > now() - 1h
+SELECT max("max_receiver_len") FROM "transaction-status-service-timing" WHERE time > now() - 1h
+```
+
+**5. Host facts** (from the node): `nproc`; `lscpu | head -20`; the validator command line, especially `--tvu-*` flags (`ps -o args= -C agave-validator`); which geyser plugin(s) are loaded and whether they handle deshred transactions, account updates and transactions.
+
+If the first hour has too few samples, rerun with `AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE=1`.
+
 ## Progress Log
 | Date | Step | Result | Commit |
 |---|---|---|---|
