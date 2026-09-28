@@ -160,3 +160,59 @@ FROM "transaction-status-service-timing" WHERE time > now() - 1h AND "host_id"::
 - which geyser plugin(s) are loaded, and whether they handle deshred transactions, account updates and transactions
 
 If the first hour has too few samples, rerun with `AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE=1`.
+
+# Additional queries (added after baseline pull #3)
+
+## 3b / 3c. Plugin cost for slot status and deshred transactions
+Same query as section 3 with the measurement changed:
+```sql
+SELECT count("count") AS "ignore",
+       sum("total_us") AS "total_us",
+       sum("count") AS "calls",
+       max("max_us") AS "worst_call_us"
+FROM "geyser-notify-slot-status" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```
+```sql
+SELECT count("count") AS "ignore",
+       sum("total_us") AS "total_us",
+       sum("count") AS "calls",
+       max("max_us") AS "worst_call_us"
+FROM "geyser-notify-deshred-transaction" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```
+
+## 6a. Blockstore insert: per-phase time (where the ~188µs per run goes)
+```sql
+SELECT count("num_shreds") AS "ignore",
+       sum("insert_lock_elapsed_us") AS "insert_lock_us",
+       sum("insert_shreds_elapsed_us") AS "insert_shreds_us",
+       sum("shred_recovery_elapsed_us") AS "shred_recovery_us",
+       sum("chaining_elapsed_us") AS "chaining_us",
+       sum("commit_working_sets_elapsed_us") AS "commit_working_sets_us",
+       sum("write_batch_elapsed_us") AS "write_batch_us",
+       sum("total_elapsed_us") AS "total_us"
+FROM "blockstore-insert-shreds" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```
+
+## 6b. Slow blockstore inserts, with timestamps (correlate with the 1c windows)
+```sql
+SELECT "total_elapsed_us", "write_batch_elapsed_us", "shred_recovery_elapsed_us", "num_shreds"
+FROM "blockstore-insert-shreds" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp' AND "total_elapsed_us" > 100000
+```
+
+## 6c. Transaction status service (executed-tx path)
+```sql
+SELECT count("batch_count") AS "ignore",
+       sum("batch_count") AS "batches",
+       sum("transaction_count") AS "transactions",
+       sum("notify_transaction_count") AS "notified",
+       sum("notify_transaction_elapsed_us") AS "notify_us",
+       sum("write_batch_elapsed_us") AS "write_batch_us"
+FROM "transaction-status-service-timing" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```
+
+## 6d. Fetch modifier time (`solTvuPktMod`)
+```sql
+SELECT count("packets_count") AS "ignore",
+       sum("modifier_elapsed_us") AS "modifier_elapsed_us"
+FROM "shred_fetch_receiver" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```

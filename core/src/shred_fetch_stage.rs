@@ -20,13 +20,32 @@ use {
     std::{
         net::UdpSocket,
         sync::{
-            Arc, RwLock,
+            Arc, LazyLock, RwLock,
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
 };
+
+const DEFAULT_COALESCE: Duration = Duration::from_millis(5);
+
+/// How long a shred receiver keeps waiting for more packets after the first
+/// one before forwarding a partly filled batch. Read once from
+/// `AGAVE_SHRED_FETCH_COALESCE_US` (microseconds, `0` disables coalescing);
+/// defaults to [`DEFAULT_COALESCE`].
+static COALESCE: LazyLock<Option<Duration>> = LazyLock::new(|| {
+    let coalesce = match std::env::var("AGAVE_SHRED_FETCH_COALESCE_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(micros) => Some(Duration::from_micros(micros)),
+        None => Some(DEFAULT_COALESCE),
+    };
+    log::info!("shred fetch coalesce window: {coalesce:?}");
+    coalesce
+});
 
 pub(crate) struct ShredFetchStage {
     thread_hdls: Vec<JoinHandle<()>>,
@@ -175,9 +194,9 @@ impl ShredFetchStage {
                     packet_sender.clone(),
                     recycler.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
-                    true,                           // use_pinned_memory
-                    false,                          // is_staked_service
+                    *COALESCE,
+                    true,  // use_pinned_memory
+                    false, // is_staked_service
                 )
             })
             .collect();

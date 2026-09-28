@@ -19,7 +19,7 @@ use {
             layout::{get_shred, resign_packet},
             wire::is_retransmitter_signed_variant,
         },
-        sigverify_shreds::{LruCache, SlotPubkeys, verify_shreds},
+        sigverify_shreds::{LruCache, SlotPubkeys, verify_shreds, verify_shreds_serial},
     },
     solana_perf::{
         self,
@@ -33,7 +33,7 @@ use {
     std::{
         num::NonZeroUsize,
         sync::{
-            Arc, RwLock,
+            Arc, LazyLock, RwLock,
             atomic::{AtomicUsize, Ordering},
         },
         thread::{Builder, JoinHandle},
@@ -59,6 +59,17 @@ const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Maximum number of packet batches to process in a single sigverify iteration.
 const SIGVERIFY_SHRED_BATCH_SIZE: usize = 1024;
+
+/// Iterations with at most this many packets run dedup, signature verification
+/// and resigning on the sigverify thread instead of the rayon pool. Read once
+/// from `AGAVE_SHRED_SIGVERIFY_SERIAL_MAX_PACKETS`; `0` (the default) always
+/// uses the pool.
+static SERIAL_MAX_PACKETS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("AGAVE_SHRED_SIGVERIFY_SERIAL_MAX_PACKETS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+});
 
 #[allow(clippy::enum_variant_names)]
 enum ShredSigverifyError {
@@ -189,24 +200,40 @@ fn run_shred_sigverify<const K: usize>(
     // path once a shred is repaired.
     // For backward compatibility we need to allow trailing bytes in the packet
     // after the shred payload, but have to exclude them here from the deduper.
-    stats.num_duplicates += thread_pool.install(|| {
-        shred_buffer
-            .par_iter_mut()
-            .flatten()
-            .filter(|packet| {
-                !packet.meta().discard()
-                    && shred::wire::get_shred(packet.as_ref())
-                        .map(|shred| deduper.dedup(shred))
-                        .unwrap_or(true)
-                    && !packet.meta().repair()
-            })
-            .map(|mut packet| packet.meta_mut().set_discard(true))
-            .count()
-    });
+    // Small iterations (the common case, ~50 packets) are cheaper to run on
+    // this thread than to dispatch to the thread pool three times.
+    let num_packets: usize = shred_buffer.iter().map(|batch| batch.len()).sum();
+    let serial = num_packets <= *SERIAL_MAX_PACKETS;
+    stats.num_serial_iters += usize::from(serial);
+    let dedup_start = Instant::now();
+    stats.num_duplicates += if serial {
+        let mut num_duplicates = 0;
+        for batch in shred_buffer.iter_mut() {
+            for mut packet in batch.iter_mut() {
+                if is_duplicate_packet(deduper, &packet) {
+                    packet.meta_mut().set_discard(true);
+                    num_duplicates += 1;
+                }
+            }
+        }
+        num_duplicates
+    } else {
+        thread_pool.install(|| {
+            shred_buffer
+                .par_iter_mut()
+                .flatten()
+                .filter(|packet| is_duplicate_packet(deduper, packet))
+                .map(|mut packet| packet.meta_mut().set_discard(true))
+                .count()
+        })
+    };
+    stats.dedup_micros += dedup_start.elapsed().as_micros() as u64;
+    let bank_forks_start = Instant::now();
     let (working_bank, root_bank) = {
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
+    stats.bank_forks_micros += bank_forks_start.elapsed().as_micros() as u64;
     let sigverify_start = Instant::now();
     verify_packets(
         thread_pool,
@@ -215,36 +242,49 @@ fn run_shred_sigverify<const K: usize>(
         leader_schedule_cache,
         shred_buffer,
         cache,
+        serial,
     );
     stats.sigverify_micros += sigverify_start.elapsed().as_micros() as u64;
     stats.num_discards_post += count_discards(shred_buffer);
     // Verify retransmitter's signature, and resign shreds
     // Merkle root as the retransmitter node.
     let resign_start = Instant::now();
-    thread_pool.install(|| {
-        shred_buffer
-            .par_iter_mut()
-            .flatten()
-            .filter(|packet| !packet.meta().discard())
-            .for_each(|mut packet| {
-                if maybe_verify_and_resign_packet(
-                    &mut packet,
-                    &root_bank,
-                    &working_bank,
-                    cluster_info,
-                    leader_schedule_cache,
-                    cluster_nodes_cache,
-                    stats,
-                    keypair,
-                )
-                .is_err()
-                {
-                    packet.meta_mut().set_discard(true);
+    let resign = |packet: &mut PacketRefMut| {
+        if maybe_verify_and_resign_packet(
+            packet,
+            &root_bank,
+            &working_bank,
+            cluster_info,
+            leader_schedule_cache,
+            cluster_nodes_cache,
+            stats,
+            keypair,
+        )
+        .is_err()
+        {
+            packet.meta_mut().set_discard(true);
+        }
+    };
+    if serial {
+        for batch in shred_buffer.iter_mut() {
+            for mut packet in batch.iter_mut() {
+                if !packet.meta().discard() {
+                    resign(&mut packet);
                 }
-            })
-    });
+            }
+        }
+    } else {
+        thread_pool.install(|| {
+            shred_buffer
+                .par_iter_mut()
+                .flatten()
+                .filter(|packet| !packet.meta().discard())
+                .for_each(|mut packet| resign(&mut packet))
+        });
+    }
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
     // Extract shred payload from packets, and separate out repaired shreds.
+    let extract_start = Instant::now();
     let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
         .iter()
         .flat_map(|batch| batch.iter())
@@ -267,7 +307,9 @@ fn run_shred_sigverify<const K: usize>(
                 Either::Left(shred::Payload::from(shred))
             }
         });
+    stats.extract_micros += extract_start.elapsed().as_micros() as u64;
 
+    let send_start = Instant::now();
     // Repaired shreds are not retransmitted.
     stats.num_retransmit_shreds += shreds.len();
     if let Err(send_err) = retransmit_sender.try_send(shreds.clone()) {
@@ -290,6 +332,7 @@ fn run_shred_sigverify<const K: usize>(
             .map(|(shred, ..)| shred.as_ref()),
     );
     verified_sender.send(shreds)?;
+    stats.send_micros += send_start.elapsed().as_micros() as u64;
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
     Ok(())
@@ -428,6 +471,16 @@ fn verify_retransmitter_signature(
     }
 }
 
+/// Returns true if `packet` is a not-yet-discarded, non-repair packet whose
+/// shred the `deduper` has seen before. The shred is recorded in the deduper.
+fn is_duplicate_packet<const K: usize>(deduper: &Deduper<K, [u8]>, packet: &PacketRefMut) -> bool {
+    !packet.meta().discard()
+        && shred::wire::get_shred(packet.as_ref())
+            .map(|shred| deduper.dedup(shred))
+            .unwrap_or(true)
+        && !packet.meta().repair()
+}
+
 fn verify_packets(
     thread_pool: &ThreadPool,
     self_pubkey: &Pubkey,
@@ -435,13 +488,18 @@ fn verify_packets(
     leader_schedule_cache: &LeaderScheduleCache,
     packets: &mut [PacketBatch],
     cache: &RwLock<LruCache>,
+    serial: bool,
 ) {
     let leader_slots: SlotPubkeys =
         get_slot_leaders(self_pubkey, packets, leader_schedule_cache, working_bank)
             .filter_map(|(slot, pubkey)| Some((slot, pubkey?)))
             .chain(std::iter::once((Slot::MAX, Pubkey::default())))
             .collect();
-    let out = verify_shreds(thread_pool, packets, &leader_slots, cache);
+    let out = if serial {
+        verify_shreds_serial(packets, &leader_slots, cache)
+    } else {
+        verify_shreds(thread_pool, packets, &leader_slots, cache)
+    };
     solana_perf::sigverify::mark_disabled(packets, &out);
 }
 
@@ -523,6 +581,14 @@ struct ShredSigVerifyStats {
     recv_wait_micros: u64,
     sigverify_micros: u64,
     resign_micros: u64,
+    // Breakdown of the rest of `elapsed_micros`.
+    dedup_micros: u64,
+    bank_forks_micros: u64,
+    extract_micros: u64,
+    // Retransmit `try_send`, latency tracking and the send to the window service.
+    send_micros: u64,
+    // Iterations that ran without the thread pool, see `SERIAL_MAX_PACKETS`.
+    num_serial_iters: usize,
 }
 
 impl ShredSigVerifyStats {
@@ -551,6 +617,11 @@ impl ShredSigVerifyStats {
             recv_wait_micros: 0u64,
             sigverify_micros: 0u64,
             resign_micros: 0u64,
+            dedup_micros: 0u64,
+            bank_forks_micros: 0u64,
+            extract_micros: 0u64,
+            send_micros: 0u64,
+            num_serial_iters: 0usize,
         }
     }
 
@@ -610,6 +681,11 @@ impl ShredSigVerifyStats {
             ("recv_wait_micros", self.recv_wait_micros, i64),
             ("sigverify_micros", self.sigverify_micros, i64),
             ("resign_micros", self.resign_micros, i64),
+            ("dedup_micros", self.dedup_micros, i64),
+            ("bank_forks_micros", self.bank_forks_micros, i64),
+            ("extract_micros", self.extract_micros, i64),
+            ("send_micros", self.send_micros, i64),
+            ("num_serial_iters", self.num_serial_iters, i64),
         );
         *self = Self::new(Instant::now());
     }
@@ -636,8 +712,8 @@ mod tests {
         test_case::test_matrix,
     };
 
-    #[test]
-    fn test_sigverify_shreds_verify_batches() {
+    #[test_matrix([true, false])]
+    fn test_sigverify_shreds_verify_batches(serial: bool) {
         let leader_keypair = Arc::new(Keypair::new());
         let wrong_keypair = Keypair::new();
         let leader_pubkey = leader_keypair.pubkey();
@@ -696,6 +772,7 @@ mod tests {
             &leader_schedule_cache,
             &mut batches,
             &cache,
+            serial,
         );
         assert!(!batches[0].get(0).unwrap().meta().discard());
         assert!(batches[0].get(1).unwrap().meta().discard());

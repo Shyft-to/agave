@@ -74,6 +74,24 @@ pub fn verify_shreds(
     })
 }
 
+/// Same as [`verify_shreds`] but runs on the calling thread. For small inputs
+/// this avoids the cost of dispatching work to, and waiting for, a thread pool.
+pub fn verify_shreds_serial(
+    batches: &[PacketBatch],
+    slot_leaders: &SlotPubkeys,
+    cache: &RwLock<LruCache>,
+) -> Vec<Vec<u8>> {
+    batches
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|packet| u8::from(verify_shred_cpu(packet, slot_leaders, cache)))
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn sign_shred_cpu(keypair: &Keypair, packet: &mut PacketRefMut) {
     let sig = shred::layout::get_signature_range();
@@ -390,6 +408,13 @@ mod tests {
                 .map(|batch| vec![1u8; batch.len()])
                 .collect::<Vec<_>>()
         );
+        assert_eq!(
+            verify_shreds_serial(&packets, &pubkeys, &cache),
+            packets
+                .iter()
+                .map(|batch| vec![1u8; batch.len()])
+                .collect::<Vec<_>>()
+        );
         // Invalidate signatures for a random number of packets.
         let out: Vec<_> = packets
             .iter_mut()
@@ -410,6 +435,7 @@ mod tests {
             })
             .collect();
         assert_eq!(verify_shreds(&thread_pool, &packets, &pubkeys, &cache), out);
+        assert_eq!(verify_shreds_serial(&packets, &pubkeys, &cache), out);
     }
 
     #[test_case(true)]

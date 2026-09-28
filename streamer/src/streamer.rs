@@ -94,6 +94,61 @@ pub enum StreamerError {
     SendPktsError(#[from] SendPktsError),
 }
 
+/// Width of a [`FetchBatchHistogram`] bucket in microseconds.
+const FETCH_HIST_BUCKET_US: u64 = 250;
+/// Number of [`FetchBatchHistogram`] buckets; the last one holds everything at
+/// or above `(FETCH_HIST_BUCKETS - 1) * FETCH_HIST_BUCKET_US` (10ms).
+const FETCH_HIST_BUCKETS: usize = 41;
+
+/// Lock-free histogram of the duration of `recv_from` calls that returned
+/// packets, i.e. how long the oldest packet of a batch can wait before the
+/// batch is forwarded. Percentiles are reported as the upper bound of the
+/// bucket that contains them.
+pub struct FetchBatchHistogram {
+    buckets: [AtomicU64; FETCH_HIST_BUCKETS],
+}
+
+impl FetchBatchHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    pub fn record(&self, micros: u64) {
+        let idx = ((micros / FETCH_HIST_BUCKET_US) as usize).min(FETCH_HIST_BUCKETS - 1);
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the (p50, p90, p99) durations in microseconds and resets the
+    /// histogram. A value equal to the lower bound of the last bucket means
+    /// "at least that long".
+    pub fn take_percentiles(&self) -> [u64; 3] {
+        let counts: [u64; FETCH_HIST_BUCKETS] =
+            std::array::from_fn(|i| self.buckets[i].swap(0, Ordering::Relaxed));
+        [50, 90, 99].map(|pct| Self::percentile(&counts, pct))
+    }
+
+    fn percentile(counts: &[u64; FETCH_HIST_BUCKETS], pct: u64) -> u64 {
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let mut cumulative = 0;
+        for (idx, count) in counts.iter().enumerate() {
+            cumulative += count;
+            if cumulative * 100 >= total * pct {
+                return if idx == FETCH_HIST_BUCKETS - 1 {
+                    idx as u64 * FETCH_HIST_BUCKET_US
+                } else {
+                    (idx as u64 + 1) * FETCH_HIST_BUCKET_US
+                };
+            }
+        }
+        unreachable!("cumulative count reaches the total in the last bucket")
+    }
+}
+
 pub struct StreamerReceiveStats {
     pub name: &'static str,
     pub packets_count: AtomicUsize,
@@ -113,6 +168,8 @@ pub struct StreamerReceiveStats {
     /// report. Upper bound on how long the oldest packet of a batch waited to
     /// be forwarded. In microseconds.
     pub fetch_max_batch_us: AtomicU64,
+    /// Distribution of the duration of `recv_from` calls that returned packets.
+    pub fetch_batch_hist: FetchBatchHistogram,
     /// Wall clock time spent in the packet modifier processing a batch (from
     /// receiving it off the fetcher's channel to sending it downstream).
     /// Only populated when a modifier stage shares this `StreamerReceiveStats`
@@ -133,11 +190,14 @@ impl StreamerReceiveStats {
             fetch_elapsed_us: AtomicU64::default(),
             fetch_idle_us: AtomicU64::default(),
             fetch_max_batch_us: AtomicU64::default(),
+            fetch_batch_hist: FetchBatchHistogram::new(),
             modifier_elapsed_us: AtomicU64::default(),
         }
     }
 
     pub fn report(&self) {
+        let [fetch_batch_p50_us, fetch_batch_p90_us, fetch_batch_p99_us] =
+            self.fetch_batch_hist.take_percentiles();
         datapoint_info!(
             self.name,
             (
@@ -180,6 +240,9 @@ impl StreamerReceiveStats {
                 self.fetch_max_batch_us.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
+            ("fetch_batch_p50_us", fetch_batch_p50_us as i64, i64),
+            ("fetch_batch_p90_us", fetch_batch_p90_us as i64, i64),
+            ("fetch_batch_p99_us", fetch_batch_p99_us as i64, i64),
             (
                 "modifier_elapsed_us",
                 self.modifier_elapsed_us.swap(0, Ordering::Relaxed) as i64,
@@ -247,6 +310,7 @@ fn recv_loop<P: SocketProvider>(
                 stats
                     .fetch_max_batch_us
                     .fetch_max(fetch_us, Ordering::Relaxed);
+                stats.fetch_batch_hist.record(fetch_us);
             } else {
                 stats.fetch_idle_us.fetch_add(fetch_us, Ordering::Relaxed);
             }
@@ -615,6 +679,47 @@ mod test {
             time::Duration,
         },
     };
+
+    #[test]
+    fn test_fetch_batch_histogram() {
+        let hist = FetchBatchHistogram::new();
+        assert_eq!(hist.take_percentiles(), [0, 0, 0]);
+
+        // 100 samples: 90 in the first bucket, 9 in the 2.5ms bucket, 1 slow.
+        for _ in 0..90 {
+            hist.record(10);
+        }
+        for _ in 0..9 {
+            hist.record(2_600);
+        }
+        hist.record(50_000);
+        assert_eq!(
+            hist.take_percentiles(),
+            [
+                FETCH_HIST_BUCKET_US,      // p50: first bucket
+                FETCH_HIST_BUCKET_US,      // p90: still the first bucket
+                11 * FETCH_HIST_BUCKET_US, // p99: upper bound of the 2.5ms bucket
+            ]
+        );
+        // A distribution dominated by slow calls lands in the overflow bucket,
+        // reported as its lower bound (10ms).
+        for _ in 0..10 {
+            hist.record(50_000);
+        }
+        assert_eq!(
+            hist.take_percentiles(),
+            [(FETCH_HIST_BUCKETS as u64 - 1) * FETCH_HIST_BUCKET_US; 3]
+        );
+        // Taking the percentiles resets the histogram.
+        assert_eq!(hist.take_percentiles(), [0, 0, 0]);
+
+        // Bucket boundaries: 249us is the first bucket, 250us the second.
+        hist.record(249);
+        hist.record(250);
+        assert_eq!(hist.take_percentiles()[0], FETCH_HIST_BUCKET_US);
+        hist.record(250);
+        assert_eq!(hist.take_percentiles()[0], 2 * FETCH_HIST_BUCKET_US);
+    }
 
     struct TestUdpSocketSender {
         socket: Arc<UdpSocket>,
