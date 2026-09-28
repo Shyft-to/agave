@@ -216,3 +216,59 @@ SELECT count("packets_count") AS "ignore",
        sum("modifier_elapsed_us") AS "modifier_elapsed_us"
 FROM "shred_fetch_receiver" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
 ```
+
+# Queries for the build with the receive histogram and sigverify breakdown
+
+Needs the build that adds `fetch_batch_p*_us` and the sigverify breakdown fields (commit "shred pipeline: batching histogram, sigverify breakdown and A/B knobs"). Before/after runs should record the environment variables in effect.
+
+## 7a. Batching delay at the receiver (how long the oldest packet of a batch waits)
+Percentiles are upper bounds of 250µs buckets; 10000 means "10ms or more". Averaged over 1s reports.
+```sql
+SELECT count("packets_count") AS "ignore",
+       mean("fetch_batch_p50_us") AS "fetch_batch_p50_us",
+       mean("fetch_batch_p90_us") AS "fetch_batch_p90_us",
+       mean("fetch_batch_p99_us") AS "fetch_batch_p99_us",
+       max("fetch_max_batch_us") AS "fetch_max_batch_us",
+       sum("packet_batches_count") AS "packet_batches_count",
+       sum("full_packet_batches_count") AS "full_packet_batches_count",
+       sum("packets_count") AS "packets_count"
+FROM "shred_fetch_receiver" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```
+
+## 7b. Sigverify per-iteration breakdown
+Compare `elapsed_micros` with the sum of the parts; per iteration = value / `num_iters`.
+```sql
+SELECT count("num_iters") AS "ignore",
+       sum("num_iters") AS "num_iters",
+       sum("num_serial_iters") AS "num_serial_iters",
+       sum("num_packets") AS "num_packets",
+       sum("elapsed_micros") AS "elapsed_micros",
+       sum("dedup_micros") AS "dedup_micros",
+       sum("bank_forks_micros") AS "bank_forks_micros",
+       sum("sigverify_micros") AS "sigverify_micros",
+       sum("resign_micros") AS "resign_micros",
+       sum("extract_micros") AS "extract_micros",
+       sum("send_micros") AS "send_micros"
+FROM "shred_sigverify" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp'
+```
+
+## A/B knobs (environment variables of the validator process, read once at startup)
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGAVE_SHRED_FETCH_COALESCE_US` | `5000` | Time a shred receiver keeps waiting for more packets after the first before forwarding a partly filled batch. `0` = forward as soon as the socket is drained. Logged at startup as "shred fetch coalesce window". Applies to the turbine and repair receivers. |
+| `AGAVE_SHRED_SIGVERIFY_SERIAL_MAX_PACKETS` | `0` (off) | Sigverify iterations with at most this many packets run dedup, verification and resign on the sigverify thread instead of the rayon pool. Try `256`. `num_serial_iters` shows how many iterations used it. |
+| `AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE` | `2` | Track every N-th slot in `shred-geyser-latency` / `slot-geyser-latency`; `0` disables. |
+
+Suggested runs, one change at a time, at least 30 minutes each at a comparable time of day, comparing 1a/1b, 7a and 7b:
+1. Baseline of this build (all defaults).
+2. `AGAVE_SHRED_SIGVERIFY_SERIAL_MAX_PACKETS=256`.
+3. `AGAVE_SHRED_FETCH_COALESCE_US=1000`, then `500`, then `0`, ideally together with the serial setting from run 2 if it helped.
+
+Remember `shred-geyser-latency` starts at the fetch modifier, so it cannot show the batching change directly; use the 7a percentiles for that (expected added delay per packet is about half of the batch call time).
+
+## 6b (corrected). Slow blockstore inserts
+The 100ms threshold in 6b was too low: the mean total per 2s report is ~133ms, so about half of all reports matched. The worst report in the hour was 252ms. Use:
+```sql
+SELECT "total_elapsed_us", "insert_shreds_elapsed_us", "write_batch_elapsed_us", "shred_recovery_elapsed_us", "num_shreds"
+FROM "blockstore-insert-shreds" WHERE time > now() - 1h AND "host_id"::tag = 'DXxxrCCvvGjayejfg56Yb2FgeZe2WVioCm4xzEjiyvhp' AND "total_elapsed_us" > 200000
+```

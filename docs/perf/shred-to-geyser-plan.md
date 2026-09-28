@@ -369,7 +369,16 @@ All values from queries in `docs/perf/baseline-queries.md`. Window = 1h (1795 tw
 6. **62.5% duplicate packets (12.2k pps)**: ask where they come from (extra feeds?). Each duplicate still costs receive + modifier + channel + dedup.
 7. Low value now: RocksDB re-read (155µs p90), deshred notify (244µs), account-update plugin (2µs mean).
 
-**Still to collect**: `blockstore-insert-shreds` per-phase sums; `transaction-status-service-timing` sums; `modifier_elapsed_us` for `shred_fetch_receiver`; `geyser-notify-slot-status` and `geyser-notify-deshred-transaction`; timestamps of `blockstore-insert-shreds` windows with `total_elapsed_us` > 100ms.
+**Pull #3, second batch (test node, same hour)**
+- **Plugins**: slot status 80.7k calls, mean 10.3µs, worst 203µs. Deshred transactions 15.76M calls (4.4k tx/s), mean **1.44µs**, worst 1.46ms (22.7s per hour). Neither matters.
+- **Transaction status service**: 15.79M tx, one batch per tx, `notify_transaction` mean **5.0µs** (79.6s/hour, ~2% of the thread), `write_batch` 0 (no RPC tx history). So the 17ms "slot completed → last tx" gap is NOT the tx-status thread or the plugin; it is replay/execution wake-up and execution itself (needs replay-side timing).
+- **Fetch modifier** (`solTvuPktMod`): 16.3s per hour = 0.45% busy, 12.4µs per batch. Not a bottleneck. `shred_fetch`: 69.6M shreds seen, `overflow_shreds` 0.
+- **Blockstore insert, per-phase sums over the hour (238.4s total)**: `insert_shreds` 108.1s (45%, 4.4µs/shred), `write_batch` 74.2s (31%, 57µs per insert run), `shred_recovery` 38.2s (16%, 1.6µs/shred), `commit_working_sets` 2.8s, `insert_lock` 1.5s, `chaining` 0.1s; rest ~13s unaccounted. Per insert run (19 shreds): ~185µs.
+- **6b was filtered wrongly** (threshold 100ms vs. a mean of 133ms per 2s report), so it shows nothing useful. The worst 2s report had 252ms of insert time in total, so the 370ms stall must be a single insert of ~250ms (RocksDB read/write or recovery) plus queueing behind it, not a lock wait (`insert_lock` max 112µs). Use the corrected 6b query (> 200ms) in `docs/perf/baseline-queries.md`.
+- Timestamps: in these tables the aggregate rows' Time is the start of the queried range, not "now"; raw-row timestamps (1c, 6b) are real point times. Hour of the run: about 17:50-18:50 in Grafana's zone.
+- Host: `nproc` = 64, so sigverify pool = 32 threads (`num_cpus/2`). Sigverify iterations are ~54 packets, so a 32-thread pool has nothing to gain; the fixed dispatch/sync cost is what we pay. The source of the 62.5% duplicate packets is unknown.
+
+**Implemented for the next build (commit "shred pipeline: batching histogram, sigverify breakdown and A/B knobs")**: `fetch_batch_p50/p90/p99_us` receive histogram; sigverify `dedup/bank_forks/extract/send_micros` and `num_serial_iters`; env knobs `AGAVE_SHRED_FETCH_COALESCE_US` and `AGAVE_SHRED_SIGVERIFY_SERIAL_MAX_PACKETS`. Queries 7a/7b and the run plan are in `docs/perf/baseline-queries.md`. Next: deploy, baseline that build, then A/B the two knobs.
 
 ## Progress Log
 | Date | Step | Result | Commit |
