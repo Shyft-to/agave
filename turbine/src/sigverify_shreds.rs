@@ -13,6 +13,7 @@ use {
     solana_ledger::{
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        pipeline_latency::PIPELINE_LATENCY,
         shred::{
             self,
             layout::{get_shred, resign_packet},
@@ -281,7 +282,14 @@ fn run_shred_sigverify<const K: usize>(
     let shreds = shreds
         .into_iter()
         .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
-    verified_sender.send(shreds.chain(repairs).collect())?;
+    let shreds: Vec<_> = shreds.chain(repairs).collect();
+    PIPELINE_LATENCY.mark_sigverified(
+        shreds
+            .iter()
+            .filter(|(_, is_repaired, _)| !is_repaired)
+            .map(|(shred, ..)| shred.as_ref()),
+    );
+    verified_sender.send(shreds)?;
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
     Ok(())

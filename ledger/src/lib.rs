@@ -24,6 +24,7 @@ pub mod entry_notifier_service;
 pub mod genesis_utils;
 pub mod leader_schedule_cache;
 pub mod next_slots_iterator;
+pub mod pipeline_latency;
 pub mod rooted_slot_iterator;
 pub mod shred;
 mod shredder;

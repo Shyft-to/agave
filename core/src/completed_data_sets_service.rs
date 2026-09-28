@@ -16,6 +16,7 @@ use {
         deshred_transaction_notifier_interface::{
             DeshredTransactionNotifier, DeshredTransactionNotifierArc,
         },
+        pipeline_latency::{DeshredStageTimes, PIPELINE_LATENCY},
     },
     solana_measure::measure::Measure,
     solana_message::{VersionedMessage, v0::LoadedAddresses},
@@ -34,7 +35,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -155,6 +156,7 @@ impl CompletedDataSetsService {
                 // Best-effort ALT resolution uses the rooted bank to avoid surfacing fork-local state.
                 bank_forks.read().unwrap().root_bank()
             });
+        let dequeued = Instant::now();
         let mut batch_measure = Measure::start("deshred_geyser_batch");
         let mut stats = DeshredBatchStats::default();
 
@@ -165,8 +167,10 @@ impl CompletedDataSetsService {
                 let CompletedDataSetInfo { slot, indices } = completed_data_set_info;
                 let completed_data_set_starting_shred_index = indices.start;
                 let completed_data_set_ending_shred_index_exclusive = indices.end;
+                let tracked_indices = indices.clone();
                 match blockstore.get_entries_in_data_block(slot, indices, /*slot_meta:*/ None) {
                     Ok(entries) => {
+                        let entries_loaded = Instant::now();
                         if let Some(notifier) = deshred_transaction_notifier
                             && let Some(update_parent) = blockstore
                                 .meta(slot)
@@ -191,6 +195,14 @@ impl CompletedDataSetsService {
                             deshred_transaction_notifier.as_deref(),
                             root_bank.as_deref(),
                             &mut stats,
+                        );
+                        PIPELINE_LATENCY.finish(
+                            slot,
+                            &tracked_indices,
+                            DeshredStageTimes {
+                                dequeued,
+                                entries_loaded,
+                            },
                         );
 
                         if let Some(rpc_subscriptions) = rpc_subscriptions {

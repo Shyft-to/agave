@@ -22,6 +22,7 @@ use {
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
+        pipeline_latency::PIPELINE_LATENCY,
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -290,6 +291,11 @@ where
     blockstore_insert_elapsed.stop();
     ws_metrics.blockstore_insert_elapsed_us += blockstore_insert_elapsed.as_us();
     let completed_data_sets = insert_result?;
+    PIPELINE_LATENCY.mark_inserted(
+        completed_data_sets
+            .iter()
+            .map(|info| (info.slot, &info.indices)),
+    );
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;

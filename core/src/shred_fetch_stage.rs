@@ -3,9 +3,12 @@
 use {
     crate::repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
     solana_gossip::cluster_info::ClusterInfo,
-    solana_ledger::shred::{
-        self,
-        filter::{ShredFilterContext, TurbineMode},
+    solana_ledger::{
+        pipeline_latency::PIPELINE_LATENCY,
+        shred::{
+            self,
+            filter::{ShredFilterContext, TurbineMode},
+        },
     },
     solana_measure::measure::Measure,
     solana_perf::packet::{PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef},
@@ -21,7 +24,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -71,6 +74,7 @@ impl ShredFetchStage {
 
         for mut packet_batch in recvr {
             let mut modifier_measure = Measure::start("modifier");
+            let batch_received_at = Instant::now();
             shred_filter_ctx.maybe_update(sharable_banks.root());
             shred_filter_ctx.stats.shred_count += packet_batch.len();
 
@@ -111,6 +115,11 @@ impl ShredFetchStage {
                     packet.meta_mut().set_discard(true);
                 } else {
                     packet.meta_mut().flags.insert(flags);
+                    if !flags.contains(PacketFlags::REPAIR)
+                        && let Some(shred) = shred::layout::get_shred(packet.as_ref())
+                    {
+                        PIPELINE_LATENCY.mark_fetched(batch_received_at, shred);
+                    }
                 }
             }
             if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
