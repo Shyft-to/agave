@@ -8,7 +8,10 @@ use {
     crossbeam_channel::{Receiver, RecvTimeoutError},
     itertools::izip,
     solana_clock::Slot,
-    solana_ledger::blockstore::{Blockstore, BlockstoreError},
+    solana_ledger::{
+        blockstore::{Blockstore, BlockstoreError},
+        pipeline_latency::PIPELINE_LATENCY,
+    },
     solana_measure::measure::Measure,
     solana_runtime::{
         bank::{Bank, KeyedRewardsAndNumPartitions},
@@ -278,6 +281,7 @@ impl TransactionStatusService {
                             &transaction,
                         );
                         notify_transaction_elapsed.stop();
+                        PIPELINE_LATENCY.mark_tx_notified(slot);
                         metrics.notify_transaction_count += 1;
                         metrics.notify_transaction_elapsed_us += notify_transaction_elapsed.as_us();
                     }

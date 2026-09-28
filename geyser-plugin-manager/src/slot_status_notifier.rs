@@ -4,11 +4,24 @@ use {
     arc_swap::ArcSwap,
     log::*,
     solana_clock::{BankId, Slot},
+    solana_ledger::pipeline_latency::{PIPELINE_LATENCY, SlotStage},
     solana_rpc::slot_status_notifier::SlotStatusNotifierInterface,
     std::{sync::Arc, time::Instant},
 };
 
 static NOTIFY_TIMINGS: NotifyTimings = NotifyTimings::new("geyser-notify-slot-status");
+
+fn slot_stage(slot_status: &SlotStatus) -> Option<SlotStage> {
+    match slot_status {
+        SlotStatus::FirstShredReceived => Some(SlotStage::FirstShredNotified),
+        SlotStatus::Completed => Some(SlotStage::Completed),
+        SlotStatus::CreatedBank => Some(SlotStage::CreatedBank),
+        SlotStatus::Processed => Some(SlotStage::Processed),
+        SlotStatus::Confirmed => Some(SlotStage::Confirmed),
+        SlotStatus::Rooted => Some(SlotStage::Rooted),
+        SlotStatus::Dead(_) => None,
+    }
+}
 
 pub struct SlotStatusNotifierImpl {
     plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
@@ -76,6 +89,9 @@ impl SlotStatusNotifierImpl {
             }
         }
         NOTIFY_TIMINGS.record(start);
+        if let Some(stage) = slot_stage(&slot_status) {
+            PIPELINE_LATENCY.mark_slot(slot, stage);
+        }
     }
 
     pub fn notify_bank_status(
@@ -111,6 +127,9 @@ impl SlotStatusNotifierImpl {
             }
         }
         NOTIFY_TIMINGS.record(start);
+        if let Some(stage) = slot_stage(&slot_status) {
+            PIPELINE_LATENCY.mark_slot(slot, stage);
+        }
     }
 }
 

@@ -68,6 +68,7 @@ use {
         },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
+        pipeline_latency::{PIPELINE_LATENCY, SlotStage},
     },
     solana_measure::measure::Measure,
     solana_poh::{
@@ -3752,6 +3753,7 @@ impl ReplayStage {
             }
         }
 
+        PIPELINE_LATENCY.mark_slot(bank.slot(), SlotStage::ReplayStart);
         let mut replay_blockstore_time = Measure::start("replay_blockstore_into_bank");
         let blockstore_result = Self::replay_blockstore_into_bank(
             my_shred_version,
@@ -4226,6 +4228,8 @@ impl ReplayStage {
                                 bank: bank.clone_without_scheduler(),
                             }));
                 }
+
+                PIPELINE_LATENCY.mark_slot(bank.slot(), SlotStage::Frozen);
 
                 if let Some(sender) = process_active_banks_context
                     .bank_notification_sender

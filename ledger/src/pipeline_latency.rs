@@ -24,6 +24,11 @@
 //! recovered by erasure coding or repaired have no fetch timestamp for the
 //! recovered shred and are measured from the last shred that did arrive.
 //!
+//! The same tracker also follows sampled slots through replay and the geyser
+//! slot/transaction notifications (see [`SlotStage`]) and emits one
+//! `slot-geyser-latency` datapoint per slot when it is rooted, with the delays
+//! between the stages measured from the arrival of the slot's first shred.
+//!
 //! Configuration (environment variables, read once at first use):
 //! - `AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE`: track every N-th slot. `0`
 //!   disables tracking, default is [`DEFAULT_SLOT_SAMPLE`].
@@ -67,6 +72,160 @@ pub struct DeshredStageTimes {
     pub entries_loaded: Instant,
 }
 
+/// Per-slot stages, recorded when the geyser plugins have been notified
+/// (or, for [`SlotStage::ReplayStart`] and [`SlotStage::Frozen`], when replay
+/// reaches that point).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotStage {
+    /// `FirstShredReceived` slot status delivered to plugins.
+    FirstShredNotified,
+    /// `Completed` slot status delivered to plugins.
+    Completed,
+    /// `CreatedBank` slot status delivered to plugins.
+    CreatedBank,
+    /// Replay starts replaying the slot from blockstore.
+    ReplayStart,
+    /// Replay froze the bank.
+    Frozen,
+    /// `Processed` slot status delivered to plugins.
+    Processed,
+    /// `Confirmed` slot status delivered to plugins.
+    Confirmed,
+    /// `Rooted` slot status delivered to plugins. Ends tracking of the slot
+    /// and emits the `slot-geyser-latency` datapoint.
+    Rooted,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SlotTimes {
+    first_fetched: Option<Instant>,
+    first_shred_notified: Option<Instant>,
+    completed: Option<Instant>,
+    created_bank: Option<Instant>,
+    replay_start: Option<Instant>,
+    frozen: Option<Instant>,
+    processed: Option<Instant>,
+    confirmed: Option<Instant>,
+    rooted: Option<Instant>,
+    first_tx_notified: Option<Instant>,
+    last_tx_notified: Option<Instant>,
+    tx_count: u64,
+}
+
+/// Delay between two slot stages in microseconds, `-1` if either is missing.
+/// Negative differences (the later stage happened first) are reported as 0.
+fn delta_us(from: Option<Instant>, to: Option<Instant>) -> i64 {
+    match (from, to) {
+        (Some(from), Some(to)) => to.saturating_duration_since(from).as_micros() as i64,
+        _ => -1,
+    }
+}
+
+impl SlotTimes {
+    fn stage_mut(&mut self, stage: SlotStage) -> &mut Option<Instant> {
+        match stage {
+            SlotStage::FirstShredNotified => &mut self.first_shred_notified,
+            SlotStage::Completed => &mut self.completed,
+            SlotStage::CreatedBank => &mut self.created_bank,
+            SlotStage::ReplayStart => &mut self.replay_start,
+            SlotStage::Frozen => &mut self.frozen,
+            SlotStage::Processed => &mut self.processed,
+            SlotStage::Confirmed => &mut self.confirmed,
+            SlotStage::Rooted => &mut self.rooted,
+        }
+    }
+
+    /// The reported delays, as (field name, microseconds).
+    fn deltas(&self) -> [(&'static str, i64); 15] {
+        [
+            (
+                "first_fetched_to_first_shred_notified_us",
+                delta_us(self.first_fetched, self.first_shred_notified),
+            ),
+            (
+                "first_fetched_to_completed_us",
+                delta_us(self.first_fetched, self.completed),
+            ),
+            (
+                "first_fetched_to_created_bank_us",
+                delta_us(self.first_fetched, self.created_bank),
+            ),
+            (
+                "created_bank_to_replay_start_us",
+                delta_us(self.created_bank, self.replay_start),
+            ),
+            (
+                "replay_start_to_first_tx_us",
+                delta_us(self.replay_start, self.first_tx_notified),
+            ),
+            (
+                "first_fetched_to_first_tx_us",
+                delta_us(self.first_fetched, self.first_tx_notified),
+            ),
+            (
+                "first_fetched_to_last_tx_us",
+                delta_us(self.first_fetched, self.last_tx_notified),
+            ),
+            (
+                "completed_to_last_tx_us",
+                delta_us(self.completed, self.last_tx_notified),
+            ),
+            (
+                "replay_start_to_frozen_us",
+                delta_us(self.replay_start, self.frozen),
+            ),
+            (
+                "frozen_to_last_tx_us",
+                delta_us(self.frozen, self.last_tx_notified),
+            ),
+            (
+                "first_fetched_to_processed_us",
+                delta_us(self.first_fetched, self.processed),
+            ),
+            (
+                "frozen_to_processed_us",
+                delta_us(self.frozen, self.processed),
+            ),
+            (
+                "processed_to_confirmed_us",
+                delta_us(self.processed, self.confirmed),
+            ),
+            (
+                "first_fetched_to_confirmed_us",
+                delta_us(self.first_fetched, self.confirmed),
+            ),
+            (
+                "confirmed_to_rooted_us",
+                delta_us(self.confirmed, self.rooted),
+            ),
+        ]
+    }
+
+    fn report(&self, slot: Slot) {
+        let d = self.deltas();
+        datapoint_info!(
+            "slot-geyser-latency",
+            ("slot", slot as i64, i64),
+            ("tx_count", self.tx_count as i64, i64),
+            (d[0].0, d[0].1, i64),
+            (d[1].0, d[1].1, i64),
+            (d[2].0, d[2].1, i64),
+            (d[3].0, d[3].1, i64),
+            (d[4].0, d[4].1, i64),
+            (d[5].0, d[5].1, i64),
+            (d[6].0, d[6].1, i64),
+            (d[7].0, d[7].1, i64),
+            (d[8].0, d[8].1, i64),
+            (d[9].0, d[9].1, i64),
+            (d[10].0, d[10].1, i64),
+            (d[11].0, d[11].1, i64),
+            (d[12].0, d[12].1, i64),
+            (d[13].0, d[13].1, i64),
+            (d[14].0, d[14].1, i64),
+        );
+    }
+}
+
 #[derive(Default)]
 struct Samples {
     fetch_to_sigverify_us: Vec<u64>,
@@ -83,9 +242,13 @@ pub struct PipelineLatencyTracker {
     /// 0 means disabled.
     slot_sample: u64,
     max_fetched_slot: AtomicU64,
+    /// Last slot for which the first fetch time was recorded; avoids a map
+    /// lookup for every shred.
+    last_first_fetch_slot: AtomicU64,
     shreds: DashMap<(Slot, u32), ShredTimes>,
     /// Keyed by (slot, first shred index of the data set).
     inserted: DashMap<(Slot, u32), Instant>,
+    slots: DashMap<Slot, SlotTimes>,
     samples: Mutex<Samples>,
     last_report: Mutex<Instant>,
 }
@@ -103,8 +266,10 @@ impl PipelineLatencyTracker {
         Self {
             slot_sample,
             max_fetched_slot: AtomicU64::default(),
+            last_first_fetch_slot: AtomicU64::default(),
             shreds: DashMap::default(),
             inserted: DashMap::default(),
+            slots: DashMap::default(),
             samples: Mutex::default(),
             last_report: Mutex::new(Instant::now()),
         }
@@ -135,6 +300,14 @@ impl PipelineLatencyTracker {
             return;
         };
         self.max_fetched_slot.fetch_max(key.0, Ordering::Relaxed);
+        if self.last_first_fetch_slot.load(Ordering::Relaxed) != key.0 {
+            self.last_first_fetch_slot.store(key.0, Ordering::Relaxed);
+            self.slots
+                .entry(key.0)
+                .or_default()
+                .first_fetched
+                .get_or_insert(now);
+        }
         self.shreds.entry(key).or_insert(ShredTimes {
             fetched: now,
             sigverified: None,
@@ -171,6 +344,45 @@ impl PipelineLatencyTracker {
                 self.inserted.entry((slot, indices.start)).or_insert(now);
             }
         }
+    }
+
+    /// Records that `slot` reached `stage`. Keeps the first timestamp if the
+    /// stage is recorded more than once. [`SlotStage::Rooted`] ends tracking
+    /// of the slot and reports it.
+    pub fn mark_slot(&self, slot: Slot, stage: SlotStage) {
+        if !self.is_sampled(slot) {
+            return;
+        }
+        let now = Instant::now();
+        self.max_fetched_slot.fetch_max(slot, Ordering::Relaxed);
+        if stage == SlotStage::Rooted {
+            if let Some((_, mut times)) = self.slots.remove(&slot) {
+                times.rooted = Some(now);
+                times.report(slot);
+            }
+            // Slots are pruned from the report path, which the deshred
+            // notifier may never drive (e.g. no deshred plugin).
+            self.maybe_report(now);
+        } else {
+            self.slots
+                .entry(slot)
+                .or_default()
+                .stage_mut(stage)
+                .get_or_insert(now);
+        }
+    }
+
+    /// Records that a transaction of `slot` was delivered to the transaction
+    /// plugins.
+    pub fn mark_tx_notified(&self, slot: Slot) {
+        if !self.is_sampled(slot) {
+            return;
+        }
+        let now = Instant::now();
+        let mut times = self.slots.entry(slot).or_default();
+        times.first_tx_notified.get_or_insert(now);
+        times.last_tx_notified = Some(now);
+        times.tx_count += 1;
     }
 
     /// Called once the deshred notifications of a data set have been sent.
@@ -248,6 +460,7 @@ impl PipelineLatencyTracker {
             .saturating_sub(MAX_SLOT_AGE);
         self.shreds.retain(|(slot, _), _| *slot >= min_slot);
         self.inserted.retain(|(slot, _), _| *slot >= min_slot);
+        self.slots.retain(|slot, _| *slot >= min_slot);
     }
 }
 
@@ -403,6 +616,80 @@ mod tests {
         tracker.prune();
         assert_eq!(tracker.shreds.len(), 1);
         assert!(tracker.shreds.contains_key(&(1000, 0)));
+    }
+
+    #[test]
+    fn test_slot_stages_are_tracked_and_rooted_slot_is_removed() {
+        let tracker = PipelineLatencyTracker::new(1);
+        tracker.mark_fetched(Instant::now(), &data_shred(6, 0));
+        assert!(tracker.slots.get(&6).unwrap().first_fetched.is_some());
+        tracker.mark_slot(6, SlotStage::Completed);
+        tracker.mark_slot(6, SlotStage::CreatedBank);
+        tracker.mark_tx_notified(6);
+        tracker.mark_tx_notified(6);
+        {
+            let times = tracker.slots.get(&6).unwrap();
+            assert!(times.completed.is_some());
+            assert!(times.created_bank.is_some());
+            assert_eq!(times.tx_count, 2);
+            assert!(times.last_tx_notified >= times.first_tx_notified);
+        }
+        tracker.mark_slot(6, SlotStage::Rooted);
+        assert!(tracker.slots.get(&6).is_none());
+    }
+
+    #[test]
+    fn test_first_stage_timestamp_is_kept() {
+        let tracker = PipelineLatencyTracker::new(1);
+        tracker.mark_slot(2, SlotStage::Processed);
+        let first = tracker.slots.get(&2).unwrap().processed.unwrap();
+        sleep(Duration::from_millis(2));
+        tracker.mark_slot(2, SlotStage::Processed);
+        assert_eq!(tracker.slots.get(&2).unwrap().processed.unwrap(), first);
+    }
+
+    #[test]
+    fn test_unsampled_slots_are_ignored() {
+        let tracker = PipelineLatencyTracker::new(2);
+        tracker.mark_slot(3, SlotStage::Completed);
+        tracker.mark_tx_notified(3);
+        assert!(tracker.slots.is_empty());
+    }
+
+    #[test]
+    fn test_slot_deltas() {
+        let base = Instant::now();
+        let at = |ms| Some(base + Duration::from_millis(ms));
+        let times = SlotTimes {
+            first_fetched: at(0),
+            completed: at(100),
+            created_bank: at(10),
+            replay_start: at(20),
+            first_tx_notified: at(30),
+            last_tx_notified: at(140),
+            // frozen after the last tx: frozen_to_last_tx clamps to 0.
+            frozen: at(150),
+            ..Default::default()
+        };
+        let deltas: std::collections::HashMap<_, _> = times.deltas().into_iter().collect();
+        assert_eq!(deltas["first_fetched_to_completed_us"], 100_000);
+        assert_eq!(deltas["created_bank_to_replay_start_us"], 10_000);
+        assert_eq!(deltas["first_fetched_to_first_tx_us"], 30_000);
+        assert_eq!(deltas["completed_to_last_tx_us"], 40_000);
+        assert_eq!(deltas["frozen_to_last_tx_us"], 0);
+        // Missing stages are reported as -1.
+        assert_eq!(deltas["first_fetched_to_processed_us"], -1);
+        assert_eq!(deltas["confirmed_to_rooted_us"], -1);
+    }
+
+    #[test]
+    fn test_prune_drops_old_slots_from_slot_map() {
+        let tracker = PipelineLatencyTracker::new(1);
+        tracker.mark_slot(1, SlotStage::Completed);
+        tracker.mark_slot(1000, SlotStage::Completed);
+        tracker.prune();
+        assert_eq!(tracker.slots.len(), 1);
+        assert!(tracker.slots.contains_key(&1000));
     }
 
     #[test]

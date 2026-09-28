@@ -184,9 +184,9 @@ For each candidate: one commit or branch, a before/after comparison on the same 
 ## Phase 1 status (updated 2026-09-28)
 - [x] 1a: busy/wait split of `fetch_elapsed_us`, `recv_micros`, `shred_receiver_elapsed_us`; `modifier_elapsed_us` now includes the send; `handle_packets_elapsed_us` re-emitted as an alias.
 - [x] 1b (deshred path): `ledger/src/pipeline_latency.rs`, datapoint `shred-geyser-latency`.
-- [ ] 1b (per-slot): first shred → bank created → replay start → first tx executed → frozen → last tx notified in TSS → Processed/Confirmed/Rooted. **Not implemented yet.**
+- [x] 1b (per-slot): `slot-geyser-latency`, one datapoint per sampled slot when it is rooted. Stages: first shred fetched → FirstShredReceived/Completed/CreatedBank notified → replay start → first/last tx notified by `solTxStatusWrtr` → frozen → Processed/Confirmed/Rooted notified.
 - [x] 1c: `geyser-notify-account-update`, `geyser-notify-slot-status`, `geyser-notify-deshred-transaction` (count/total_us/avg_us/max_us every 2s).
-- [ ] Deploy to the test node and run the Phase 2 baseline.
+- [ ] Deploy to the test node (done by the user) and run the Phase 2 baseline.
 
 ### Notes and deviations from the plan text above
 - **Coalescing:** in `streamer/src/packet.rs` `recv_from_coalesce`, the deadline is computed at call start, not at first packet arrival. If the socket was idle for longer than `max_wait`, the batch is forwarded immediately. Under load the call starts right after the previous batch, so a batch can wait up to the full 5ms. New metrics: `fetch_max_batch_us` (upper bound on batching delay), `fetch_idle_us`.
@@ -213,6 +213,24 @@ SELECT sum("total_us")/sum("count") AS avg_us, max("max_us") FROM "geyser-notify
 SELECT sum("total_us")/sum("count") AS avg_us, max("max_us") FROM "geyser-notify-slot-status" WHERE $timeFilter GROUP BY time($__interval)
 SELECT sum("total_us")/sum("count") AS avg_us, max("max_us") FROM "geyser-notify-deshred-transaction" WHERE $timeFilter GROUP BY time($__interval)
 ```
+Per-slot latency (one row per sampled slot; `-1` means a stage was not seen, later-before-earlier is clamped to 0):
+```sql
+SELECT "slot", "tx_count", "first_fetched_to_first_tx_us", "first_fetched_to_last_tx_us", "completed_to_last_tx_us",
+       "created_bank_to_replay_start_us", "replay_start_to_first_tx_us", "frozen_to_last_tx_us"
+FROM "slot-geyser-latency" WHERE $timeFilter AND "first_fetched_to_last_tx_us" >= 0
+
+SELECT mean("frozen_to_processed_us"), mean("processed_to_confirmed_us"), mean("confirmed_to_rooted_us"), mean("first_fetched_to_confirmed_us")
+FROM "slot-geyser-latency" WHERE $timeFilter GROUP BY time($__interval)
+```
+Percentiles over slots: `SELECT percentile("first_fetched_to_first_tx_us", 90) FROM "slot-geyser-latency" WHERE $timeFilter AND "first_fetched_to_first_tx_us" >= 0 GROUP BY time($__interval)`.
+
+How to read `slot-geyser-latency` (things that can mislead):
+- `first_fetched_*` starts at the first turbine data shred of the slot passing the fetch modifier. Leader slots and slots first seen by repair have no such start, so their `first_fetched_*` fields are `-1`.
+- Slot-status stages are stamped when the plugins have returned from the callback, not when the event was produced. A slow plugin therefore delays the stamp and also delays the events queued behind it on the same thread (`solBankNotif`, `solRetransmittr`, `solRpcComplSlot`).
+- `first_tx`/`last_tx` are stamped after `notify_transaction` returns on `solTxStatusWrtr`. Without a transaction-notifier plugin, `tx_count` is 0 and these are `-1`.
+- Only every N-th slot is tracked (`AGAVE_PIPELINE_LATENCY_SLOT_SAMPLE`); slots that never root (dead or pruned forks) are dropped after 64 slots without a datapoint.
+- A slot that is rooted before this build sees its early stages (e.g. right after restart) will have `-1` fields.
+
 Stage busy vs idle (per second): `shred_fetch_receiver`: `fetch_elapsed_us`, `fetch_idle_us`, `fetch_max_batch_us`, `modifier_elapsed_us`, `channel_len`; `shred_sigverify`: `recv_micros`, `recv_wait_micros`, `sigverify_micros`, `resign_micros`; `recv-window-insert-shreds`: `shred_receiver_elapsed_us`, `shred_receiver_wait_us`, `shred_deserialize_elapsed_us`, `blockstore_insert_elapsed_us`.
 
 ## Progress Log
@@ -222,3 +240,4 @@ Stage busy vs idle (per second): `shred_fetch_receiver`: `fetch_elapsed_us`, `fe
 | 2026-09-28 | Phase 1a: busy/wait split of shred pipeline metrics | compiles, not yet deployed | 03293d1c3a |
 | 2026-09-28 | Phase 1b (deshred path): sampled end-to-end latency tracker, 6 unit tests pass | compiles, not yet deployed | c15c4ca3c3 |
 | 2026-09-28 | Phase 1c: plugin callback timings (account update, slot status, deshred tx) | 20 geyser-manager tests pass, not yet deployed | ebb4382aa6 |
+| 2026-09-28 | Phase 1b (per-slot): `slot-geyser-latency` covering executed txs and slot status; 5 new unit tests | compiles, 11 tracker + 20 geyser tests pass, not yet deployed | (next commit) |
