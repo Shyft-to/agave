@@ -1,6 +1,6 @@
 /// Module responsible for notifying plugins of account updates
 use {
-    crate::geyser_plugin_manager::GeyserPluginManager,
+    crate::{geyser_plugin_manager::GeyserPluginManager, notify_timings::NotifyTimings},
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         ReplicaAccountInfoV3, ReplicaAccountInfoVersions,
     },
@@ -13,8 +13,11 @@ use {
     solana_clock::{BankId, Slot},
     solana_pubkey::Pubkey,
     solana_transaction::sanitized::SanitizedTransaction,
-    std::sync::Arc,
+    std::{sync::Arc, time::Instant},
 };
+
+static NOTIFY_TIMINGS: NotifyTimings = NotifyTimings::new("geyser-notify-account-update");
+
 #[derive(Debug)]
 pub(crate) struct AccountsUpdateNotifierImpl {
     plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
@@ -172,6 +175,7 @@ impl AccountsUpdateNotifierImpl {
         if plugin_manager.plugins.is_empty() {
             return;
         }
+        let start = Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             if !plugin.account_data_notifications_enabled() {
                 continue;
@@ -200,6 +204,7 @@ impl AccountsUpdateNotifierImpl {
                 }
             }
         }
+        NOTIFY_TIMINGS.record(start);
     }
 }
 

@@ -8730,6 +8730,7 @@ dependencies = [
  "solana-ledger",
  "solana-measure",
  "solana-message",
+ "solana-metrics",
  "solana-pubkey 4.3.0",
  "solana-rpc",
  "solana-runtime",

@@ -1,12 +1,14 @@
 use {
-    crate::geyser_plugin_manager::GeyserPluginManager,
+    crate::{geyser_plugin_manager::GeyserPluginManager, notify_timings::NotifyTimings},
     agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
     arc_swap::ArcSwap,
     log::*,
     solana_clock::{BankId, Slot},
     solana_rpc::slot_status_notifier::SlotStatusNotifierInterface,
-    std::sync::Arc,
+    std::{sync::Arc, time::Instant},
 };
+
+static NOTIFY_TIMINGS: NotifyTimings = NotifyTimings::new("geyser-notify-slot-status");
 
 pub struct SlotStatusNotifierImpl {
     plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
@@ -53,6 +55,7 @@ impl SlotStatusNotifierImpl {
             return;
         }
 
+        let start = Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             match plugin.update_slot_status(slot, parent, &slot_status) {
                 Err(err) => {
@@ -72,6 +75,7 @@ impl SlotStatusNotifierImpl {
                 }
             }
         }
+        NOTIFY_TIMINGS.record(start);
     }
 
     pub fn notify_bank_status(
@@ -86,6 +90,7 @@ impl SlotStatusNotifierImpl {
             return;
         }
 
+        let start = Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             match plugin.update_bank_status(slot, parent, &slot_status, bank_id) {
                 Err(err) => {
@@ -105,6 +110,7 @@ impl SlotStatusNotifierImpl {
                 }
             }
         }
+        NOTIFY_TIMINGS.record(start);
     }
 }
 

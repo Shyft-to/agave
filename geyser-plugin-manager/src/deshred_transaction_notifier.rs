@@ -1,6 +1,6 @@
 /// Module responsible for notifying plugins of transactions when deshredded
 use {
-    crate::geyser_plugin_manager::GeyserPluginManager,
+    crate::{geyser_plugin_manager::GeyserPluginManager, notify_timings::NotifyTimings},
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         ReplicaDeshredTransactionInfoV2, ReplicaDeshredTransactionInfoVersions,
         ReplicaDeshredUpdateParentInfo, ReplicaDeshredUpdateParentInfoVersions,
@@ -12,12 +12,13 @@ use {
         blockstore_meta::UpdateParentInfo,
         deshred_transaction_notifier_interface::DeshredTransactionNotifier,
     },
-    solana_measure::measure::Measure,
     solana_message::v0::LoadedAddresses,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
-    std::sync::Arc,
+    std::{sync::Arc, time::Instant},
 };
+
+static NOTIFY_TIMINGS: NotifyTimings = NotifyTimings::new("geyser-notify-deshred-transaction");
 
 /// This implementation of DeshredTransactionNotifier is passed to the CompletedDataSetsService
 /// at validator startup. CompletedDataSetsService invokes the notify_deshred_transaction method
@@ -45,8 +46,7 @@ impl DeshredTransactionNotifier for DeshredTransactionNotifierImpl {
             return;
         }
 
-        let mut measure =
-            Measure::start("geyser-plugin-notify_plugins_of_deshred_transaction_info");
+        let start = Instant::now();
         let transaction_info = ReplicaDeshredTransactionInfoV2 {
             signature,
             is_vote,
@@ -79,7 +79,7 @@ impl DeshredTransactionNotifier for DeshredTransactionNotifierImpl {
                 }
             }
         }
-        measure.stop();
+        NOTIFY_TIMINGS.record(start);
     }
 
     fn alt_resolution_enabled(&self) -> bool {
