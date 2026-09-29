@@ -255,6 +255,17 @@ where
     });
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
     ws_metrics.num_shreds_received += shreds.len();
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["deserialize"])
+        .observe(now.elapsed().as_micros() as f64);
+
+    let store_start = Instant::now();
+    let before_insert_shreds_us = metrics.insert_shreds_elapsed_us;
+    let before_write_batch_us = metrics.write_batch_elapsed_us;
+    let before_recovery_us = metrics.shred_recovery_elapsed_us;
+    let before_insert_lock_us = metrics.insert_lock_elapsed_us;
+    let before_commit_working_sets_us = metrics.commit_working_sets_elapsed_us;
+
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         false, // is_trusted
@@ -264,6 +275,26 @@ where
         &handle_duplicate,
         metrics,
     )?;
+
+    let blockstore_store_us = &solana_metrics::pipeline_metrics::BLOCKSTORE_STORE_DURATION_US;
+    blockstore_store_us
+        .with_label_values(&["total"])
+        .observe(store_start.elapsed().as_micros() as f64);
+    blockstore_store_us
+        .with_label_values(&["insert_shreds"])
+        .observe((metrics.insert_shreds_elapsed_us - before_insert_shreds_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["write_batch"])
+        .observe((metrics.write_batch_elapsed_us - before_write_batch_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["recovery"])
+        .observe((metrics.shred_recovery_elapsed_us - before_recovery_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["insert_lock"])
+        .observe((metrics.insert_lock_elapsed_us - before_insert_lock_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["commit_working_sets"])
+        .observe((metrics.commit_working_sets_elapsed_us - before_commit_working_sets_us) as f64);
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;

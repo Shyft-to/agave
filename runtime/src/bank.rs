@@ -4636,6 +4636,7 @@ impl Bank {
         log_messages_bytes_limit: Option<usize>,
         pre_commit_callback: Option<impl FnOnce(&[TransactionProcessingResult]) -> Result<()>>,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
+        let execute_start = std::time::Instant::now();
         let LoadAndExecuteTransactionsOutput {
             processing_results,
             processed_counts,
@@ -4657,17 +4658,24 @@ impl Bank {
                 drop_noop_transactions: false,
             },
         );
+        solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
+            .with_label_values(&["execute"])
+            .observe(execute_start.elapsed().as_micros() as f64);
 
         if let Some(pre_commit_callback) = pre_commit_callback {
             let () = pre_commit_callback(&processing_results)?;
         }
 
+        let commit_start = std::time::Instant::now();
         let commit_results = self.commit_transactions(
             batch.sanitized_transactions(),
             processing_results,
             &processed_counts,
             timings,
         );
+        solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
+            .with_label_values(&["commit"])
+            .observe(commit_start.elapsed().as_micros() as f64);
         Ok((commit_results, balance_collector))
     }
 

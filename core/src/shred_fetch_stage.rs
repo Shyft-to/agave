@@ -101,13 +101,27 @@ impl ShredFetchStage {
 
             // Filter out shreds that are way too far in the future to avoid the
             // overhead of having to hold onto them.
+            let filter_start = std::time::Instant::now();
             for mut packet in packet_batch.iter_mut().filter(|p| !p.meta().discard()) {
                 if shred_filter_ctx.should_discard_packet(packet.as_ref()) {
                     packet.meta_mut().set_discard(true);
                 } else {
                     packet.meta_mut().flags.insert(flags);
+                    if let Some(shred_bytes) = shred::wire::get_shred(packet.as_ref())
+                        && let Some(slot) = shred::wire::get_slot(shred_bytes)
+                    {
+                        solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY
+                            .mark_slot_started(slot);
+                        if let Some(fec_set_index) = shred::wire::get_fec_set_index(shred_bytes) {
+                            solana_metrics::pipeline_latency::DESHRED_LATENCY
+                                .mark_started(slot, fec_set_index);
+                        }
+                    }
                 }
             }
+            solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+                .with_label_values(&["filter"])
+                .observe(filter_start.elapsed().as_micros() as f64);
             if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
                 && let Some(stats) = recvr_stats.as_ref()
             {
@@ -117,6 +131,8 @@ impl ShredFetchStage {
                 match send_err {
                     crossbeam_channel::TrySendError::Full(v) => {
                         shred_filter_ctx.stats.overflow_shreds += v.len();
+                        solana_metrics::pipeline_metrics::SHRED_PACKETS_DROPPED_TOTAL
+                            .inc_by(v.len() as u64);
                     }
                     _ => unreachable!("EvictingSender holds on to both ends of the channel"),
                 }

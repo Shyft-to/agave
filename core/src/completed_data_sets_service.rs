@@ -290,8 +290,16 @@ impl CompletedDataSetsService {
                 );
                 notify_measure.stop();
                 stats.total_notify_us += notify_measure.as_us();
+                solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+                    .with_label_values(&["deshred_transaction"])
+                    .observe(notify_measure.as_us() as f64);
             }
         }
+
+        // A completed data set's starting shred index is its FEC set index, matching
+        // the key `mark_started` used when the data set's first shred was fetched.
+        solana_metrics::pipeline_latency::DESHRED_LATENCY
+            .mark_notified(slot, completed_data_set_starting_shred_index);
     }
 
     fn get_transaction_signatures(entries: Vec<Entry>) -> Vec<Signature> {

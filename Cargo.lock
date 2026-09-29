@@ -1401,7 +1401,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -1417,8 +1417,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes 0.14.100",
- "rand 0.7.3",
- "rand_core 0.5.1",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
  "serde",
  "unicode-normalization",
 ]
@@ -5554,6 +5554,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
+dependencies = [
+ "cfg-if 1.0.4",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot 0.12.3",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8730,6 +8744,7 @@ dependencies = [
  "solana-ledger",
  "solana-measure",
  "solana-message",
+ "solana-metrics",
  "solana-pubkey 4.3.0",
  "solana-rpc",
  "solana-runtime",
@@ -9326,9 +9341,12 @@ version = "4.3.0"
 dependencies = [
  "bencher",
  "crossbeam-channel",
+ "dashmap",
  "env_logger",
  "gethostname",
+ "hyper 0.14.32",
  "log",
+ "prometheus",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "serial_test",
@@ -9337,6 +9355,7 @@ dependencies = [
  "solana-sha256-hasher",
  "solana-time-utils",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

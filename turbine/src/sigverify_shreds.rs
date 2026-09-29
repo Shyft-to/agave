@@ -184,6 +184,7 @@ fn run_shred_sigverify<const K: usize>(
     // path once a shred is repaired.
     // For backward compatibility we need to allow trailing bytes in the packet
     // after the shred payload, but have to exclude them here from the deduper.
+    let dedup_start = Instant::now();
     stats.num_duplicates += thread_pool.install(|| {
         shred_buffer
             .par_iter_mut()
@@ -198,10 +199,17 @@ fn run_shred_sigverify<const K: usize>(
             .map(|mut packet| packet.meta_mut().set_discard(true))
             .count()
     });
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["dedup"])
+        .observe(dedup_start.elapsed().as_micros() as f64);
+
     let (working_bank, root_bank) = {
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
+    // Signature verification, and verifying/resigning the retransmitter's
+    // signature (Merkle root as the retransmitter node).
+    let sign_start = Instant::now();
     verify_packets(
         thread_pool,
         &keypair.pubkey(),
@@ -211,8 +219,6 @@ fn run_shred_sigverify<const K: usize>(
         cache,
     );
     stats.num_discards_post += count_discards(shred_buffer);
-    // Verify retransmitter's signature, and resign shreds
-    // Merkle root as the retransmitter node.
     let resign_start = Instant::now();
     thread_pool.install(|| {
         shred_buffer
@@ -237,6 +243,9 @@ fn run_shred_sigverify<const K: usize>(
             })
     });
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["sign"])
+        .observe(sign_start.elapsed().as_micros() as f64);
     // Extract shred payload from packets, and separate out repaired shreds.
     let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
         .iter()

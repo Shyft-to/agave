@@ -53,6 +53,7 @@ impl SlotStatusNotifierImpl {
             return;
         }
 
+        let notify_start = std::time::Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             match plugin.update_slot_status(slot, parent, &slot_status) {
                 Err(err) => {
@@ -72,6 +73,9 @@ impl SlotStatusNotifierImpl {
                 }
             }
         }
+        solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+            .with_label_values(&["slot_status"])
+            .observe(notify_start.elapsed().as_micros() as f64);
     }
 
     pub fn notify_bank_status(
@@ -86,6 +90,7 @@ impl SlotStatusNotifierImpl {
             return;
         }
 
+        let notify_start = std::time::Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             match plugin.update_bank_status(slot, parent, &slot_status, bank_id) {
                 Err(err) => {
@@ -105,6 +110,9 @@ impl SlotStatusNotifierImpl {
                 }
             }
         }
+        solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+            .with_label_values(&["slot_status"])
+            .observe(notify_start.elapsed().as_micros() as f64);
     }
 }
 

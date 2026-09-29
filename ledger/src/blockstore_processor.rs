@@ -1384,6 +1384,9 @@ pub fn confirm_slot(
         } else {
             timing.fetch_elapsed += load_elapsed.as_us();
         }
+        solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
+            .with_label_values(&["read_blockstore"])
+            .observe(load_elapsed.as_us() as f64);
         load_result
     }?;
 
@@ -1421,6 +1424,7 @@ pub fn confirm_slot(
         .iter()
         .rposition(|bc| matches!(bc, BlockComponent::EntryBatch(_)));
 
+    let collect_entries_start = std::time::Instant::now();
     for (ix, (completed_range, component)) in
         completed_ranges.iter().zip(slot_components).enumerate()
     {
@@ -1518,6 +1522,9 @@ pub fn confirm_slot(
             processor.on_final(migration_status, slot, bank.parent_slot())?;
         }
     }
+    solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
+        .with_label_values(&["collect_entries"])
+        .observe(collect_entries_start.elapsed().as_micros() as f64);
 
     Ok(())
 }

@@ -335,6 +335,8 @@ pub struct ValidatorConfig {
     pub on_start_geyser_plugin_config_files: Option<Vec<PathBuf>>,
     pub geyser_plugin_always_enabled: bool,
     pub rpc_addrs: Option<(SocketAddr, SocketAddr)>, // (JsonRpc, JsonRpcPubSub)
+    /// Serve a Prometheus scrape endpoint (`GET /metrics`) on this address. `None` disables it.
+    pub metrics_listen_addr: Option<SocketAddr>,
     pub pubsub_config: PubSubConfig,
     pub snapshot_config: SnapshotConfig,
     pub blockstore_cleanup_strategy: BlockstoreCleanupStrategy,
@@ -426,6 +428,7 @@ impl ValidatorConfig {
             on_start_geyser_plugin_config_files: None,
             geyser_plugin_always_enabled: false,
             rpc_addrs: None,
+            metrics_listen_addr: None,
             pubsub_config: PubSubConfig::default_for_tests(),
             snapshot_config: SnapshotConfig::new_load_only(),
             broadcast_stage_type: BroadcastStageType::Standard,
@@ -687,6 +690,7 @@ pub struct Validator {
     #[cfg_attr(not(unix), allow(dead_code))]
     log_config: Option<ValidatorLogConfig>,
     json_rpc_service: Option<JsonRpcService>,
+    metrics_server: Option<solana_metrics::prometheus_server::MetricsServer>,
     pubsub_service: Option<PubSubService>,
     rpc_completed_slots_service: Option<JoinHandle<()>>,
     optimistically_confirmed_bank_tracker: Option<OptimisticallyConfirmedBankTracker>,
@@ -1252,6 +1256,17 @@ impl Validator {
                 .thread_name("solTpuClientRt")
                 .build()
                 .unwrap()
+        });
+
+        let metrics_server = config.metrics_listen_addr.map(|addr| {
+            let server = solana_metrics::prometheus_server::MetricsServer::new(addr);
+            let close_handle = server.close_handle();
+            config
+                .validator_exit
+                .write()
+                .unwrap()
+                .register_exit(Box::new(move || close_handle.close()));
+            server
         });
 
         let rpc_override_health_check =
@@ -1858,6 +1873,7 @@ impl Validator {
             gossip_service,
             serve_repair_service,
             json_rpc_service,
+            metrics_server,
             pubsub_service,
             rpc_completed_slots_service,
             optimistically_confirmed_bank_tracker,
@@ -1984,6 +2000,10 @@ impl Validator {
 
         if let Some(json_rpc_service) = self.json_rpc_service {
             json_rpc_service.join().expect("rpc_service");
+        }
+
+        if let Some(metrics_server) = self.metrics_server {
+            metrics_server.join();
         }
 
         if let Some(pubsub_service) = self.pubsub_service {

@@ -860,6 +860,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("metrics_listen_address")
+            .long("metrics-listen-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .validator(solana_net_utils::is_host_port)
+            .help(
+                "Serve internal pipeline metrics on this address as a Prometheus scrape \
+                 endpoint (GET /metrics). Disabled by default.",
+            ),
+    )
+    .arg(
         Arg::with_name("geyser_plugin_config")
             .long("geyser-plugin-config")
             .alias("accountsdb-plugin-config")
