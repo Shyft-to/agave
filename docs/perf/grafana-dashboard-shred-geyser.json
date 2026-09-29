@@ -1,0 +1,1564 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "type": "timeseries",
+      "title": "End-to-End Latency by Path ($percentile)",
+      "description": "What it tracks: two independent cross-thread timers, each sampled once (not per-shred).\n\n- path=deshred: wall-clock time from the FIRST shred fetched for a (slot, fec_set_index) data set (timestamped in the fetch-stage filter loop, core/src/shred_fetch_stage.rs) to the moment notify_deshred_transaction() returns for that data set's last transaction (core/src/completed_data_sets_service.rs). One observation per completed data set that had a Geyser deshred-transaction plugin loaded. This is the priority-1 target: shred-in to earliest-possible Geyser notification.\n\n- path=executed_tx: wall-clock time from the FIRST shred fetched for a SLOT to EACH transaction notified via notify_transaction() for that slot (geyser-plugin-manager/src/transaction_notifier.rs). Observed once per notified transaction (not just the last one), so within one slot you get a whole distribution of 'time since first shred' values, one per tx -- the histogram naturally captures the spread across early vs. late transactions in a block.\n\nGranularity: batch/end-to-end span, not a single instant. Buckets are 10us-500ms; values above 500ms still count (in the +Inf bucket) but individual outliers beyond that aren't separately visible here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_end_to_end_duration_us_bucket[$__rate_interval])) by (le, path))",
+          "legendFormat": "{{path}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "type": "timeseries",
+      "title": "End-to-End Observation Rate by Path",
+      "description": "What it tracks: observations per second feeding the panel above (derived from the histogram's _count series), i.e. how many end-to-end timers actually completed, per path, per second.\n\n- path=deshred: completed data sets per second that had a start timestamp AND a deshred-transaction Geyser plugin loaded to notify. If this is 0, either no deshred plugin is loaded, or shreds are only arriving via repair/leader (which have no 'first shred fetched' start point and are excluded).\n\n- path=executed_tx: transactions notified per second across all tracked slots. Roughly tracks cluster TPS if a transaction-notifying Geyser plugin is loaded; 0 if none is.\n\nUse this as a sanity check before trusting the latency panel above -- a low or zero rate means the latency numbers are based on too few samples (or none).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_end_to_end_duration_us_count[$__rate_interval])) by (path)",
+          "legendFormat": "{{path}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Shred Path",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "panels": []
+    },
+    {
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "type": "timeseries",
+      "title": "Shred Stage Duration ($percentile)",
+      "description": "GRANULARITY (direct answer): every stage here is timed per BATCH/ITERATION, never per individual shred or packet -- and the batch unit is DIFFERENT across stages, not shared:\n\n- stage=receive, stage=filter: one UDP packet_batch (~50-64 packets, PACKETS_PER_BATCH-sized), i.e. the unit that comes straight off one recv_from() call. One observation per batch.\n\n- stage=dedup, stage=sign: one sigverify ITERATION (turbine/src/sigverify_shreds.rs run_shred_sigverify), which drains and processes UP TO 1024 packet_batches in a single call before dedup/verify runs -- this is a coarser, backlog-dependent unit than the 'receive/filter' packet_batch above, even though in steady-state low-backlog operation it often ends up close to ~1 packet_batch per iteration in practice (observed ~1.0-1.02 batches/iteration, ~54 packets/iteration in an earlier baseline run). Under backlog it can cover many more packet_batches at once. dedup and sign share the exact same iteration/batch, so they're directly comparable to each other, but not to receive/filter's per-packet_batch unit.\n\n- stage=retransmit: one retransmit-stage drain, up to 4096 SHREDS (already-verified shred payloads, a different unit again -- shreds, not packets or packet_batches) pulled from the retransmit channel (turbine/src/retransmit_stage.rs RETRANSMIT_BATCH_SIZE).\n\n- stage=deserialize: one core/src/window_service.rs run_insert call, draining the ENTIRE backlog on the verified-shreds channel at that moment (try_iter().flatten(), no fixed cap) -- size is purely backlog-dependent, and this is the SAME batch that then gets stored in one blockstore-store call (see the Blockstore Store panel below).\n\nBottom line: fetch (receive/filter) and sigverify (dedup/sign) do NOT share a batch definition, even though they're adjacent pipeline stages -- don't directly compare p90(receive) vs p90(dedup) as if scaling by the same packet count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_shred_stage_duration_us_bucket[$__rate_interval])) by (le, stage))",
+          "legendFormat": "{{stage}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "type": "timeseries",
+      "title": "Shred Stage Throughput (batches/iterations per sec)",
+      "description": "What it tracks: how many BATCHES or ITERATIONS per second were observed for each stage above (derived from each histogram's _count). This is batch/iteration cadence, NOT shreds-per-second or packets-per-second -- each stage's batch size differs (e.g. ~64 packets/batch for receive/filter vs. ~54 packets/iteration for dedup/sign vs. a variable-size drain for deserialize/retransmit), so don't compare raw rates across stages as if they were throughput in the same unit. Useful for spotting a stage that has suddenly stopped running (rate drops to 0) or is thrashing (rate spikes with many tiny batches).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_shred_stage_duration_us_count[$__rate_interval])) by (stage)",
+          "legendFormat": "{{stage}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "type": "timeseries",
+      "title": "Shred Pipeline Queue Length",
+      "description": "What it tracks (intended): a Gauge, sampled at scrape time (a point-in-time depth, not an average or max over an interval), for the depth of the shred pipeline's internal channels (e.g. fetch_sender, verified_sender), labeled by channel.\n\nSTATUS: this metric is registered but NOT YET WIRED to a real channel-length read as of 2026-09-29 -- it will show absent/zero until a follow-up change calls .with_label_values(&[channel]).set(len) at the relevant channel. Left in the dashboard as a placeholder for that follow-up; do not draw conclusions from it yet.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "agave_shred_fetch_queue_length",
+          "legendFormat": "{{channel}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "type": "timeseries",
+      "title": "Shred Packets Dropped",
+      "description": "What it tracks: a Counter, incremented by the number of PACKETS (not batches) dropped when the fetch-stage's outbound channel to sigverify was full (EvictingSender TrySendError::Full), summed across both the TVU shred fetch modifier and the repair fetch modifier (core/src/shred_fetch_stage.rs). The panel shows the per-second rate of increase. Should be ~0 under normal operation; sustained non-zero values mean sigverify (or something downstream of it) can't keep up with shred receive rate and shreds are being lost before verification, not just deduplicated.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(agave_shred_packets_dropped_total[$__rate_interval])",
+          "legendFormat": "dropped/sec",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Blockstore Store",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "type": "timeseries",
+      "title": "Blockstore Store Phase Duration ($percentile)",
+      "description": "WHAT 'BATCH' MEANS HERE (direct answer): a batch is the Vec<Shred> produced by ONE core/src/window_service.rs run_insert call -- the exact same batch as the 'deserialize' stage in the Shred Stage Duration panel above (deserialize builds this Vec, then this same Vec is passed straight into Blockstore::insert_shreds_at_location_handle_duplicate() in the same run_insert call). Its size is backlog-dependent (run_insert drains the whole verified-shreds channel with no cap), not fixed, and not a single shred/entry.\n\nTIMING IS FOR THE WHOLE BATCH, not a single entry: every value in this panel is the time for ONE such call, covering however many shreds were in that batch.\n\n- phase=total: wall time of the entire insert call for that batch.\n\n- phase=insert_shreds / write_batch / recovery / insert_lock / commit_working_sets: NOT independently timed by new code -- ledger's own BlockstoreInsertionMetrics cumulative counters are snapshotted immediately before and after the insert call, and the DELTA for that one call/batch is observed here. So each is 'how much of THIS batch's total time this sub-phase contributed', still batch-level, not per-shred or per-entry. total >= sum(the five sub-phases) is expected (some overhead is unattributed).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_blockstore_store_duration_us_bucket[$__rate_interval])) by (le, phase))",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "type": "timeseries",
+      "title": "Blockstore Store Throughput (batches/sec)",
+      "description": "What it tracks: run_insert iterations per second (blockstore-store batches/sec), derived from the histogram's _count. All five phase labels plus 'total' share the same call rate (they're all observed once per run_insert call), so these lines should overlap almost exactly -- if they diverge, something is wrong with the instrumentation, not the validator. Not a shreds-per-second figure; multiply by the (unwired) average batch size to estimate that.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_blockstore_store_duration_us_count[$__rate_interval])) by (phase)",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Replay & Execution",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "panels": []
+    },
+    {
+      "id": 13,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "type": "timeseries",
+      "title": "Replay Stage Duration ($percentile)",
+      "description": "PER-TX OR PER-SLOT? (direct answer): neither one consistently -- this metric family mixes two different granularities, both finer than 'per slot':\n\n- stage=read_blockstore, stage=collect_entries: per CALL to confirm_slot() (ledger/src/blockstore_processor.rs), which is sub-slot granularity -- confirm_slot() is invoked repeatedly for the SAME slot as more shreds/entries become available during replay, so one slot can produce several observations, each covering however many entries/transactions were newly available in that call. collect_entries additionally wraps the whole per-block-component loop for that confirm_slot call (so it overlaps/double-counts whatever execute/commit time happens underneath it for every entry batch processed in that call) -- treat it as an umbrella figure, not an independent stage.\n\n- stage=execute, stage=commit: per TRANSACTION BATCH, one call each to load_and_execute_transactions() and commit_transactions() respectively (runtime/src/bank.rs), for the SAME batch, back to back. Under the unified scheduler a 'batch' is commonly a single transaction, so in practice these two approximate per-transaction latency, not per-slot and not per-confirm_slot-call.\n\nBecause of this mismatch, do not sum or compare these four series as if they summed to one slot's total time -- read_blockstore/collect_entries answer 'how long did this replay pass take', while execute/commit answer 'how long did this one transaction (batch) take'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_replay_stage_duration_us_bucket[$__rate_interval])) by (le, stage))",
+          "legendFormat": "{{stage}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "type": "timeseries",
+      "title": "Replay Stage Throughput",
+      "description": "What it tracks: invocation rate per second per stage label above (derived from each histogram's _count). Because read_blockstore/collect_entries are per-confirm_slot-call while execute/commit are per-transaction-batch, their rates are NOT comparable to each other -- execute/commit will typically show a much higher rate (closer to transactions/sec) than read_blockstore/collect_entries (closer to confirm_slot-calls/sec, which is coarser than slots/sec since one slot can trigger several calls as shreds trickle in).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_replay_stage_duration_us_count[$__rate_interval])) by (stage)",
+          "legendFormat": "{{stage}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Geyser Notify",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 44
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "type": "timeseries",
+      "title": "Geyser Notify Duration ($percentile)",
+      "description": "What it tracks: wall time to loop over ALL loaded Geyser plugins for ONE event of the given type (i.e. plugin-side cost, not validator-side pipeline cost) -- if N plugins are loaded, this is the sum of all N plugin callback durations for that single event, not a per-plugin average.\n\n- notifier=account_update: one call in notify_plugins_of_account_update_for_bank() (geyser-plugin-manager/src/accounts_update_notifier.rs), per (slot, bank_id, account, write_version) commit-time write. Highest-volume notifier under load -- one event per account touched per transaction.\n\n- notifier=slot_status: one call in notify_slot_status()/notify_bank_status() (geyser-plugin-manager/src/slot_status_notifier.rs), per slot-status transition (FirstShredReceived, Completed, CreatedBank, Processed, Confirmed, Rooted, Dead). Only ~6-7 events per slot -- lowest volume notifier here.\n\n- notifier=deshred_transaction: one call per transaction inside a completed data set (core/src/completed_data_sets_service.rs), i.e. pre-replay, from raw deserialized entries.\n\n- notifier=transaction: one call per EXECUTED transaction via TransactionStatusService (geyser-plugin-manager/src/transaction_notifier.rs), post-replay.\n\ndeshred_transaction and transaction both fire once per tx but from different pipeline stages (pre- vs. post-replay) -- compare them to see whether a plugin is slower on one path than the other.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_geyser_notify_duration_us_bucket[$__rate_interval])) by (le, notifier))",
+          "legendFormat": "{{notifier}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "type": "timeseries",
+      "title": "Geyser Notify Throughput (events/sec)",
+      "description": "What it tracks: events per second per notifier type (derived from each histogram's _count). Expect very different natural magnitudes: account_update can be many events per transaction (one per account touched), deshred_transaction/transaction are roughly one per transaction each, and slot_status is only a handful of events per SLOT (not per transaction) -- so slot_status will look nearly flat-zero next to the others on a shared axis even though it's behaving normally.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_geyser_notify_duration_us_count[$__rate_interval])) by (notifier)",
+          "legendFormat": "{{notifier}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Transaction-Status Queue",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "type": "timeseries",
+      "title": "Tx-Status Queue Wait ($percentile)",
+      "description": "What it tracks: how long a committed transaction sits in the (unbounded) TransactionStatusService channel before TransactionStatusService dequeues it and calls notify_transaction -- runtime/src/transaction_execution.rs stamps enqueued_at=Instant::now() when the batch is sent (send_transaction_status_batch), and rpc/src/transaction_status_service.rs observes enqueued_at.elapsed() the moment it's dequeued. One observation per TransactionStatusBatch (which can hold multiple transactions committed together), reusing the agave_replay_stage_duration_us family with stage=tx_status_queue_wait so it's directly comparable to execute/commit above.\n\nWhy this exists: added after the executed_tx end-to-end panel showed p90/p99 (hundreds of ms) exceeding a single slot's duration, while execute/commit themselves were microsecond-scale. This channel is the one hop in the pipeline that had NO backpressure and NO prior visibility -- a rising value here (not a rising execute/commit) is the likely explanation for that tail. Compare directly against the queue length panel below: wait time should track queue length, not confirm_slot/execute/commit costs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_replay_stage_duration_us_bucket{stage=\"tx_status_queue_wait\"}[$__rate_interval])) by (le))",
+          "legendFormat": "queue wait",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "type": "timeseries",
+      "title": "Tx-Status Queue Length",
+      "description": "What it tracks: a Gauge, sampled once per loop iteration of the TransactionStatusService thread (solTxStatusWrtr) immediately after it dequeues a message -- transaction_status_receiver.len(), i.e. how many TransactionStatusBatch/Freeze messages are still waiting behind the one just dequeued. This is a point-in-time depth (not an average over an interval). The channel is crossbeam_channel::unbounded() (core/src/validator.rs), so this can grow arbitrarily under load with no backpressure on the sender side.\n\nHow to read it with the panel above: if queue length is consistently near 0 but tx_status_queue_wait is still elevated, look elsewhere (e.g. the notify_transaction call itself, or Geyser plugin cost -- see the Geyser Notify Duration panel). If queue length is growing/sustained >0, that backlog directly explains elevated tx_status_queue_wait and, transitively, the tail of the executed_tx end-to-end panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "agave_tx_status_queue_length",
+          "legendFormat": "queue depth",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "agave",
+    "shred-geyser",
+    "prometheus"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "p90",
+          "value": "0.9"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Percentile",
+        "multi": false,
+        "name": "percentile",
+        "options": [
+          {
+            "selected": false,
+            "text": "p50",
+            "value": "0.5"
+          },
+          {
+            "selected": true,
+            "text": "p90",
+            "value": "0.9"
+          },
+          {
+            "selected": false,
+            "text": "p95",
+            "value": "0.95"
+          },
+          {
+            "selected": false,
+            "text": "p99",
+            "value": "0.99"
+          }
+        ],
+        "query": "p50 : 0.5,p90 : 0.9,p95 : 0.95,p99 : 0.99",
+        "queryValue": "",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Agave Shred → Geyser Latency",
+  "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
+  "uid": "agave-shred-geyser-latency",
+  "version": 4,
+  "weekStart": ""
+}

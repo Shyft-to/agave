@@ -88,6 +88,8 @@ impl TransactionStatusService {
                                 continue;
                             }
                         };
+                        solana_metrics::pipeline_metrics::TX_STATUS_QUEUE_LENGTH
+                            .set(transaction_status_receiver.len() as f64);
 
                         match Self::write_transaction_status_batch(
                             message,
@@ -137,9 +139,13 @@ impl TransactionStatusService {
                     token_balances,
                     costs,
                     transaction_indexes,
+                    enqueued_at,
                 },
                 work_id,
             )) => {
+                solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
+                    .with_label_values(&["tx_status_queue_wait"])
+                    .observe(enqueued_at.elapsed().as_micros() as f64);
                 let mut status_and_memos_batch = if enable_rpc_transaction_history {
                     Some(blockstore.get_write_batch()?)
                 } else {
@@ -531,6 +537,7 @@ pub(crate) mod tests {
             token_balances,
             costs: vec![Some(123)],
             transaction_indexes: vec![transaction_index],
+            enqueued_at: std::time::Instant::now(),
         };
 
         let test_notifier = Arc::new(TestTransactionNotifier::new());
@@ -642,6 +649,7 @@ pub(crate) mod tests {
             token_balances,
             costs: vec![Some(123), Some(456)],
             transaction_indexes: vec![transaction_index1, transaction_index2],
+            enqueued_at: std::time::Instant::now(),
         };
 
         let test_notifier = Arc::new(TestTransactionNotifier::new());

@@ -38,6 +38,19 @@ pub static SHRED_PACKETS_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| 
     )
 });
 
+/// Depth of the (currently unbounded) `TransactionStatusService` channel,
+/// sampled each time its receiver thread loops. A growing value here means
+/// notify_transaction is falling behind commit, which shows up as inflated
+/// `agave_replay_stage_duration_us{stage="tx_status_queue_wait"}` and
+/// `agave_end_to_end_duration_us{path="executed_tx"}` values without any of
+/// the execute/commit stages themselves being slow.
+pub static TX_STATUS_QUEUE_LENGTH: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_gauge(
+        "agave_tx_status_queue_length",
+        "Depth of the TransactionStatusService channel",
+    )
+});
+
 /// Busy-duration of the blockstore shred-store operation, labeled by
 /// `phase`: `total`, `insert_shreds`, `write_batch`, `recovery`,
 /// `insert_lock`, `commit_working_sets`.

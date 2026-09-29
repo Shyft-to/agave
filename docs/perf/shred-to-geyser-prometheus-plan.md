@@ -169,6 +169,9 @@ pruned by slot age. Every transition calls `.observe()` directly.
 
 ## 4. Phase 2 — Baseline
 
+Step-by-step deployment/collection instructions are in
+`docs/perf/prometheus-deployment.md`. Summary below.
+
 Each validator exposes its own `/metrics` endpoint, so there's no need to filter by
 host in queries (unlike a shared InfluxDB sink feeding many nodes).
 
@@ -306,6 +309,14 @@ wired end to end.
 **Not yet done**: no real validator/testnet run yet (Phase 2 baseline), so no
 before/after numbers exist. That is the next step once this is deployed.
 
+**Grafana dashboard**: `docs/perf/grafana-dashboard-shred-geyser.json` — import
+into Grafana (Dashboards -> New -> Import), pick a Prometheus datasource that
+scrapes this validator's `/metrics` endpoint. Panels: End-to-End latency + rate
+by path, Shred Stage duration + throughput, Queue length, Packets dropped,
+Blockstore Store phase duration + throughput, Replay Stage duration +
+throughput, Geyser Notify duration + throughput. A `$percentile` dropdown
+(p50/p90/p95/p99) drives every `histogram_quantile()` panel.
+
 ## Progress Log
 
 | Date | Step | Result | Commit |
@@ -313,3 +324,89 @@ before/after numbers exist. That is the next step once this is deployed.
 | 2026-09-29 | Plan written (this doc), pipeline mapped via 3 parallel Explore agents, confirmed no drift since fork point 2e10d67f90 | — | (uncommitted) |
 | 2026-09-29 | Phase 0: Prometheus registry, metric helpers, HTTP `/metrics` server, CLI flag, `Validator` wiring | `solana-metrics` 27/27 tests pass incl. live HTTP round-trip; `agave-validator`/`solana-core` compile clean | (uncommitted) |
 | 2026-09-29 | Phase 1: shred-path (receive/deserialize/dedup/filter/sign/retransmit), blockstore-store phases, replay (read/collect/execute/commit), geyser-notify (all 4 notifier types), deshred + executed_tx end-to-end trackers | All touched crates compile; every pre-existing unit test in touched modules still passes (see "Verification performed" above) | (uncommitted) |
+| 2026-09-29 | Phase 2 baseline (test node, live `promtool` pull, ~1h range) | See "Phase 2 baseline results" below. **Finding: `receive` (p50 2.99ms/p90 8.21ms/p99 9.82ms) is the single largest shred-path cost and is NOT included in the `deshred` end-to-end number** (the tracker's start point is inside the fetch-filter loop, after receive already happened) -- true socket-to-notify latency is closer to receive + deshred-end-to-end. Everything else (sigverify, blockstore store, replay stages, geyser notify) is comparatively small. Re-ranks Phase 3: coalesce window is priority 1. | — |
+
+## Phase 2 baseline results (2026-09-29, live `promtool` pull, `[1h]` range)
+
+**End-to-end** (us): | path | p50 | p90 | p99 | observations/sec |
+|---|---|---|---|---|
+| deshred | 2562 | 9181 | 32086 | 67.6 |
+| executed_tx | 132161 | 426654 | 492915 | 3803 |
+
+**Shred path stage duration** (us), throughput all ~314-340 batches/sec (consistent across stages -- confirms one shared batch per stage as documented):
+| stage | p50 | p90 | p99 |
+|---|---|---|---|
+| receive | 2987 | 8213 | 9822 |
+| sign | 267 | 477 | 962 |
+| dedup | 147 | 273 | 600 |
+| retransmit | 54 | 100 | 469 |
+| filter | 12 | 19 | 49 |
+| deserialize | 6.6 | 16 | 31 |
+
+Packets dropped: 0. Queue length: empty (not wired, as expected).
+
+**Blockstore store phase duration** (us), throughput ~313.8 batches/sec for all six (confirms all six are observed together per batch):
+| phase | p50 | p90 | p99 |
+|---|---|---|---|
+| total | 129 | 467 | 944 |
+| insert_shreds | 59 | 188 | 456 |
+| write_batch | 56 | 162 | 204 |
+| recovery | 5.5 | 10 | 471 (heavy tail) |
+| insert_lock | 5.0 | 9.0 | 9.9 |
+| commit_working_sets | 5.0 | 9.0 | 9.9 |
+
+Sub-phase sum roughly tracks `total` at p50/p90 as expected; at p99 the sum exceeds `total` since each phase's p99 is its own independent worst case, not necessarily from the same batch.
+
+**Replay stage duration** (us):
+| stage | p50 | p90 | p99 | throughput/sec |
+|---|---|---|---|---|
+| read_blockstore | 65 | 166 | 405 | 104 (confirm_slot calls) |
+| collect_entries | 597 | 1194 | 4934 | 104 (confirm_slot calls) |
+| execute | 45 | 626 | 1912 | 3803 (tx batches) |
+| commit | 17 | 47 | 206 | 3803 (tx batches) |
+
+execute/commit throughput (~3803/sec) matches the `executed_tx` end-to-end observation rate and the `transaction`/`deshred_transaction` geyser-notify rates almost exactly -- good cross-check that these are all measuring the same underlying tx flow.
+
+**Geyser notify duration** (us) -- all negligible:
+| notifier | p50 | p90 | p99 | throughput/sec |
+|---|---|---|---|---|
+| account_update | 5.1 | 9.1 | 13 | 10195 |
+| deshred_transaction | 5.0 | 9.0 | 9.9 | 3803 |
+| transaction | 5.8 | 13 | 39 | 3803 |
+| slot_status | 9.4 | 18 | 21 | 22.5 |
+
+**Interpretation:**
+1. **`receive` (~3-10ms) dominates the shred path** and is bigger than every other shred-path stage combined (sign+dedup+retransmit+filter+deserialize sums to ~487us at p50, ~885us at p90 -- an order of magnitude less than receive alone). This lines up with the known `coalesce = Some(Duration::from_millis(5))` on the shred UDP sockets (`core/src/shred_fetch_stage.rs` `packet_modifier` -> `streamer::receiver`). **Phase 3 priority 1: make the coalesce window configurable and A/B it (0 / 500us / 1ms / 2ms vs. the current 5ms)**, watching `receive` p50/p90/p99, sigverify iteration count/CPU (smaller batches -> more iterations), and packet-drop/overflow counters.
+2. **`receive` is not inside the `deshred` end-to-end number.** The deshred tracker's `mark_started` fires inside the fetch-stage filter loop, i.e. after `receive` has already completed for that batch. So the true "wire to Geyser-notified" latency for the deshred path is closer to **receive + deshred end-to-end**: ~5.5ms p50, ~17.4ms p90, ~41.9ms p99 -- not the 2.6/9.2/32ms the `deshred` panel shows on its own. Worth a follow-up: fold `receive` into the tracker's start point, or at minimum always read them together.
+3. **`executed_tx`'s huge numbers (132-493ms) are not explained by any per-stage cost measured here** (all replay/execute/commit/geyser-notify costs are microsecond-scale). This metric is dominated by a transaction's *position within its slot* relative to that slot's own duration (~hundreds of ms), not by processing overhead -- optimizing `execute`/`commit`/`collect_entries` further will barely move it. If the real goal is "how long after execution does a tx reach Geyser" rather than "how long after the slot's first shred", a different, narrower metric would be needed.
+4. Blockstore `recovery` and `insert_shreds` have a p99 tail (471us, 456us) worth watching but are not currently the dominant cost anywhere.
+5. Geyser plugin cost is negligible across all four notifier types, consistent with earlier findings on the unrelated `custom-pipeline` branch -- plugins are not the bottleneck.
+
+### Follow-up instrumentation: TransactionStatusService queue (added 2026-09-29)
+
+Since `execute`/`commit` are microsecond-scale but `executed_tx` end-to-end p90/p99
+(427ms/493ms) exceed a single slot's duration, the gap had to be somewhere not yet
+measured. The one candidate hop with no prior visibility: the
+`crossbeam_channel::unbounded()` channel between transaction commit and
+`TransactionStatusService` (`core/src/validator.rs:2958`), which has no
+backpressure and, until now, no depth or wait-time metric.
+
+Added:
+- `TransactionStatusBatch.enqueued_at: Instant` (`runtime/src/transaction_execution.rs`),
+  stamped in `send_transaction_status_batch` at send time, read back in
+  `rpc/src/transaction_status_service.rs::write_transaction_status_batch` to observe
+  queue wait into `agave_replay_stage_duration_us{stage="tx_status_queue_wait"}`
+  (reuses the existing replay-stage metric family rather than a new one, since it's
+  directly comparable to `execute`/`commit`).
+- `agave_tx_status_queue_length` (Gauge) -- `transaction_status_receiver.len()`,
+  sampled once per `solTxStatusWrtr` loop iteration right after a dequeue.
+
+Dashboard: new "Transaction-Status Queue" row (2 panels) added to
+`grafana-dashboard-shred-geyser.json` (now version 4). Baseline queries file and
+`run-baseline-queries.sh` updated with the corresponding PromQL.
+
+Verification: `cargo check` on `solana-runtime`, `solana-rpc`, `solana-metrics`,
+`solana-ledger`, `solana-core`, `agave-validator` bins all clean.
+`solana-rpc::transaction_status_service` tests (2/2) and
+`solana-runtime::transaction_execution` tests (6/6) pass. Not yet deployed/re-baselined
+with this addition.
