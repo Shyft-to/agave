@@ -16,12 +16,20 @@ use {
 /// accident (as could happen with `prometheus::default_registry()`).
 pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
-/// Bucket boundaries, in microseconds, spanning ~10us to 500ms. All duration
+/// Bucket boundaries, in microseconds, spanning ~10us to 5s. All duration
 /// metrics in this module are in microseconds, not Prometheus's usual
 /// base-unit-in-seconds convention.
+///
+/// The top end (1s/2s/5s) exists specifically for `agave_end_to_end_duration_us`
+/// (path=executed_tx can legitimately span multiple slots on a real cluster --
+/// skipped slots, big blocks, a validator briefly falling behind). Without these,
+/// `histogram_quantile` silently clips any p99/p999 above the highest finite
+/// bucket to that bucket's boundary instead of showing the true value -- this
+/// was observed in practice (a reported p99 of exactly 500000us, the old
+/// ceiling, on 2026-09-29's baseline run) before this range was widened.
 pub const DURATION_US_BUCKETS: &[f64] = &[
     10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 20_000.0,
-    50_000.0, 100_000.0, 500_000.0,
+    50_000.0, 100_000.0, 500_000.0, 1_000_000.0, 2_000_000.0, 5_000_000.0,
 ];
 
 pub fn register_histogram(name: &str, help: &str) -> Histogram {
