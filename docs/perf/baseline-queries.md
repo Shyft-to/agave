@@ -128,7 +128,26 @@ and the queue length stays near 0, this rules out this hop as the source of
 the unaccounted ~17-25ms gap between measured shred-path stages and the
 `deshred` end-to-end p99 (see the Progress Log entry for "Phase 3 hypothesis 2").
 
-## 9. Host facts (not queries — note manually alongside the results above)
+## 9. Verified-shreds channel wait/backlog (Phase 3 hypothesis 3)
+
+```promql
+histogram_quantile(0.5, sum(rate(agave_shred_stage_duration_us_bucket{stage="verified_recv_wait"}[1h])) by (le))
+histogram_quantile(0.9, sum(rate(agave_shred_stage_duration_us_bucket{stage="verified_recv_wait"}[1h])) by (le))
+histogram_quantile(0.99, sum(rate(agave_shred_stage_duration_us_bucket{stage="verified_recv_wait"}[1h])) by (le))
+agave_verified_shreds_queue_length
+```
+
+This is the last genuinely unmeasured hop between the shred-fetch tracker's
+start point and the `deshred` end-to-end notify -- the unbounded channel
+between sigverify and `window_service::run_insert`. If this also comes back
+small/near-zero, the remaining ~45ms p99 gap (see the Progress Log's Phase 3
+hypothesis 2 result) is more likely burst correlation across stages than a
+single missing hop -- worth cross-referencing against
+`agave_shred_stage_duration_us{stage="dedup"|"sign"}` and
+`agave_blockstore_store_duration_us{phase="total"}` *max* values (not just
+percentiles) in the same time window to check for simultaneous spikes.
+
+## 10. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

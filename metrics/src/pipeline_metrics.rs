@@ -12,7 +12,12 @@ use {
 };
 
 /// Busy-duration of each shred-path operation, labeled by `stage`:
-/// `receive`, `deserialize`, `dedup`, `filter`, `sign`, `retransmit`.
+/// `receive`, `deserialize`, `dedup`, `filter`, `sign`, `retransmit`,
+/// `verified_recv_wait` (time `window_service::run_insert` spends blocked in
+/// `recv_timeout` waiting for the sigverify->window-service channel, plus
+/// draining whatever had queued -- mostly reflects genuine idle wait unless
+/// the channel has backlog, in which case pair it with
+/// `VERIFIED_SHREDS_QUEUE_LENGTH`).
 pub static SHRED_STAGE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_shred_stage_duration_us",
@@ -35,6 +40,21 @@ pub static SHRED_PACKETS_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| 
     register_int_counter(
         "agave_shred_packets_dropped_total",
         "Shred packets dropped before reaching sigverify",
+    )
+});
+
+/// Depth of the `verified_sender`/`verified_receiver` channel between
+/// sigverify and `window_service::run_insert`, sampled once per `run_insert`
+/// call right after `recv_timeout` succeeds (before the channel is drained
+/// via `try_iter`, so it reflects genuine backlog rather than the emptiness
+/// left behind by that same drain). Unbounded channel, added while chasing
+/// an unaccounted gap between measured shred-path stages and the `deshred`
+/// end-to-end p99 (see docs/perf/shred-to-geyser-prometheus-plan.md, "Phase 3
+/// hypothesis 3").
+pub static VERIFIED_SHREDS_QUEUE_LENGTH: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_gauge(
+        "agave_verified_shreds_queue_length",
+        "Depth of the verified-shreds channel between sigverify and window_service",
     )
 });
 

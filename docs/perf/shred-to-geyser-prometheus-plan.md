@@ -657,6 +657,48 @@ Verification: `cargo check` on `solana-metrics`, `solana-core`,
 `agave-validator` bins, and `solana-local-cluster` (with
 `--features agave-unstable-api`, per the lesson above) all clean.
 `solana-core::completed_data_sets_service` tests (10/10) pass -- unaffected,
-since no message type changed. Not yet deployed/re-baselined -- next step is
-to redeploy and pull section 8 of `baseline-queries.md`, per the "how to use
-this" note on the new dashboard panel.
+since no message type changed.
+
+**Result (deployed and re-baselined, 2026-09-30): ruled out.**
+`rocksdb_reread` p50/p90/p99 = 84/170/385us, `batch_total` p50/p90/p99 =
+6.7/332/552us, `agave_completed_data_sets_queue_length` = 0. Both small, no
+backlog. **This hop is not where the time is going.**
+
+The `deshred` end-to-end number pulled in the same session was *worse*, not
+better: p50/p90/p99 = 2864/9490/48600us (vs the 2681/9336/26534us original
+baseline) -- summing every shred-path stage measured so far (dedup ~0.6ms +
+sign ~1.0ms + blockstore store ~0.9ms + rocksdb_reread ~0.4ms + batch_total
+~0.55ms, all at p99) only accounts for ~3.5ms, leaving **~45ms unexplained at
+p99** -- a bigger gap than the ~17-25ms that motivated this hypothesis.
+
+Two things to hold in mind going into hypothesis 3: (a) there's still one
+genuinely unmeasured hop on this exact path -- the unbounded
+`verified_sender`/`verified_receiver` channel between sigverify and
+`window_service::run_insert`, never checked before now; (b) a p99-of-the-sum
+can legitimately exceed the sum of independently-computed per-stage p99s if a
+traffic burst slows multiple sequential stages *at once* for the same shred --
+some of this gap may be that correlation rather than one missing hop, and
+hypothesis 3 won't fully resolve that possibility even if it comes back clean.
+
+## Phase 3, hypothesis 3: verified-shreds channel (sigverify -> window_service) wait/backlog
+
+**Implemented (2026-09-30):**
+- `agave_verified_shreds_queue_length` (Gauge) -- `verified_receiver.len()`,
+  sampled in `core/src/window_service.rs::run_insert` right after
+  `recv_timeout` succeeds but *before* the subsequent `try_iter().flatten()`
+  drain, so it reflects genuine backlog rather than the emptiness that same
+  drain would otherwise leave behind.
+- `agave_shred_stage_duration_us{stage="verified_recv_wait"}` -- exposes the
+  pre-existing `shred_receiver_elapsed` `Measure` (previously only fed into
+  the legacy `WindowServiceMetrics` datapoint) as a histogram too. Reused the
+  existing `SHRED_STAGE_DURATION_US` family rather than adding a new one,
+  since it's directly comparable to the other shred-path stages. Mostly
+  reflects idle wait unless paired with a non-zero queue-length reading.
+
+Verification: `cargo check` on `solana-metrics`, `solana-core`,
+`agave-validator` bins, and `solana-local-cluster` (`--features
+agave-unstable-api`) all clean. `solana-core::window_service` tests (4/4)
+pass. Not yet deployed/re-baselined -- next step is to redeploy and pull
+`agave_verified_shreds_queue_length` and
+`agave_shred_stage_duration_us{stage="verified_recv_wait"}` alongside the
+`deshred` end-to-end numbers, same pattern as hypothesis 2.

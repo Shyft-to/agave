@@ -234,9 +234,14 @@ where
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
+    solana_metrics::pipeline_metrics::VERIFIED_SHREDS_QUEUE_LENGTH
+        .set(verified_receiver.len() as f64);
     shreds.extend(verified_receiver.try_iter().flatten());
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["verified_recv_wait"])
+        .observe(shred_receiver_elapsed.as_us() as f64);
     ws_metrics.run_insert_count += 1;
     let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
         if repair {

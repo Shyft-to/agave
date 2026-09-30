@@ -67,3 +67,9 @@ run "p50 deshred stage duration" "histogram_quantile(0.5, sum(rate(agave_deshred
 run "p90 deshred stage duration" "histogram_quantile(0.9, sum(rate(agave_deshred_stage_duration_us_bucket[$RANGE])) by (le, stage))"
 run "p99 deshred stage duration" "histogram_quantile(0.99, sum(rate(agave_deshred_stage_duration_us_bucket[$RANGE])) by (le, stage))"
 run "completed-data-sets queue length" "agave_completed_data_sets_queue_length"
+
+echo "== 9. Verified-shreds channel wait/backlog =="
+run "p50 verified_recv_wait" "histogram_quantile(0.5, sum(rate(agave_shred_stage_duration_us_bucket{stage=\"verified_recv_wait\"}[$RANGE])) by (le))"
+run "p90 verified_recv_wait" "histogram_quantile(0.9, sum(rate(agave_shred_stage_duration_us_bucket{stage=\"verified_recv_wait\"}[$RANGE])) by (le))"
+run "p99 verified_recv_wait" "histogram_quantile(0.99, sum(rate(agave_shred_stage_duration_us_bucket{stage=\"verified_recv_wait\"}[$RANGE])) by (le))"
+run "verified-shreds queue length" "agave_verified_shreds_queue_length"

@@ -1907,6 +1907,217 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 27,
+      "type": "row",
+      "title": "Verified-Shreds Channel (Phase 3 hypothesis 3: last unmeasured hop)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "panels": []
+    },
+    {
+      "id": 28,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 81
+      },
+      "type": "timeseries",
+      "title": "Verified-Recv Wait ($percentile)",
+      "description": "What it tracks: exposes the pre-existing shred_receiver_elapsed Measure from core/src/window_service.rs::run_insert (previously only fed into the legacy WindowServiceMetrics datapoint) as a histogram, reusing the agave_shred_stage_duration_us family. Covers recv_timeout() (blocking wait for the next message on the sigverify->window_service channel, up to 200ms) PLUS draining whatever else had queued via try_iter(). One observation per run_insert call.\n\nMostly reflects genuine idle wait (channel usually empty, thread blocks on recv_timeout) rather than backlog -- pair with the queue-length panel below to tell the difference. Added while chasing an unaccounted ~45ms gap between measured shred-path stages and the deshred end-to-end p99: this is the last genuinely unmeasured hop on that path (sigverify -> window_service, an unbounded channel, never checked before).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_shred_stage_duration_us_bucket{stage=\"verified_recv_wait\"}[$__rate_interval])) by (le))",
+          "legendFormat": "verified_recv_wait",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 81
+      },
+      "type": "timeseries",
+      "title": "Verified-Shreds Queue Length",
+      "description": "What it tracks: a Gauge, sampled once per run_insert call in core/src/window_service.rs, immediately after recv_timeout() succeeds but BEFORE the subsequent try_iter().flatten() drain -- verified_receiver.len(), i.e. how many more Vec<(shred::Payload, bool, BlockLocation)> messages were queued at that moment, on top of the one just received. Sampled before the drain specifically so it reflects genuine backlog rather than the emptiness that same drain would otherwise leave behind. Channel is unbounded.\n\nHow to read it: near-zero here alongside a small verified_recv_wait rules out this hop as the source of the unaccounted deshred p99 gap -- at that point the remaining explanation is most likely burst correlation across multiple stages simultaneously (a traffic spike slowing receive+dedup/sign+store together for the same shred), not one single missing hop. Sustained backlog here would instead point to window_service/blockstore-insert throughput, not any per-call latency we've measured.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "agave_verified_shreds_queue_length",
+          "legendFormat": "queue depth",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "10s",
@@ -1981,6 +2192,6 @@
   "title": "Agave Shred → Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 6,
+  "version": 7,
   "weekStart": ""
 }
