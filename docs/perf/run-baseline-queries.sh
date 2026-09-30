@@ -61,3 +61,9 @@ run "p99 execute phase duration"  "histogram_quantile(0.99, sum(rate(agave_execu
 run "p50 execute detail duration" "histogram_quantile(0.5, sum(rate(agave_execute_detail_duration_us_bucket[$RANGE])) by (le, phase))"
 run "p90 execute detail duration" "histogram_quantile(0.9, sum(rate(agave_execute_detail_duration_us_bucket[$RANGE])) by (le, phase))"
 run "p99 execute detail duration" "histogram_quantile(0.99, sum(rate(agave_execute_detail_duration_us_bucket[$RANGE])) by (le, phase))"
+
+echo "== 8. Completed-data-sets channel wait + RocksDB re-read =="
+run "p50 deshred stage duration" "histogram_quantile(0.5, sum(rate(agave_deshred_stage_duration_us_bucket[$RANGE])) by (le, stage))"
+run "p90 deshred stage duration" "histogram_quantile(0.9, sum(rate(agave_deshred_stage_duration_us_bucket[$RANGE])) by (le, stage))"
+run "p99 deshred stage duration" "histogram_quantile(0.99, sum(rate(agave_deshred_stage_duration_us_bucket[$RANGE])) by (le, stage))"
+run "completed-data-sets queue length" "agave_completed_data_sets_queue_length"

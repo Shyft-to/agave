@@ -38,6 +38,33 @@ pub static SHRED_PACKETS_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| 
     )
 });
 
+/// Busy-duration of CompletedDataSetsService-specific work, labeled by
+/// `stage`: `rocksdb_reread` (re-reading and re-deserializing shred entries
+/// already held in memory by the window-service insert, per completed data
+/// set) and `batch_total` (the whole drain-and-notify batch, reusing the
+/// pre-existing `batch_measure` this service already computed for its legacy
+/// datapoint).
+pub static DESHRED_STAGE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_deshred_stage_duration_us",
+        "Duration of CompletedDataSetsService-specific stages, in microseconds",
+        &["stage"],
+    )
+});
+
+/// Depth of the `CompletedDataSetsService` channel, sampled each time its
+/// receiver thread loops. Added alongside `DESHRED_STAGE_DURATION_US` while
+/// investigating an unaccounted ~17-25ms gap between the sum of measured
+/// shred-path stages and the `deshred` end-to-end p99 -- if this stays near 0
+/// while `rocksdb_reread`/`batch_total` are small too, the gap is neither a
+/// queueing backlog nor blockstore re-read cost.
+pub static COMPLETED_DATA_SETS_QUEUE_LENGTH: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_gauge(
+        "agave_completed_data_sets_queue_length",
+        "Depth of the CompletedDataSetsService channel",
+    )
+});
+
 /// Depth of the (currently unbounded) `TransactionStatusService` channel,
 /// sampled each time its receiver thread loops. A growing value here means
 /// notify_transaction is falling behind commit, which shows up as inflated

@@ -545,3 +545,118 @@ increase total sigverify time if it results in many more iterations), and
 than default) to see if it changes the `dedup`/`sign` per-iteration cost curve.
 Change one flag at a time per the plan's "one hypothesis per commit/config"
 rule, and log before/after p50/p90/p99 in this Progress Log.
+
+## Phase 3, hypothesis 1 result: coalesce window -- tested, no net gain (2026-09-30)
+
+Deployed and A/B'd on the live test node using
+`docs/perf/compare-before-after.sh` (added this session; compares two
+historical windows via `promtool query instant --time=<ts>` rather than the
+`@` PromQL modifier, since this Prometheus version doesn't support `@`).
+Baseline: defaults (`coalesce=5000us`, `batch=1024`) at 05:00. Two after-pulls,
+both confirming each other: 09:15 with `coalesce=2000us` alone (`batch=1024`
+unchanged), and 12:30 with `coalesce=2000us` + `batch=512` together.
+
+**receive improved substantially and reproducibly**, exactly as the mechanism
+predicts (smaller coalesce window -> faster batch return, more frequent
+batches):
+| | before | after (both configs, consistent) |
+|---|---|---|
+| receive p50/p90/p99 (us) | 2516/7738/9774 | ~1800/4280/4930 |
+| receive batches/sec | 346 | ~575 (+66%) |
+
+**But `sigverify_batch_size` 1024->512 turned out to be inert at current
+traffic**: comparing the two after-pulls against each other (both at
+`coalesce=2000us`, only `batch` differs) shows receive/dedup/sign timings,
+iteration rate (~570-576/sec both times) and sigverify busy time (0.1776 vs
+0.1785) all within noise of each other. Confirms the Phase 2 baseline's own
+finding (sigverify already averages ~1 packet-batch/iteration under normal
+load) -- a batch-size *cap* well above what's ever actually queued has nothing
+to bind on. Not worth touching again unless traffic grows much heavier.
+
+**The coalesce win doesn't carry through to the outcome metric, and comes with
+a reproducible cost**:
+| | before | after (both configs, consistent) |
+|---|---|---|
+| deshred p50/p90 (us) | 2681/9336 | ~2700-2800/9460-9580 (flat) |
+| deshred p99 (us) | 26534 | 29449-37037 (worse, noisy but consistently above baseline) |
+| sigverify busy time/sec | 0.148 | ~0.178 (**+20%, reproducible**) |
+| packets dropped/sec | 0 | 0 |
+
+**Verdict: does not clear the keep bar** (p90 of the outcome metric must
+improve and regression guards must not worsen; here p90 is flat and the
+sigverify-busy-time guard reproducibly regresses 20%). `receive`'s own
+improvement is real but gets absorbed by more frequent sigverify iterations
+paying more aggregate fixed per-iteration overhead -- consistent with the
+Phase 2 baseline's finding that sigverify cost is dominated by fixed
+dispatch/sync cost, not per-packet cost. **Recommendation: revert to the
+5000us/1024 defaults** (or try a much smaller trim, e.g. 3500-4000us, if
+revisited later) -- not pursuing further for now.
+
+**New finding while analyzing this**: summing the measured shred-path stage
+p99s (receive ~9.8ms + dedup ~0.6ms + sign ~1.0ms + blockstore-store total
+~0.9ms ~= 12.3ms) falls well short of the actual `deshred` end-to-end p99
+(~29-37ms). Per the design note in section 3d, `receive` isn't inside the
+`deshred` end-to-end window at all (the tracker starts after receive already
+happened), so it doesn't subtract from this gap -- meaning roughly 17-25ms of
+the deshred p99 tail is currently unaccounted for by any instrumented stage.
+The likely hiding places, per the original Phase 3 candidate list (S6): the
+`completed_data_sets` channel wait time between blockstore-insert and
+`CompletedDataSetsService` dequeuing it, and/or the RocksDB re-read inside
+`recv_completed_data_sets` (`blockstore.get_entries_in_data_block`, which
+re-reads and re-deserializes shreds already held in memory by `run_insert`) --
+neither is currently instrumented. This becomes Phase 3 hypothesis 2 below.
+
+## Phase 3, hypothesis 2: completed-data-sets channel wait + RocksDB re-read cost (next)
+
+Rationale: see the unaccounted-gap finding immediately above. Plan: instrument
+first (per the project's own "measure before optimizing" rule), same pattern
+as the tx-status-queue investigation --
+1. Channel wait: stamp an `Instant` when `run_insert`
+   (`core/src/window_service.rs`) sends a `CompletedDataSetInfo` batch on
+   `completed_data_sets_sender`, read it back in
+   `CompletedDataSetsService::recv_completed_data_sets`
+   (`core/src/completed_data_sets_service.rs`) to observe queue wait, plus a
+   channel-length gauge (mirrors `agave_tx_status_queue_length`).
+2. RocksDB re-read cost: wrap the `blockstore.get_entries_in_data_block(...)`
+   call in `recv_completed_data_sets` with a timer, observed into a new
+   `phase="rocksdb_reread"` (or similar) label.
+3. Redeploy, re-pull the `deshred` breakdown, and see whether either of these
+   two now accounts for the 17-25ms gap. Only attempt the actual fix (S6:
+   have `run_insert` pass along the already-deserialized entries instead of
+   re-reading them) once the data confirms this is where the time is going --
+   not before.
+
+**Implemented (2026-09-30):**
+- `agave_deshred_stage_duration_us{stage="rocksdb_reread"|"batch_total"}` --
+  `rocksdb_reread` wraps `blockstore.get_entries_in_data_block(...)` per
+  completed data set; `batch_total` exposes the service's pre-existing
+  `batch_measure` (previously only in the legacy `deshred_geyser_timing`
+  datapoint) as a histogram too. Both in `metrics/src/pipeline_metrics.rs` +
+  `core/src/completed_data_sets_service.rs`.
+- `agave_completed_data_sets_queue_length` (Gauge) --
+  `completed_sets_receiver.len()`, sampled once per `solComplDataSet` loop
+  iteration right after a successful `recv_timeout`. This channel is bounded
+  at 100,000 (`core/src/tvu.rs`), unlike the unbounded tx-status channel, but
+  can still build a meaningful backlog well before that ceiling.
+- Deliberately did NOT change the `CompletedDataSetsSender`/`Receiver` message
+  type to carry a per-message enqueue timestamp (the more direct way to
+  measure channel *wait* time, as done for tx-status) -- `CompletedDataSetInfo`
+  derives `Eq`/`PartialEq` and has an equality-based test
+  (`ledger/src/blockstore/tests.rs`), and three more direct-send test sites in
+  `completed_data_sets_service.rs`, making that change meaningfully more
+  invasive. The queue-length gauge is the cheaper proxy: combined with
+  `batch_total`, it's enough to tell whether this hop has a backlog at all
+  before committing to the bigger change.
+
+Dashboard: new "Completed-Data-Sets Channel" row (2 panels) added to
+`grafana-dashboard-shred-geyser.json` (now version 6). Baseline queries file
+(section 8) and `run-baseline-queries.sh` updated with the corresponding
+PromQL.
+
+Verification: `cargo check` on `solana-metrics`, `solana-core`,
+`agave-validator` bins, and `solana-local-cluster` (with
+`--features agave-unstable-api`, per the lesson above) all clean.
+`solana-core::completed_data_sets_service` tests (10/10) pass -- unaffected,
+since no message type changed. Not yet deployed/re-baselined -- next step is
+to redeploy and pull section 8 of `baseline-queries.md`, per the "how to use
+this" note on the new dashboard panel.

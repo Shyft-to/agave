@@ -148,6 +148,8 @@ impl CompletedDataSetsService {
     ) -> Result<(), RecvTimeoutError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
         let first_completed_data_sets = completed_sets_receiver.recv_timeout(RECV_TIMEOUT)?;
+        solana_metrics::pipeline_metrics::COMPLETED_DATA_SETS_QUEUE_LENGTH
+            .set(completed_sets_receiver.len() as f64);
         let root_bank = deshred_transaction_notifier
             .as_ref()
             .filter(|notifier| notifier.alt_resolution_enabled())
@@ -165,7 +167,12 @@ impl CompletedDataSetsService {
                 let CompletedDataSetInfo { slot, indices } = completed_data_set_info;
                 let completed_data_set_starting_shred_index = indices.start;
                 let completed_data_set_ending_shred_index_exclusive = indices.end;
-                match blockstore.get_entries_in_data_block(slot, indices, /*slot_meta:*/ None) {
+                let reread_start = std::time::Instant::now();
+                let reread_result = blockstore.get_entries_in_data_block(slot, indices, /*slot_meta:*/ None);
+                solana_metrics::pipeline_metrics::DESHRED_STAGE_DURATION_US
+                    .with_label_values(&["rocksdb_reread"])
+                    .observe(reread_start.elapsed().as_micros() as f64);
+                match reread_result {
                     Ok(entries) => {
                         if let Some(notifier) = deshred_transaction_notifier
                             && let Some(update_parent) = blockstore
@@ -210,6 +217,9 @@ impl CompletedDataSetsService {
         }
 
         batch_measure.stop();
+        solana_metrics::pipeline_metrics::DESHRED_STAGE_DURATION_US
+            .with_label_values(&["batch_total"])
+            .observe(batch_measure.as_us() as f64);
 
         if deshred_transaction_notifier.is_some() {
             let avg_notify_us = stats

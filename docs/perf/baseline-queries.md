@@ -112,7 +112,23 @@ phases in the detail query -- those are ~0 for warm/cached programs and the
 most likely place a rare outlier hides (a cold program forcing a JIT compile
 on the hot path).
 
-## 8. Host facts (not queries — note manually alongside the results above)
+## 8. Completed-data-sets channel wait + RocksDB re-read (Phase 3 hypothesis 2)
+
+```promql
+histogram_quantile(0.5, sum(rate(agave_deshred_stage_duration_us_bucket[1h])) by (le, stage))
+histogram_quantile(0.9, sum(rate(agave_deshred_stage_duration_us_bucket[1h])) by (le, stage))
+histogram_quantile(0.99, sum(rate(agave_deshred_stage_duration_us_bucket[1h])) by (le, stage))
+agave_completed_data_sets_queue_length
+```
+
+`stage="rocksdb_reread"` is the `get_entries_in_data_block` re-read/re-deserialize
+cost per completed data set; `stage="batch_total"` is the whole
+drain-and-notify batch. If `rocksdb_reread` and `batch_total` are both small
+and the queue length stays near 0, this rules out this hop as the source of
+the unaccounted ~17-25ms gap between measured shred-path stages and the
+`deshred` end-to-end p99 (see the Progress Log entry for "Phase 3 hypothesis 2").
+
+## 9. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

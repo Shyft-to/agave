@@ -1696,6 +1696,217 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "Completed-Data-Sets Channel (Phase 3 hypothesis 2: unaccounted deshred p99 gap)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "type": "timeseries",
+      "title": "Deshred Stage Duration ($percentile)",
+      "description": "What it tracks: CompletedDataSetsService-specific work, added while chasing an unaccounted ~17-25ms gap between the sum of measured shred-path stage p99s and the actual `deshred` end-to-end p99 (see docs/perf/shred-to-geyser-prometheus-plan.md, 'Phase 3 hypothesis 2').\n\nstage=rocksdb_reread: time for ONE Blockstore::get_entries_in_data_block() call per completed data set (core/src/completed_data_sets_service.rs) -- this RE-READS AND RE-DESERIALIZES shred entries from RocksDB that window_service::run_insert already held in memory a moment earlier. One observation per completed data set (a slot's data can produce several per batch).\n\nstage=batch_total: the whole drain-and-notify batch for one recv_completed_data_sets() call (covers however many completed data sets were queued at that moment) -- reuses the pre-existing `batch_measure` this service already computed for its legacy datapoint_info, now also exposed here. One observation per call, lower cadence than rocksdb_reread.\n\nHow to use this: if rocksdb_reread/batch_total together only account for low tens-of-microseconds to low-single-digit-milliseconds, this hop is NOT where the unaccounted gap is hiding -- check the queue length panel next, then look further upstream/downstream.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_deshred_stage_duration_us_bucket[$__rate_interval])) by (le, stage))",
+          "legendFormat": "{{stage}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "type": "timeseries",
+      "title": "Completed-Data-Sets Queue Length",
+      "description": "What it tracks: a Gauge, sampled once per loop iteration of CompletedDataSetsService's solComplDataSet thread, immediately after a successful recv_timeout() -- completed_sets_receiver.len(), i.e. how many more Vec<CompletedDataSetInfo> batches are still queued behind the one just received. Point-in-time depth, not an average. This channel is bounded at 100_000 (core/src/tvu.rs), so unlike the tx-status channel it has an eventual backpressure ceiling, but can still build a meaningful backlog well before hitting it.\n\nHow to read it: if this stays near 0 while the duration panel above is also small, a queueing backlog on THIS hop is ruled out as the source of the unaccounted deshred p99 gap. If it's sustained above 0, that backlog (not rocksdb_reread/batch_total cost) is a real candidate explanation, and the fix would be about throughput/backpressure on this stage, not per-call latency.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "agave_completed_data_sets_queue_length",
+          "legendFormat": "queue depth",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "10s",
@@ -1770,6 +1981,6 @@
   "title": "Agave Shred → Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 5,
+  "version": 6,
   "weekStart": ""
 }
