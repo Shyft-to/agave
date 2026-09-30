@@ -93,7 +93,26 @@ If `tx_status_queue_wait` is large and `agave_tx_status_queue_length` is
 sustained above 0, that backlog (not execute/commit) explains the `executed_tx`
 end-to-end tail.
 
-## 7. Host facts (not queries — note manually alongside the results above)
+## 7. Execute phase/detail breakdown (added while investigating the executed_tx tail)
+
+```promql
+histogram_quantile(0.5, sum(rate(agave_execute_phase_duration_us_bucket[1h])) by (le, phase))
+histogram_quantile(0.9, sum(rate(agave_execute_phase_duration_us_bucket[1h])) by (le, phase))
+histogram_quantile(0.99, sum(rate(agave_execute_phase_duration_us_bucket[1h])) by (le, phase))
+
+histogram_quantile(0.5, sum(rate(agave_execute_detail_duration_us_bucket[1h])) by (le, phase))
+histogram_quantile(0.9, sum(rate(agave_execute_detail_duration_us_bucket[1h])) by (le, phase))
+histogram_quantile(0.99, sum(rate(agave_execute_detail_duration_us_bucket[1h])) by (le, phase))
+```
+
+Reuses Solana's own pre-existing `ExecuteTimings`/`ExecuteDetailsTimings` counters
+(snapshotted before/after each `execute` call), not new manual timers. Watch
+especially `create_executor_jit_compile` and the other `create_executor_*`
+phases in the detail query -- those are ~0 for warm/cached programs and the
+most likely place a rare outlier hides (a cold program forcing a JIT compile
+on the hot path).
+
+## 8. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

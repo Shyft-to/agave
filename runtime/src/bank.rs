@@ -4637,6 +4637,7 @@ impl Bank {
         pre_commit_callback: Option<impl FnOnce(&[TransactionProcessingResult]) -> Result<()>>,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         let execute_start = std::time::Instant::now();
+        let execute_timings_before = ExecuteTimingsSnapshot::capture(timings);
         let LoadAndExecuteTransactionsOutput {
             processing_results,
             processed_counts,
@@ -4661,6 +4662,7 @@ impl Bank {
         solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
             .with_label_values(&["execute"])
             .observe(execute_start.elapsed().as_micros() as f64);
+        execute_timings_before.observe_deltas(&ExecuteTimingsSnapshot::capture(timings));
 
         if let Some(pre_commit_callback) = pre_commit_callback {
             let () = pre_commit_callback(&processing_results)?;
@@ -7331,5 +7333,132 @@ pub mod test_utils {
         account.checked_add_lamports(lamports)?;
         bank.store_account(pubkey, &account);
         Ok(account.lamports())
+    }
+}
+
+/// A snapshot of `ExecuteTimings`' cumulative counters, taken immediately
+/// before and after one `execute` call so the delta for just that call can be
+/// observed as Prometheus histograms -- these counters are Solana's own
+/// pre-existing internal accounting (never reset between calls until some
+/// outer periodic report drains them), so this reuses them rather than adding
+/// new manual timers.
+struct ExecuteTimingsSnapshot {
+    check: u64,
+    validate_fees: u64,
+    load: u64,
+    execute: u64,
+    store: u64,
+    program_cache: u64,
+    filter_executable: u64,
+    collect_balances: u64,
+    collect_logs: u64,
+    update_stakes_cache: u64,
+    update_executors: u64,
+    check_block_limits: u64,
+    detail_serialize: u64,
+    detail_create_vm: u64,
+    detail_execute_inner: u64,
+    detail_deserialize: u64,
+    detail_get_or_create_executor: u64,
+    detail_register_syscalls: u64,
+    detail_load_elf: u64,
+    detail_verify_code: u64,
+    detail_jit_compile: u64,
+}
+
+impl ExecuteTimingsSnapshot {
+    fn capture(timings: &ExecuteTimings) -> Self {
+        Self {
+            check: timings.metrics[ExecuteTimingType::CheckUs].0,
+            validate_fees: timings.metrics[ExecuteTimingType::ValidateFeesUs].0,
+            load: timings.metrics[ExecuteTimingType::LoadUs].0,
+            execute: timings.metrics[ExecuteTimingType::ExecuteUs].0,
+            store: timings.metrics[ExecuteTimingType::StoreUs].0,
+            program_cache: timings.metrics[ExecuteTimingType::ProgramCacheUs].0,
+            filter_executable: timings.metrics[ExecuteTimingType::FilterExecutableUs].0,
+            collect_balances: timings.metrics[ExecuteTimingType::CollectBalancesUs].0,
+            collect_logs: timings.metrics[ExecuteTimingType::CollectLogsUs].0,
+            update_stakes_cache: timings.metrics[ExecuteTimingType::UpdateStakesCacheUs].0,
+            update_executors: timings.metrics[ExecuteTimingType::UpdateExecutorsUs].0,
+            check_block_limits: timings.metrics[ExecuteTimingType::CheckBlockLimitsUs].0,
+            detail_serialize: timings.details.serialize_us.0,
+            detail_create_vm: timings.details.create_vm_us.0,
+            detail_execute_inner: timings.details.execute_us.0,
+            detail_deserialize: timings.details.deserialize_us.0,
+            detail_get_or_create_executor: timings.details.get_or_create_executor_us.0,
+            detail_register_syscalls: timings.details.create_executor_register_syscalls_us.0,
+            detail_load_elf: timings.details.create_executor_load_elf_us.0,
+            detail_verify_code: timings.details.create_executor_verify_code_us.0,
+            detail_jit_compile: timings.details.create_executor_jit_compile_us.0,
+        }
+    }
+
+    fn observe_deltas(&self, after: &Self) {
+        let phase = &solana_metrics::pipeline_metrics::EXECUTE_PHASE_DURATION_US;
+        phase
+            .with_label_values(&["check"])
+            .observe((after.check - self.check) as f64);
+        phase
+            .with_label_values(&["validate_fees"])
+            .observe((after.validate_fees - self.validate_fees) as f64);
+        phase
+            .with_label_values(&["load"])
+            .observe((after.load - self.load) as f64);
+        phase
+            .with_label_values(&["execute"])
+            .observe((after.execute - self.execute) as f64);
+        phase
+            .with_label_values(&["store"])
+            .observe((after.store - self.store) as f64);
+        phase
+            .with_label_values(&["program_cache"])
+            .observe((after.program_cache - self.program_cache) as f64);
+        phase
+            .with_label_values(&["filter_executable"])
+            .observe((after.filter_executable - self.filter_executable) as f64);
+        phase
+            .with_label_values(&["collect_balances"])
+            .observe((after.collect_balances - self.collect_balances) as f64);
+        phase
+            .with_label_values(&["collect_logs"])
+            .observe((after.collect_logs - self.collect_logs) as f64);
+        phase
+            .with_label_values(&["update_stakes_cache"])
+            .observe((after.update_stakes_cache - self.update_stakes_cache) as f64);
+        phase
+            .with_label_values(&["update_executors"])
+            .observe((after.update_executors - self.update_executors) as f64);
+        phase
+            .with_label_values(&["check_block_limits"])
+            .observe((after.check_block_limits - self.check_block_limits) as f64);
+
+        let detail = &solana_metrics::pipeline_metrics::EXECUTE_DETAIL_DURATION_US;
+        detail
+            .with_label_values(&["serialize"])
+            .observe((after.detail_serialize - self.detail_serialize) as f64);
+        detail
+            .with_label_values(&["create_vm"])
+            .observe((after.detail_create_vm - self.detail_create_vm) as f64);
+        detail
+            .with_label_values(&["execute_inner"])
+            .observe((after.detail_execute_inner - self.detail_execute_inner) as f64);
+        detail
+            .with_label_values(&["deserialize"])
+            .observe((after.detail_deserialize - self.detail_deserialize) as f64);
+        detail
+            .with_label_values(&["get_or_create_executor"])
+            .observe((after.detail_get_or_create_executor - self.detail_get_or_create_executor) as f64);
+        detail
+            .with_label_values(&["create_executor_register_syscalls"])
+            .observe((after.detail_register_syscalls - self.detail_register_syscalls) as f64);
+        detail
+            .with_label_values(&["create_executor_load_elf"])
+            .observe((after.detail_load_elf - self.detail_load_elf) as f64);
+        detail
+            .with_label_values(&["create_executor_verify_code"])
+            .observe((after.detail_verify_code - self.detail_verify_code) as f64);
+        detail
+            .with_label_values(&["create_executor_jit_compile"])
+            .observe((after.detail_jit_compile - self.detail_jit_compile) as f64);
     }
 }

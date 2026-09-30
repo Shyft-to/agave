@@ -408,5 +408,140 @@ Dashboard: new "Transaction-Status Queue" row (2 panels) added to
 Verification: `cargo check` on `solana-runtime`, `solana-rpc`, `solana-metrics`,
 `solana-ledger`, `solana-core`, `agave-validator` bins all clean.
 `solana-rpc::transaction_status_service` tests (2/2) and
-`solana-runtime::transaction_execution` tests (6/6) pass. Not yet deployed/re-baselined
-with this addition.
+`solana-runtime::transaction_execution` tests (6/6) pass.
+
+**Re-baseline result (deployed, 2026-09-29):** `tx_status_queue_wait` p50/p90/p99
+= 13us/94us/910us, `agave_tx_status_queue_length` = 0. **The tx-status channel
+hypothesis is disproven** -- it is not backing up and does not explain the
+`executed_tx` tail.
+
+### Follow-up: histogram bucket ceiling was clipping the tail (found + fixed 2026-09-29)
+
+The same re-baseline showed `executed_tx` p99 = exactly `500000` (us) -- suspicious
+because that's *exactly* `DURATION_US_BUCKETS`'s old top boundary (500ms).
+`histogram_quantile` cannot extrapolate past the highest finite bucket into
+`+Inf`, so it silently returns that boundary instead of the true value whenever
+the real quantile falls above it -- our own metric definition was clipping the
+one number we most wanted to trust.
+
+**Fix:** widened `DURATION_US_BUCKETS` (`metrics/src/prometheus_metrics.rs`) to
+add 1s/2s/5s buckets on top of the existing 10us-500ms range. Affects every
+histogram in the pipeline (negligible overhead -- a few extra buckets per
+label), but matters specifically for `agave_end_to_end_duration_us{path="executed_tx"}`,
+which can legitimately span multiple slots.
+
+**Confirmed fixed after redeploy:** `histogram_quantile(0.99, ...{path="executed_tx"}...)`
+now returns `493149.89` -- a non-round number, i.e. genuinely interpolated within
+real bucket data rather than clipped. This also matches the very first baseline
+pull's p99 (492915us) almost exactly, across three independent measurement
+windows. **Conclusion: the ~493ms `executed_tx` p99 tail is real, reproducible,
+and not explained by the tx-status queue, execute, commit, read_blockstore, or
+collect_entries (all previously ruled out as microsecond-to-low-tens-of-ms
+scale).** It is best explained by genuine cross-slot wall-clock variance
+(skipped slots, larger blocks, this validator occasionally running behind
+realtime) rather than any single instrumented pipeline stage -- there is no
+further Phase 2 lead to chase on this specific number with the metrics defined
+so far. Phase 3 priority 1 remains the shred-receive coalesce window (see
+Section 5), which is the one clearly fixable, high-leverage target the baseline
+identified.
+
+### Follow-up instrumentation: execute phase/detail breakdown (added 2026-09-30)
+
+Requested to see if finer detail inside `execute` explains the ~493ms
+`executed_tx` tail. It's a long shot given `execute` itself is only ~2ms at p99
+(the tail can't be *inside* a span that small), but it's cheap and rules
+sub-phases in/out concretely rather than by inference, and specifically checks
+for program-cache/JIT-compile cold-start spikes that a single `execute` number
+would average away.
+
+Added, reusing Solana's own pre-existing internal accounting rather than new
+manual timers (same "snapshot cumulative counters before/after, observe the
+delta" pattern used for the blockstore-store phases):
+- `agave_execute_phase_duration_us{phase=...}` (`metrics/src/pipeline_metrics.rs`)
+  -- from `ExecuteTimings.metrics` (`svm-timings` crate): check, validate_fees,
+  load, execute, store, program_cache, filter_executable, collect_balances,
+  collect_logs, update_stakes_cache, update_executors, check_block_limits.
+- `agave_execute_detail_duration_us{phase=...}` -- from
+  `ExecuteTimings.details` (`ExecuteDetailsTimings`): serialize, create_vm,
+  execute_inner, deserialize, get_or_create_executor, plus four
+  `create_executor_*` sub-phases (register_syscalls, load_elf, verify_code,
+  jit_compile) -- the likely hiding place for a cold-program outlier, since
+  these should be ~0 for warm/cached programs.
+- Wired via a new `ExecuteTimingsSnapshot` helper (module-level, end of
+  `runtime/src/bank.rs`) capturing both structs before/after the
+  `load_and_execute_transactions` call already timed as `stage="execute"`.
+- Dashboard: new "Execute Phase Breakdown" row (2 panels) added to
+  `grafana-dashboard-shred-geyser.json` (now version 5). Baseline queries file
+  and `run-baseline-queries.sh` updated with the corresponding PromQL.
+
+Verification: `cargo check` on `solana-runtime`, `solana-metrics` clean.
+`solana-runtime::transaction_execution` (6/6), `solana-runtime::bank::tests::test_commit_*`
+(2/2), `solana-ledger::blockstore_processor` (57/57, 1 pre-existing ignore) all
+pass. `agave-validator` bins compile. Not yet deployed/re-baselined with this
+addition -- next step is to redeploy and pull the queries in section 7 of
+`baseline-queries.md`, watching specifically for any non-trivial mass in
+`create_executor_jit_compile` or the other `create_executor_*` phases.
+
+## Phase 3, hypothesis 1: configurable shred coalesce window + sigverify batch size (2026-09-30)
+
+Implements the Phase 3 priority-1 candidate identified from the baseline (the
+`receive` stage dominating the shred path, ~3-10ms, consistent with the
+previously-hardcoded 5ms coalesce window) plus the related "S3 batch size"
+candidate, as two independent CLI flags so both can be A/B tested on a live
+node without rebuilding between values.
+
+Added:
+- `--shred-fetch-coalesce-us <MICROS>` (default `5000`, matching the prior
+  hardcoded behavior exactly) -- controls the `coalesce` window passed to
+  `streamer::receiver` for both the TVU and repair shred sockets in
+  `core/src/shred_fetch_stage.rs`. `0` disables coalescing (return as soon as
+  any packet is available).
+- `--shred-sigverify-batch-size <COUNT>` (default `1024`, matching the prior
+  hardcoded `SIGVERIFY_SHRED_BATCH_SIZE` constant) -- controls how many packet
+  batches `turbine/src/sigverify_shreds.rs::run_shred_sigverify` drains per
+  iteration before dedup/verify/resign runs.
+
+Threaded through the same path as the existing `--tvu-shred-sigverify-threads`
+flag: CLI arg (`validator/src/commands/run/args.rs`, defaults sourced from
+`validator/src/cli.rs::DefaultArgs`) -> parsed in
+`validator/src/commands/run/execute.rs` -> `ValidatorConfig` fields
+(`core/src/validator.rs`) -> `TvuConfig` fields (`core/src/tvu.rs`) ->
+`ShredFetchStage::new`/`spawn_shred_sigverify` parameters.
+
+**Found and fixed in passing:** `solana-local-cluster` (gated behind
+`#![cfg(feature = "agave-unstable-api")]` like every other lib crate here, but
+nothing else in the workspace depends on it, so it's never unification-checked
+by a plain `cargo check -p <other-crate>` the way core/turbine/ledger/etc. are)
+had been silently broken since the `metrics_listen_addr` field was added in an
+earlier session -- its `safe_clone_config` exhaustively lists every
+`ValidatorConfig` field and was missing that one. Fixed by adding
+`metrics_listen_addr`, `shred_fetch_coalesce_us`, and
+`shred_sigverify_batch_size` to that clone. Lesson for future sessions: after
+adding a field to `ValidatorConfig`, explicitly `cargo check -p
+solana-local-cluster --features agave-unstable-api` too -- it will not be
+caught by checking any other crate.
+
+Verification: `cargo check` across `solana-metrics`, `solana-core`,
+`solana-turbine`, `solana-ledger`, `solana-runtime`,
+`solana-geyser-plugin-manager`, `solana-rpc`, `solana-streamer`,
+`solana-local-cluster` (with `--features agave-unstable-api`), and
+`agave-validator` bins all clean together. `solana-turbine::sigverify_shreds`
+(5/5), `solana-turbine::retransmit_stage` (2/2), and
+`solana-core::window_service` (4/4) tests pass. `agave-validator run --help`
+confirms both new flags with the expected defaults.
+
+**Recommended A/B plan for deployment:** baseline first with defaults
+unchanged (`--shred-fetch-coalesce-us 5000 --shred-sigverify-batch-size 1024`,
+equivalent to omitting both flags), then try
+`--shred-fetch-coalesce-us 500` (or `1000`/`2000`) alone first since it's the
+higher-confidence lever, watching `agave_shred_stage_duration_us{stage="receive"}`
+p50/p90/p99 (expect it to drop substantially), `agave_shred_stage_duration_us{stage="dedup"|"sign"}`
+(watch for a rise, since smaller batches mean more, cheaper iterations -- per
+the earlier finding that sigverify's cost is dominated by fixed per-iteration
+overhead, not per-packet cost, a *smaller* coalesce window could paradoxically
+increase total sigverify time if it results in many more iterations), and
+`agave_shred_packets_dropped_total`/channel-overflow counters (should stay at
+0). Only after that, separately try `--shred-sigverify-batch-size 256` (smaller
+than default) to see if it changes the `dedup`/`sign` per-iteration cost curve.
+Change one flag at a time per the plan's "one hypothesis per commit/config"
+rule, and log before/after p50/p90/p99 in this Progress Log.

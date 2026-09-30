@@ -298,6 +298,9 @@ pub struct DefaultArgs {
 
     pub contact_debug_interval: String,
 
+    pub shred_fetch_coalesce_us: String,
+    pub shred_sigverify_batch_size: String,
+
     pub snapshot_version: SnapshotVersion,
     pub snapshot_archive_format: String,
     pub snapshot_zstd_compression_level: String,
@@ -350,6 +353,11 @@ impl DefaultArgs {
             snapshot_archive_format: DEFAULT_ARCHIVE_COMPRESSION.to_string(),
             snapshot_zstd_compression_level: "1".to_string(), // level 1 is optimized for speed
             contact_debug_interval: "120000".to_string(),
+            // Matches the previously-hardcoded 5ms coalesce window on shred UDP sockets
+            // (core/src/shred_fetch_stage.rs) and the previously-hardcoded
+            // SIGVERIFY_SHRED_BATCH_SIZE (turbine/src/sigverify_shreds.rs).
+            shred_fetch_coalesce_us: "5000".to_string(),
+            shred_sigverify_batch_size: "1024".to_string(),
             snapshot_version: SnapshotVersion::default(),
             accounts_shrink_optimize_total_space: DEFAULT_ACCOUNTS_SHRINK_OPTIMIZE_TOTAL_SPACE
                 .to_string(),

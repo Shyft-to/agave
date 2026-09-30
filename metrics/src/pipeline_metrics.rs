@@ -72,6 +72,35 @@ pub static REPLAY_STAGE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     )
 });
 
+/// Fine-grained breakdown of the `execute` stage above, labeled by `phase`:
+/// `check`, `validate_fees`, `load`, `execute`, `store`, `program_cache`,
+/// `filter_executable`, `collect_balances`, `collect_logs`,
+/// `update_stakes_cache`, `update_executors`, `check_block_limits`. These
+/// reuse Solana's own pre-existing `ExecuteTimings` cumulative counters
+/// (snapshotted before/after each `execute` call and observed as a delta)
+/// rather than adding new manual timers.
+pub static EXECUTE_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_execute_phase_duration_us",
+        "Fine-grained breakdown of the execute stage, in microseconds, from ExecuteTimings",
+        &["phase"],
+    )
+});
+
+/// Deeper breakdown of program execution specifically (a subset of `execute`
+/// above), labeled by `phase`: `serialize`, `create_vm`, `execute_inner`,
+/// `deserialize`, `get_or_create_executor`,
+/// `create_executor_register_syscalls`, `create_executor_load_elf`,
+/// `create_executor_verify_code`, `create_executor_jit_compile`. Also reuses
+/// Solana's own `ExecuteDetailsTimings` cumulative counters.
+pub static EXECUTE_DETAIL_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_execute_detail_duration_us",
+        "Deeper breakdown of program execution, in microseconds, from ExecuteDetailsTimings",
+        &["phase"],
+    )
+});
+
 /// Time spent inside a Geyser plugin notify callback, labeled by
 /// `notifier`: `account_update`, `slot_status`, `deshred_transaction`,
 /// `transaction`.

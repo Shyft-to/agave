@@ -155,6 +155,7 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_mode: TurbineMode,
+        coalesce: Duration,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let (packet_sender, packet_receiver) =
@@ -171,9 +172,9 @@ impl ShredFetchStage {
                     packet_sender.clone(),
                     recycler.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
-                    true,                           // use_pinned_memory
-                    false,                          // is_staked_service
+                    Some(coalesce),
+                    true,  // use_pinned_memory
+                    false, // is_staked_service
                 )
             })
             .collect();
@@ -207,6 +208,7 @@ impl ShredFetchStage {
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_mode: TurbineMode,
         exit: Arc<AtomicBool>,
+        coalesce: Duration,
     ) -> Self {
         let recycler = PacketBatchRecycler::new();
         let repair_context = RepairContext {
@@ -229,6 +231,7 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_mode.clone(),
+            coalesce,
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -245,6 +248,7 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_mode.clone(),
+            coalesce,
         );
 
         tvu_threads.extend(repair_receiver);

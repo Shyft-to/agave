@@ -860,6 +860,32 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("shred_fetch_coalesce_us")
+            .long("shred-fetch-coalesce-us")
+            .value_name("MICROS")
+            .takes_value(true)
+            .default_value(&default_args.shred_fetch_coalesce_us)
+            .validator(is_parsable::<u64>)
+            .help(
+                "Coalesce window for shred UDP receive, in microseconds (0 disables \
+                 coalescing). Larger values batch more packets per receive at the cost of \
+                 added latency; smaller values reduce that latency at the cost of more, \
+                 smaller batches downstream.",
+            ),
+    )
+    .arg(
+        Arg::with_name("shred_sigverify_batch_size")
+            .long("shred-sigverify-batch-size")
+            .value_name("COUNT")
+            .takes_value(true)
+            .default_value(&default_args.shred_sigverify_batch_size)
+            .validator(is_parsable::<usize>)
+            .help(
+                "Maximum number of packet batches drained per shred sigverify iteration \
+                 before dedup/verify/resign runs on them.",
+            ),
+    )
+    .arg(
         Arg::with_name("metrics_listen_address")
             .long("metrics-listen-address")
             .value_name("HOST:PORT")

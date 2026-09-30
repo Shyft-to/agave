@@ -1485,6 +1485,217 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Execute Phase Breakdown (added while investigating the executed_tx tail)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 62
+      },
+      "panels": []
+    },
+    {
+      "id": 22,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 63
+      },
+      "type": "timeseries",
+      "title": "Execute Phase Duration ($percentile)",
+      "description": "What it tracks: a finer breakdown of the 'execute' stage in the Replay Stage Duration panel, reusing Solana's OWN pre-existing internal accounting (ExecuteTimings, runtime/src/bank.rs / svm-timings crate) rather than new manual timers -- these counters were already being computed for every execute call, just never exposed as Prometheus histograms before. Same granularity as 'execute' above: one observation per transaction batch (commonly 1 tx under the unified scheduler), taken as the delta of each cumulative counter across that one execute call.\n\nphase=check: signature/nonce/age checks. validate_fees: fee-payer validation. load: loading accounts needed by the batch. execute: running the SVM/program processor itself (see the Execute Detail panel below for what's inside this). store: writing changed accounts back. program_cache: program cache lookups. filter_executable: filtering executable accounts. collect_balances / collect_logs: gathering pre/post balances and program logs for the tx-status/Geyser path. update_stakes_cache / update_executors: bookkeeping after execution. check_block_limits: block cost-limit check (also separately timed by pre-existing code elsewhere).\n\nWhy this was added: the 'execute' stage as a single number was only ~2ms even at p99, far short of the executed_tx end-to-end tail (~493ms). This breakdown exists to catch a specific sub-phase spiking (e.g. load, if account contention or I/O stalls occasionally block it) that a single 'execute' number would average away. If every phase here stays small and proportional, that's evidence the tail is NOT inside transaction execution at all, and is upstream/cross-slot instead (see the Execute Detail panel and the end-to-end panel's notes).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_execute_phase_duration_us_bucket[$__rate_interval])) by (le, phase))",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 63
+      },
+      "type": "timeseries",
+      "title": "Execute Detail Duration ($percentile)",
+      "description": "What it tracks: a DEEPER breakdown, specifically of program execution (a subset of phase=execute in the panel above), again reusing Solana's own pre-existing ExecuteDetailsTimings counters. Same granularity: one observation per transaction batch.\n\nphase=serialize / deserialize: copying account data into/out of the VM's memory region. create_vm: constructing the SBPF VM instance. execute_inner: the actual bytecode execution inside the VM (the truest 'how long did this program run' number). get_or_create_executor: program cache lookup/miss handling. create_executor_register_syscalls / create_executor_load_elf / create_executor_verify_code / create_executor_jit_compile: sub-phases of loading and JIT-compiling a program that WASN'T already in the program cache -- these should be ~0 for warm/cached programs and are the most likely place a rare, large outlier could hide (a cold/rarely-used program forcing a compile on the hot path).\n\nHow to use this: if create_executor_jit_compile (or the other create_executor_* phases) shows any non-trivial mass, that's a concrete, actionable lead (program cache warming/eviction). If everything here stays negligible like the panel above, it further confirms the executed_tx tail is not inside transaction execution -- it's the slot-position/cross-slot effect already documented on the end-to-end panel and in docs/perf/shred-to-geyser-prometheus-plan.md.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_execute_detail_duration_us_bucket[$__rate_interval])) by (le, phase))",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "10s",
@@ -1559,6 +1770,6 @@
   "title": "Agave Shred → Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 4,
+  "version": 5,
   "weekStart": ""
 }

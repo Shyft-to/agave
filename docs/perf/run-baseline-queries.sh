@@ -53,3 +53,11 @@ run "p50 tx-status queue wait" "histogram_quantile(0.5, sum(rate(agave_replay_st
 run "p90 tx-status queue wait" "histogram_quantile(0.9, sum(rate(agave_replay_stage_duration_us_bucket{stage=\"tx_status_queue_wait\"}[$RANGE])) by (le))"
 run "p99 tx-status queue wait" "histogram_quantile(0.99, sum(rate(agave_replay_stage_duration_us_bucket{stage=\"tx_status_queue_wait\"}[$RANGE])) by (le))"
 run "tx-status queue length"   "agave_tx_status_queue_length"
+
+echo "== 7. Execute phase/detail breakdown =="
+run "p50 execute phase duration"  "histogram_quantile(0.5, sum(rate(agave_execute_phase_duration_us_bucket[$RANGE])) by (le, phase))"
+run "p90 execute phase duration"  "histogram_quantile(0.9, sum(rate(agave_execute_phase_duration_us_bucket[$RANGE])) by (le, phase))"
+run "p99 execute phase duration"  "histogram_quantile(0.99, sum(rate(agave_execute_phase_duration_us_bucket[$RANGE])) by (le, phase))"
+run "p50 execute detail duration" "histogram_quantile(0.5, sum(rate(agave_execute_detail_duration_us_bucket[$RANGE])) by (le, phase))"
+run "p90 execute detail duration" "histogram_quantile(0.9, sum(rate(agave_execute_detail_duration_us_bucket[$RANGE])) by (le, phase))"
+run "p99 execute detail duration" "histogram_quantile(0.99, sum(rate(agave_execute_detail_duration_us_bucket[$RANGE])) by (le, phase))"

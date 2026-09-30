@@ -161,6 +161,10 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
+    /// Coalesce window for shred UDP receive, in microseconds (0 disables coalescing).
+    pub shred_fetch_coalesce_us: u64,
+    /// Maximum packet batches drained per shred sigverify iteration.
+    pub shred_sigverify_batch_size: usize,
 }
 
 impl Default for TvuConfig {
@@ -177,6 +181,8 @@ impl Default for TvuConfig {
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
+            shred_fetch_coalesce_us: 5_000,
+            shred_sigverify_batch_size: 1024,
         }
     }
 }
@@ -393,6 +399,7 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_mode,
             exit.clone(),
+            std::time::Duration::from_micros(tvu_config.shred_fetch_coalesce_us),
         );
 
         let (verified_sender, verified_receiver) = unbounded();
@@ -417,6 +424,7 @@ impl Tvu {
                 }
             }),
             tvu_config.shred_sigverify_threads,
+            tvu_config.shred_sigverify_batch_size,
         );
 
         let retransmit_stage = RetransmitStage::new(
