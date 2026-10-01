@@ -97,7 +97,11 @@ impl SlotStatusNotifierImpl {
                 solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_bank_created(slot);
             }
             SlotStatus::Processed => {
-                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_frozen(slot)
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_frozen(slot);
+                // Direct measurement of first-shred-to-frozen, to avoid
+                // inferring it by subtracting two independently-computed
+                // percentiles (see mark_bank_frozen's doc comment).
+                solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_bank_frozen(slot);
             }
             SlotStatus::Confirmed => {
                 solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_confirmed(slot)

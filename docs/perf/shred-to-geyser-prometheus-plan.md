@@ -891,3 +891,52 @@ propagation" conclusion needs to be read as applying specifically to
 not to `executed_tx`, which is a different span entirely and was always
 going to be dominated by whatever happens *before* `created_bank`, not after
 `frozen`.
+
+### Result (deployed and pulled, 2026-10-01): `first_shred_to_created_bank` is small -- ruled out, and a math error found along the way
+
+`first_shred_to_created_bank` p90 = 19,288us (19.3ms). Small -- rules out
+replay wake-up/scheduling as the explanation for `executed_tx`'s tail.
+
+But this immediately created a contradiction: combined with the earlier
+(invalid) `created_bank_to_frozen` estimate (~20ms, from subtracting
+`created_bank_to_confirmed` minus `frozen_to_confirmed`), the implied total
+"first shred to frozen" was only ~40ms -- yet no transaction can be notified
+(and therefore contribute an `executed_tx` observation) after its own slot
+freezes, so every `executed_tx` value should be bounded by roughly its slot's
+own first-shred-to-frozen time. ~40ms vs. an `executed_tx` p90 of ~400ms+
+can't both be true.
+
+**Root cause of the contradiction: invalid percentile arithmetic**, not a
+real anomaly. `created_bank_to_frozen` was never measured directly -- it was
+inferred by subtracting two *independently-computed* percentiles
+(`created_bank_to_confirmed` minus `frozen_to_confirmed`), and
+`p90(A) - p90(B) != p90(A - B)` in general. That subtraction should not have
+been used to reason about a third quantity.
+
+**Fix: added `first_shred_to_frozen`, a direct measurement** (not composed
+from other metrics) -- `ExecutedTxLatencyTracker::mark_bank_frozen`
+(`metrics/src/pipeline_latency.rs`), reads (does not remove) the tracker's
+existing per-slot start timestamp when `Processed` (bank freeze) fires,
+wired into `slot_status_notifier.rs::notify_bank_status`'s `Processed` arm
+alongside the existing `SLOT_CONFIRMATION_LATENCY.mark_frozen` call.
+
+Verification: `cargo check` on `solana-metrics`, `solana-geyser-plugin-manager`,
+`solana-core`, `agave-validator` bins, `solana-local-cluster` (`--features
+agave-unstable-api`) all clean. `solana-metrics::pipeline_latency` (2 new
+tests, 10 total) and `solana-geyser-plugin-manager::slot_status_notifier`
+(1/1) pass. Dashboard panel description updated in place (now version 11).
+Not yet deployed/re-baselined.
+
+**What to look for once pulled:** compare `first_shred_to_frozen` directly
+against `executed_tx` (path=executed_tx on the End-to-End panel). If
+`first_shred_to_frozen` p90/p99 is itself large (hundreds of ms) and roughly
+tracks `executed_tx`, that's the real, validly-measured answer: slots
+genuinely take that long to fully replay end-to-end on this validator (still
+consistent with the small `first_shred_to_created_bank` and
+`created_bank_to_confirmed`-vs-`frozen_to_confirmed` cross-check, just not
+with the invalid subtraction). If `first_shred_to_frozen` is small (tens of
+ms, matching `first_shred_to_created_bank`) while `executed_tx` stays large,
+that's a genuine, currently-unexplained discrepancy worth investigating
+further -- possibly pointing at something in the tx-status/notify path we
+haven't caught, or a measurement issue specific to `executed_tx`'s own
+tracker.

@@ -180,11 +180,19 @@ pub static DESHRED_TRACKING_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLoc
 /// Slot lifecycle latency, labeled by `stage`:
 /// - `first_shred_to_created_bank`: "replay wake-up latency" -- how long
 ///   between this validator first fetching a shred for the slot and replay
-///   actually creating a bank for it. Added after discovering `executed_tx`
-///   (first-shred -> commit) was much larger than `created_bank_to_frozen`
-///   (created-bank -> freeze) even though `notify_transaction` fires at
-///   commit with no dependency on voting -- this stage is where that gap
-///   turned out to be hiding.
+///   actually creating a bank for it. Came back small in practice (~19ms
+///   p90), ruling this out as the explanation for `executed_tx`'s much
+///   larger tail.
+/// - `first_shred_to_frozen`: first shred fetched -> bank freeze (all
+///   transactions in the slot executed and committed), measured directly.
+///   Added because composing this from `created_bank_to_confirmed` minus
+///   `frozen_to_confirmed` (two independently-computed percentiles) is not
+///   valid math (p90(A) - p90(B) != p90(A - B)) -- this is the real number.
+///   No transaction's `executed_tx` observation can exceed roughly this
+///   value for its own slot (plus the already-measured small tx-status
+///   queue/notify overhead), so comparing the two directly is the way to
+///   tell whether `executed_tx`'s tail is explained by slow slots or
+///   something else entirely.
 /// - `created_bank_to_confirmed`: "time taken for votes to confirm a slot",
 ///   measured from when this validator first created a bank for the slot.
 /// - `frozen_to_confirmed`: "time difference of bank freeze -- transaction

@@ -115,6 +115,25 @@ impl ExecutedTxLatencyTracker {
         }
     }
 
+    /// Observes `first_shred_to_frozen` -- a DIRECT measurement of first
+    /// shred fetched to bank freeze (all transactions in the slot executed
+    /// and committed), as opposed to inferring it by subtracting
+    /// `created_bank_to_confirmed` minus `frozen_to_confirmed` (two
+    /// independently-computed percentiles, which is not valid: p90(A) -
+    /// p90(B) != p90(A - B) in general). Added after `first_shred_to_created_bank`
+    /// came back small, which combined with the (invalid) subtraction implied
+    /// the whole slot finishes within ~40ms of the first shred -- hard to
+    /// square with `executed_tx` p90 being ~400ms, since no transaction can
+    /// be notified after its slot freezes. This measures the true value
+    /// directly instead of composing it from two other metrics.
+    pub fn mark_bank_frozen(&self, slot: u64) {
+        if let Some(start) = self.started.get(&slot) {
+            crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
+                .with_label_values(&["first_shred_to_frozen"])
+                .observe(start.elapsed().as_micros() as f64);
+        }
+    }
+
     /// Observe how long after the slot's first shred this transaction was
     /// notified. Called once per notified transaction (not just the last),
     /// so the histogram reflects the full per-transaction distribution.
@@ -264,6 +283,21 @@ mod test {
     fn test_executed_tx_tracker_bank_created_with_no_start_does_not_panic() {
         let tracker = ExecutedTxLatencyTracker::new();
         tracker.mark_bank_created(999_997);
+    }
+
+    #[test]
+    fn test_executed_tx_tracker_bank_frozen_does_not_remove_start() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_slot_started(10);
+        tracker.mark_bank_frozen(10);
+        assert!(tracker.started.contains_key(&10));
+        tracker.mark_tx_notified(10);
+    }
+
+    #[test]
+    fn test_executed_tx_tracker_bank_frozen_with_no_start_does_not_panic() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_bank_frozen(999_996);
     }
 
     #[test]
