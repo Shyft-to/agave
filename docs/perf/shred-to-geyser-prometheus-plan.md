@@ -698,7 +698,113 @@ hypothesis 3 won't fully resolve that possibility even if it comes back clean.
 Verification: `cargo check` on `solana-metrics`, `solana-core`,
 `agave-validator` bins, and `solana-local-cluster` (`--features
 agave-unstable-api`) all clean. `solana-core::window_service` tests (4/4)
-pass. Not yet deployed/re-baselined -- next step is to redeploy and pull
-`agave_verified_shreds_queue_length` and
-`agave_shred_stage_duration_us{stage="verified_recv_wait"}` alongside the
-`deshred` end-to-end numbers, same pattern as hypothesis 2.
+pass.
+
+**Result (deployed and re-baselined, 2026-09-30): also ruled out, but for a
+more subtle reason.** `verified_recv_wait` p90 = 4855us -- not small in
+absolute terms, comparable to the `receive` stage itself -- but
+`agave_verified_shreds_queue_length` = 0 at the same time. Since this queue
+has no backlog, `verified_recv_wait` is almost entirely idle time
+(`window_service` blocked in `recv_timeout` waiting for sigverify to produce
+the next batch) rather than sequential added latency for a specific shred --
+that idle wait happens *concurrently with*, not *after*, the tracked shred's
+own upstream processing, the same pattern already seen with sigverify itself
+(83% idle in the Phase 2 baseline). A consumer with an empty queue when work
+arrives isn't adding latency to what arrives. So this hop is cleared too, but
+the reasoning is "large-but-not-causal", not "small", which is worth getting
+right before ruling out a channel by number size alone in future hops.
+
+## Phase 3, hypothesis 4: is the `deshred` tracker itself trustworthy?
+
+With every discrete pipeline hop on the deshred path now checked (sigverify,
+blockstore store, RocksDB re-read, both inter-service channels) and none
+explaining the gap, the remaining candidates are (a) burst correlation across
+stages (see the note at the end of the hypothesis 2 result), or (b) a flaw in
+the tracker itself. (b) is worth checking first since it's cheap and, if true,
+would mean the `deshred` p99 number was never trustworthy in the first place --
+no amount of further pipeline instrumentation would explain a self-inflicted
+measurement artifact.
+
+The specific concern: `DeshredLatencyTracker::mark_started` (`metrics/src/
+pipeline_latency.rs`) is keyed by a shred's own `fec_set_index` (from
+`shred::wire::get_fec_set_index`, read in the fetch-stage filter loop), while
+`mark_notified` is keyed by a completed data set's *starting shred index*
+(`completed_data_set_starting_shred_index`, from `ledger/src/blockstore.rs`'s
+`update_slot_meta` completion logic, which tracks contiguous *consumed* shred
+ranges terminated by a `DATA_COMPLETE_SHRED` flag). These two are assumed
+equal (`fec_set_index == data set start index`), and the code that assigns
+FEC-set boundaries and the code that assigns data-set-completion boundaries
+do share the same `DATA_COMPLETE_SHRED` flag as their terminator, which
+supports the assumption in the common case -- but nothing in
+`insert_data_shred`/`update_slot_meta` *guarantees* a completed data set's
+start always falls on a FEC-set boundary (e.g. after repair fills a gap, or
+after a validator joins mid-slot). If they diverge, `mark_notified` either
+finds no match (silently dropped observation, not a spike) or, rarely, could
+match a stale unrelated entry with the same key by coincidence (a spurious
+large or small duration).
+
+**Implemented (2026-09-30):** `agave_deshred_tracking_total{outcome="tracked"|
+"untracked"}` (IntCounterVec) -- incremented in `mark_notified`
+(`metrics/src/pipeline_latency.rs`) depending on whether a matching
+`mark_started` entry was found. A high `untracked` rate directly proves the
+`deshred` metric is sampling an unrepresentative subset of data sets rather
+than measuring what it claims to; a near-zero rate rules this hypothesis out
+too and leaves burst correlation as the remaining explanation.
+
+Verification: `cargo check` on `solana-metrics`, `solana-core`,
+`agave-validator` bins, `solana-local-cluster` (`--features
+agave-unstable-api`) all clean. `solana-metrics::pipeline_latency` tests
+(3/3) pass. Not yet deployed/re-baselined -- next step: pull
+`sum(rate(agave_deshred_tracking_total[1h])) by (outcome)` and compute the
+untracked fraction.
+
+## Vote/confirmation latency (new, separate from the Phase 3 hypotheses above)
+
+While investigating the `executed_tx` tail, established that slot
+*confirmation* is driven by `OptimisticallyConfirmedBankTracker` aggregating
+cluster votes -- a subsystem that runs independently of this validator's own
+transaction execution/replay, and therefore wasn't measured by anything built
+so far (every metric above is on the shred-receive/replay/execute/commit/
+notify path, none of it vote-related). Added instrumentation to measure this
+directly rather than keep inferring it from replay-side numbers.
+
+**Implemented (2026-10-01):**
+- `agave_slot_confirmation_duration_us{stage="created_bank_to_confirmed"|
+  "frozen_to_confirmed"}` (`metrics/src/pipeline_metrics.rs`).
+- `SlotConfirmationLatencyTracker` (`metrics/src/pipeline_latency.rs`) --
+  slot-keyed, stores `created_bank`/`frozen` `Instant`s, observes both deltas
+  (whichever start timestamps are present) when `Confirmed` fires. Same
+  64-slot-age pruning convention as the other slot-keyed trackers in this
+  file; entries are not removed on `Confirmed` (bounded by the same pruning),
+  leaving room to add `confirmed_to_rooted` later without redesigning this.
+- Wired into `geyser-plugin-manager/src/slot_status_notifier.rs::
+  notify_bank_status` (handles `CreatedBank`/`Processed`/`Confirmed`/`Rooted`
+  for this notifier), matched on `SlotStatus` and placed *before* the
+  function's early-return-if-no-plugins check, so slot confirmation timing is
+  recorded even with zero Geyser plugins loaded -- it's a validator-level
+  concern, not a plugin one.
+- Timestamps are taken at the top of `notify_bank_status`, which is a close
+  approximation of (not exactly) the underlying event time -- there's a small
+  channel hop (`BankNotification` -> `solOpConfBnkTrk` -> `solBankNotif`)
+  between the actual freeze/vote-threshold event and this notifier being
+  invoked, analogous to other channel hops already measured elsewhere in this
+  plan and found negligible.
+
+Dashboard: new "Slot Confirmation Latency" row (1 full-width panel) added
+(now version 9). Baseline queries file (section 11) and
+`run-baseline-queries.sh` updated with the corresponding PromQL.
+
+Verification: `cargo check` on `solana-metrics`, `solana-geyser-plugin-manager`,
+`solana-core`, `agave-validator` bins, `solana-local-cluster` (`--features
+agave-unstable-api`) all clean. `solana-metrics::pipeline_latency` (3 new
+tests) and `solana-geyser-plugin-manager::slot_status_notifier` (1/1,
+unaffected since no message type changed) pass. Not yet deployed/re-baselined.
+
+**How to read the result once pulled**: if `frozen_to_confirmed` is large
+while `created_bank_to_confirmed` is only slightly larger than it, most of
+the slot's total time-to-confirm is pure vote propagation/aggregation, not
+this validator's own replay speed -- directly relevant to the earlier
+`executed_tx` tail discussion (see the Progress Log entries above), since it
+would confirm that votes, not transaction processing, dominate how long a
+slot takes to be externally recognized as confirmed from this node's
+perspective.

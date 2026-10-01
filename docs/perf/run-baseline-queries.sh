@@ -73,3 +73,11 @@ run "p50 verified_recv_wait" "histogram_quantile(0.5, sum(rate(agave_shred_stage
 run "p90 verified_recv_wait" "histogram_quantile(0.9, sum(rate(agave_shred_stage_duration_us_bucket{stage=\"verified_recv_wait\"}[$RANGE])) by (le))"
 run "p99 verified_recv_wait" "histogram_quantile(0.99, sum(rate(agave_shred_stage_duration_us_bucket{stage=\"verified_recv_wait\"}[$RANGE])) by (le))"
 run "verified-shreds queue length" "agave_verified_shreds_queue_length"
+
+echo "== 10. Deshred tracker trustworthiness =="
+run "deshred tracking outcome (tracked vs untracked)" "sum(rate(agave_deshred_tracking_total[$RANGE])) by (outcome)"
+
+echo "== 11. Slot confirmation latency (votes) =="
+run "p50 slot confirmation duration" "histogram_quantile(0.5, sum(rate(agave_slot_confirmation_duration_us_bucket[$RANGE])) by (le, stage))"
+run "p90 slot confirmation duration" "histogram_quantile(0.9, sum(rate(agave_slot_confirmation_duration_us_bucket[$RANGE])) by (le, stage))"
+run "p99 slot confirmation duration" "histogram_quantile(0.99, sum(rate(agave_slot_confirmation_duration_us_bucket[$RANGE])) by (le, stage))"

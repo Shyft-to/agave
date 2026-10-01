@@ -2118,6 +2118,230 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Deshred Tracker Trustworthiness (Phase 3 hypothesis 4)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 89
+      },
+      "panels": []
+    },
+    {
+      "id": 31,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 90
+      },
+      "type": "timeseries",
+      "title": "Deshred Tracking Outcome (tracked vs untracked)",
+      "description": "What it tracks: whether mark_notified (core/src/completed_data_sets_service.rs, via metrics/src/pipeline_latency.rs::DeshredLatencyTracker) found a matching mark_started entry when a data set's deshred transaction was notified -- outcome=tracked means yes (contributes an observation to the deshred end-to-end histogram), outcome=untracked means no (silently dropped, no observation).\n\nWhy this exists: mark_started is keyed by a shred's own fec_set_index; mark_notified is keyed by a completed data set's STARTING SHRED INDEX (ledger/src/blockstore.rs update_slot_meta completion logic). These are assumed equal but aren't strictly guaranteed to be in every case (out-of-order arrival, repair, partial fills at slot boundaries) -- added after every other candidate hop on the deshred path (sigverify, blockstore store, RocksDB re-read, both inter-service channels) came back clean, to check whether the deshred metric itself is trustworthy before concluding the remaining ~45ms p99 gap is burst correlation rather than a self-inflicted measurement artifact.\n\nHow to read it: compute untracked / (tracked + untracked). Near-zero means the deshred metric is measuring what it claims to. A high fraction means it's sampling an unrepresentative subset of data sets, and every conclusion drawn from the deshred end-to-end panel so far -- including the Phase 3 hypothesis 1 (coalesce window) verdict -- should be revisited.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_deshred_tracking_total[$__rate_interval])) by (outcome)",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "row",
+      "title": "Slot Confirmation Latency (votes, independent of transaction execution)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 98
+      },
+      "panels": []
+    },
+    {
+      "id": 33,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 99
+      },
+      "type": "timeseries",
+      "title": "Slot Confirmation Duration ($percentile)",
+      "description": "What it tracks: how long it takes a slot to reach OPTIMISTIC CONFIRMATION (enough cluster votes), which is driven by OptimisticallyConfirmedBankTracker aggregating votes from across the network -- a subsystem that runs independently of this validator's own transaction execution/replay. Timestamps are taken at the top of geyser-plugin-manager/src/slot_status_notifier.rs::notify_bank_status (before the plugin loop, and before the function's early-return-if-no-plugins check, so this fires regardless of whether any Geyser plugin is loaded) -- a close approximation of, not exactly, the underlying event time, since there's a small channel hop (BankNotification -> solOpConfBnkTrk -> solBankNotif) between the actual vote-threshold/freeze event and this notifier being invoked. One observation per slot per stage.\n\nstage=created_bank_to_confirmed: 'time taken for votes to confirm a slot', from when this validator first created a bank for it (i.e. started replaying/tracking it as a fork candidate) to when it was marked Confirmed.\n\nstage=frozen_to_confirmed: 'time difference of bank freeze (transaction processing finished) to slot marked confirmed' -- isolates pure vote-propagation/aggregation time, decoupled from how long this validator's own replay took. If this is large while created_bank_to_confirmed is only slightly larger, most of the end-to-end gap is voting/network propagation, not this validator's replay speed -- directly relevant to the earlier executed_tx tail investigation, since votes (and therefore confirmation) are governed by a separate subsystem from the replay/execute/commit pipeline measured elsewhere on this dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_slot_confirmation_duration_us_bucket[$__rate_interval])) by (le, stage))",
+          "legendFormat": "{{stage}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "10s",
@@ -2192,6 +2416,6 @@
   "title": "Agave Shred → Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 7,
+  "version": 9,
   "weekStart": ""
 }

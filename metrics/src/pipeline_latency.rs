@@ -46,11 +46,21 @@ impl DeshredLatencyTracker {
 
     /// Record that the data set's deshred transaction was notified,
     /// observing the end-to-end duration if a start was recorded for it.
+    /// Also records, via `DESHRED_TRACKING_TOTAL`, whether a matching start
+    /// was actually found -- see that metric's doc comment for why this
+    /// isn't guaranteed on every call.
     pub fn mark_notified(&self, slot: u64, fec_set_index: u32) {
         if let Some((_, start)) = self.started.remove(&(slot, fec_set_index)) {
             END_TO_END_DURATION_US
                 .with_label_values(&["deshred"])
                 .observe(start.elapsed().as_micros() as f64);
+            crate::pipeline_metrics::DESHRED_TRACKING_TOTAL
+                .with_label_values(&["tracked"])
+                .inc();
+        } else {
+            crate::pipeline_metrics::DESHRED_TRACKING_TOTAL
+                .with_label_values(&["untracked"])
+                .inc();
         }
     }
 
@@ -111,6 +121,94 @@ impl ExecutedTxLatencyTracker {
 pub static EXECUTED_TX_LATENCY: LazyLock<ExecutedTxLatencyTracker> =
     LazyLock::new(ExecutedTxLatencyTracker::new);
 
+/// Per-slot timestamps for the slot-status lifecycle (`CreatedBank` ->
+/// `Processed` (bank freeze, i.e. transaction processing finished) ->
+/// `Confirmed` (optimistic confirmation via votes) -> ... ). Votes are
+/// counted by a separate subsystem (`OptimisticallyConfirmedBankTracker`)
+/// that runs independently of transaction execution, so `Confirmed` timing is
+/// *not* just downstream replay latency -- it's primarily governed by how
+/// long it takes the cluster's votes to reach this validator and accumulate
+/// past the optimistic-confirmation threshold.
+///
+/// Timestamps are taken at the top of
+/// `geyser-plugin-manager/src/slot_status_notifier.rs::notify_bank_status`,
+/// i.e. just before that status is reported to Geyser plugins -- this is a
+/// close approximation of, but not exactly, the moment the underlying event
+/// happened (there's a small channel hop between the actual bank-freeze/
+/// vote-threshold event and this notifier being invoked, analogous to the
+/// channel hops already measured elsewhere in this pipeline and found
+/// negligible).
+#[derive(Default, Clone, Copy)]
+struct SlotLifecycleTimestamps {
+    created_bank: Option<Instant>,
+    frozen: Option<Instant>,
+}
+
+pub struct SlotConfirmationLatencyTracker {
+    slots: DashMap<u64, SlotLifecycleTimestamps>,
+    max_slot_seen: AtomicU64,
+}
+
+impl SlotConfirmationLatencyTracker {
+    fn new() -> Self {
+        Self {
+            slots: DashMap::new(),
+            max_slot_seen: AtomicU64::new(0),
+        }
+    }
+
+    pub fn mark_created_bank(&self, slot: u64) {
+        self.slots
+            .entry(slot)
+            .or_default()
+            .created_bank
+            .get_or_insert_with(Instant::now);
+        self.maybe_prune(slot);
+    }
+
+    pub fn mark_frozen(&self, slot: u64) {
+        self.slots
+            .entry(slot)
+            .or_default()
+            .frozen
+            .get_or_insert_with(Instant::now);
+        self.maybe_prune(slot);
+    }
+
+    /// Observes `created_bank_to_confirmed` ("time taken for votes to
+    /// confirm a slot", from when this validator started tracking it) and
+    /// `frozen_to_confirmed` ("time difference of bank freeze, i.e.
+    /// transaction processing finished, to slot marked confirmed") for
+    /// whichever start timestamps were actually recorded.
+    pub fn mark_confirmed(&self, slot: u64) {
+        let Some(timestamps) = self.slots.get(&slot).map(|entry| *entry) else {
+            return;
+        };
+        if let Some(created_bank) = timestamps.created_bank {
+            crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
+                .with_label_values(&["created_bank_to_confirmed"])
+                .observe(created_bank.elapsed().as_micros() as f64);
+        }
+        if let Some(frozen) = timestamps.frozen {
+            crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
+                .with_label_values(&["frozen_to_confirmed"])
+                .observe(frozen.elapsed().as_micros() as f64);
+        }
+    }
+
+    fn maybe_prune(&self, slot: u64) {
+        let previous_max = self.max_slot_seen.fetch_max(slot, Ordering::Relaxed);
+        if slot <= previous_max || slot < MAX_TRACKED_SLOT_AGE {
+            return;
+        }
+        let cutoff = slot - MAX_TRACKED_SLOT_AGE;
+        self.slots.retain(|entry_slot, _| *entry_slot >= cutoff);
+    }
+}
+
+pub static SLOT_CONFIRMATION_LATENCY: LazyLock<SlotConfirmationLatencyTracker> =
+    LazyLock::new(SlotConfirmationLatencyTracker::new);
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -132,6 +230,31 @@ mod test {
         EXECUTED_TX_LATENCY.mark_slot_started(1);
         EXECUTED_TX_LATENCY.mark_tx_notified(1);
         EXECUTED_TX_LATENCY.mark_tx_notified(1);
+    }
+
+    #[test]
+    fn test_slot_confirmation_tracker_no_prior_marks_does_not_panic() {
+        // mark_confirmed with no prior created_bank/frozen marks must not panic
+        // and must not observe anything.
+        SLOT_CONFIRMATION_LATENCY.mark_confirmed(999_998);
+    }
+
+    #[test]
+    fn test_slot_confirmation_tracker_partial_marks() {
+        let tracker = SlotConfirmationLatencyTracker::new();
+        // Only created_bank recorded, no frozen -- confirmed should still
+        // observe created_bank_to_confirmed without panicking on the missing
+        // frozen timestamp.
+        tracker.mark_created_bank(2);
+        tracker.mark_confirmed(2);
+    }
+
+    #[test]
+    fn test_slot_confirmation_tracker_both_marks() {
+        let tracker = SlotConfirmationLatencyTracker::new();
+        tracker.mark_created_bank(3);
+        tracker.mark_frozen(3);
+        tracker.mark_confirmed(3);
     }
 
     #[test]

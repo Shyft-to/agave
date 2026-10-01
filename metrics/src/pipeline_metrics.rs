@@ -159,6 +159,42 @@ pub static GEYSER_NOTIFY_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| 
     )
 });
 
+/// Count of `mark_notified` calls that found (or didn't find) a matching
+/// `mark_started` entry, labeled by `outcome`: `tracked` or `untracked`. Added
+/// as a direct sanity check on the `deshred` end-to-end tracker itself, after
+/// ruling out every other candidate hop for an unaccounted latency gap --
+/// `mark_started` is keyed by a shred's own `fec_set_index`, `mark_notified`
+/// by a completed data set's *starting shred index*, which are assumed equal
+/// but aren't guaranteed to be in every case (out-of-order arrival, repair,
+/// partial fills). A high `untracked` rate means the `deshred` metric is
+/// sampling an unrepresentative subset of data sets, not measuring what it
+/// claims to.
+pub static DESHRED_TRACKING_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_deshred_tracking_total",
+        "Whether mark_notified found a matching mark_started entry",
+        &["outcome"],
+    )
+});
+
+/// Slot-confirmation latency, labeled by `stage`:
+/// `created_bank_to_confirmed` ("time taken for votes to confirm a slot",
+/// measured from when this validator first created a bank for the slot) and
+/// `frozen_to_confirmed` ("time difference of bank freeze -- transaction
+/// processing finished -- to slot marked confirmed"). Confirmation is driven
+/// by `OptimisticallyConfirmedBankTracker` aggregating cluster votes, a
+/// subsystem that runs independently of transaction execution -- so this is
+/// not downstream replay latency, it's primarily vote-propagation/aggregation
+/// time. See `metrics/src/pipeline_latency.rs::SlotConfirmationLatencyTracker`
+/// for exactly where each timestamp is taken.
+pub static SLOT_CONFIRMATION_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_slot_confirmation_duration_us",
+        "Slot confirmation latency (vote-driven), in microseconds",
+        &["stage"],
+    )
+});
+
 /// Top-line end-to-end latency, labeled by `path`: `deshred` (first shred
 /// received for a data set -> deshred transaction notified) or
 /// `executed_tx` (first shred received for a slot -> last transaction

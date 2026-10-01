@@ -147,7 +147,39 @@ single missing hop -- worth cross-referencing against
 `agave_blockstore_store_duration_us{phase="total"}` *max* values (not just
 percentiles) in the same time window to check for simultaneous spikes.
 
-## 10. Host facts (not queries — note manually alongside the results above)
+## 10. Deshred tracker trustworthiness (Phase 3 hypothesis 4)
+
+```promql
+sum(rate(agave_deshred_tracking_total[1h])) by (outcome)
+```
+
+Compute `untracked / (tracked + untracked)`. Near-zero means the `deshred`
+end-to-end metric is measuring what it claims to, and the unaccounted p99 gap
+is most likely burst correlation across stages rather than any single fixable
+hop. A high fraction means the metric itself is unreliable (sampling an
+unrepresentative subset of data sets) and any conclusions drawn from it so
+far -- including the Phase 3 hypothesis 1 (coalesce window) verdict -- should
+be revisited.
+
+## 11. Slot confirmation latency (votes, independent of transaction execution)
+
+```promql
+histogram_quantile(0.5, sum(rate(agave_slot_confirmation_duration_us_bucket[1h])) by (le, stage))
+histogram_quantile(0.9, sum(rate(agave_slot_confirmation_duration_us_bucket[1h])) by (le, stage))
+histogram_quantile(0.99, sum(rate(agave_slot_confirmation_duration_us_bucket[1h])) by (le, stage))
+```
+
+`stage="created_bank_to_confirmed"`: time taken for votes to confirm a slot,
+from when this validator first created a bank for it. `stage=
+"frozen_to_confirmed"`: time difference of bank freeze (transaction processing
+finished) to slot marked confirmed -- this isolates pure vote-propagation/
+aggregation time, since confirmation is driven by
+`OptimisticallyConfirmedBankTracker` aggregating cluster votes, a subsystem
+that runs independently of transaction execution/replay. If this is large
+while `created_bank_to_confirmed` is only slightly larger, most of the gap is
+voting, not this validator's own replay speed.
+
+## 12. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

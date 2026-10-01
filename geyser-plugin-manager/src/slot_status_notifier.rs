@@ -85,6 +85,22 @@ impl SlotStatusNotifierImpl {
         slot_status: SlotStatus,
         bank_id: BankId,
     ) {
+        // Recorded unconditionally (ahead of the early-return below) so slot
+        // confirmation timing doesn't depend on whether any Geyser plugin is
+        // loaded -- it's a validator-level concern, not a plugin one.
+        match slot_status {
+            SlotStatus::CreatedBank => {
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_created_bank(slot)
+            }
+            SlotStatus::Processed => {
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_frozen(slot)
+            }
+            SlotStatus::Confirmed => {
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_confirmed(slot)
+            }
+            _ => {}
+        }
+
         let plugin_manager = self.plugin_manager.load();
         if plugin_manager.plugins.is_empty() {
             return;
