@@ -177,16 +177,26 @@ pub static DESHRED_TRACKING_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLoc
     )
 });
 
-/// Slot-confirmation latency, labeled by `stage`:
-/// `created_bank_to_confirmed` ("time taken for votes to confirm a slot",
-/// measured from when this validator first created a bank for the slot) and
-/// `frozen_to_confirmed` ("time difference of bank freeze -- transaction
-/// processing finished -- to slot marked confirmed"). Confirmation is driven
-/// by `OptimisticallyConfirmedBankTracker` aggregating cluster votes, a
-/// subsystem that runs independently of transaction execution -- so this is
-/// not downstream replay latency, it's primarily vote-propagation/aggregation
-/// time. See `metrics/src/pipeline_latency.rs::SlotConfirmationLatencyTracker`
-/// for exactly where each timestamp is taken.
+/// Slot lifecycle latency, labeled by `stage`:
+/// - `first_shred_to_created_bank`: "replay wake-up latency" -- how long
+///   between this validator first fetching a shred for the slot and replay
+///   actually creating a bank for it. Added after discovering `executed_tx`
+///   (first-shred -> commit) was much larger than `created_bank_to_frozen`
+///   (created-bank -> freeze) even though `notify_transaction` fires at
+///   commit with no dependency on voting -- this stage is where that gap
+///   turned out to be hiding.
+/// - `created_bank_to_confirmed`: "time taken for votes to confirm a slot",
+///   measured from when this validator first created a bank for the slot.
+/// - `frozen_to_confirmed`: "time difference of bank freeze -- transaction
+///   processing finished -- to slot marked confirmed". Confirmation is
+///   driven by `OptimisticallyConfirmedBankTracker` aggregating cluster
+///   votes, a subsystem that runs independently of transaction execution --
+///   so this is not downstream replay latency, it's primarily
+///   vote-propagation/aggregation time.
+///
+/// See `metrics/src/pipeline_latency.rs::SlotConfirmationLatencyTracker` and
+/// `ExecutedTxLatencyTracker::mark_bank_created` for exactly where each
+/// timestamp is taken.
 pub static SLOT_CONFIRMATION_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_slot_confirmation_duration_us",

@@ -90,7 +90,11 @@ impl SlotStatusNotifierImpl {
         // loaded -- it's a validator-level concern, not a plugin one.
         match slot_status {
             SlotStatus::CreatedBank => {
-                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_created_bank(slot)
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_created_bank(slot);
+                // Also observes "first shred fetched -> bank created" (replay
+                // wake-up latency) against the executed_tx tracker's existing
+                // per-slot start timestamp, without disturbing it.
+                solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_bank_created(slot);
             }
             SlotStatus::Processed => {
                 solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_frozen(slot)

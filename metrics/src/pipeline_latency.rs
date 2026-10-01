@@ -97,6 +97,24 @@ impl ExecutedTxLatencyTracker {
         self.maybe_prune(slot);
     }
 
+    /// Observes `first_shred_to_created_bank` ("replay wake-up latency" --
+    /// how long between this validator first fetching a shred for the slot
+    /// and replay creating a bank for it) if a start was recorded. Does not
+    /// remove the entry -- `mark_tx_notified` still needs it afterward.
+    /// Added after `executed_tx` (first-shred -> commit) turned out much
+    /// larger than `created_bank_to_frozen` (created-bank -> freeze,
+    /// independently measured as fast): since `notify_transaction` fires at
+    /// commit with no dependency on voting, the only place that gap could be
+    /// hiding is between shred arrival and replay actually starting on this
+    /// slot, which until now was never directly measured.
+    pub fn mark_bank_created(&self, slot: u64) {
+        if let Some(start) = self.started.get(&slot) {
+            crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
+                .with_label_values(&["first_shred_to_created_bank"])
+                .observe(start.elapsed().as_micros() as f64);
+        }
+    }
+
     /// Observe how long after the slot's first shred this transaction was
     /// notified. Called once per notified transaction (not just the last),
     /// so the histogram reflects the full per-transaction distribution.
@@ -230,6 +248,22 @@ mod test {
         EXECUTED_TX_LATENCY.mark_slot_started(1);
         EXECUTED_TX_LATENCY.mark_tx_notified(1);
         EXECUTED_TX_LATENCY.mark_tx_notified(1);
+    }
+
+    #[test]
+    fn test_executed_tx_tracker_bank_created_does_not_remove_start() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_slot_started(9);
+        tracker.mark_bank_created(9);
+        // mark_tx_notified must still find the start timestamp afterward.
+        assert!(tracker.started.contains_key(&9));
+        tracker.mark_tx_notified(9);
+    }
+
+    #[test]
+    fn test_executed_tx_tracker_bank_created_with_no_start_does_not_panic() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_bank_created(999_997);
     }
 
     #[test]

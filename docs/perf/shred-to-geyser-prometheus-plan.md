@@ -808,3 +808,86 @@ this validator's own replay speed -- directly relevant to the earlier
 would confirm that votes, not transaction processing, dominate how long a
 slot takes to be externally recognized as confirmed from this node's
 perspective.
+
+### Result (deployed and pulled, 2026-10-01): conclusive -- confirmation is ~96% vote-driven
+
+```
+frozen_to_confirmed p90        = 441,885us (441.9ms)
+created_bank_to_confirmed p90  = 461,641us (461.6ms)
+implied created_bank_to_frozen ~= 19.7ms (this validator's own replay time for the whole slot)
+```
+
+The implied `created_bank_to_frozen` (~20ms) matches almost exactly the
+independently-measured `collect_entries` p99 (~22ms) from the earlier Phase 3
+hypothesis 2 baseline -- two separately-built metrics agreeing is a strong
+cross-validation that both are measuring real things, not artifacts.
+
+**Conclusion: ~96% of a slot's time-to-confirm (frozen_to_confirmed /
+created_bank_to_confirmed) is vote propagation/aggregation via
+`OptimisticallyConfirmedBankTracker`; only ~4% is this validator's own replay.**
+This fully resolves the `executed_tx` end-to-end tail discussion earlier in
+this doc: block *production* (leader schedule, ~250-400ms cadence) and block
+*confirmation* (votes reaching supermajority) are decoupled processes. The
+chain keeps producing blocks on schedule regardless of how long any one
+slot's votes take to accumulate -- which is exactly why slot cadence stays
+stable while this validator's own `executed_tx`/`frozen_to_confirmed` numbers
+sit at a roughly constant ~440-460ms. It is not backlog (every queue gauge
+checked on the replay path reads ~0), not a pipeline bottleneck (every stage
+independently measured is microseconds to low tens-of-ms) -- it is genuinely
+how long optimistic confirmation takes on this network right now, now
+measured directly instead of inferred.
+
+**Scope implication going forward**: the shred-to-geyser pipeline this whole
+plan has been instrumenting and tuning (`deshred` path: receive, sigverify,
+blockstore, completed-data-sets; `executed_tx` path: replay, execute, commit,
+tx-status) is upstream of and decoupled from vote/confirmation timing.
+`notify_deshred_transaction` fires pre-replay, before any voting occurs at
+all, and even the `executed_tx` path's own replay/execute/commit stages are
+fast and unaffected by vote propagation. Phase 3 hypotheses 1-4 remain the
+correct track for improving *this validator's own* notification latency
+(deshred and raw execution results); nothing further in this pipeline will
+move the vote-confirmation number, since that is gated by a different
+subsystem (gossip/vote-transaction propagation, stake distribution, network
+topology) outside this project's scope.
+
+### Correction (2026-10-01): the "it's all voting" framing was incomplete
+
+User correctly pushed back: `notify_transaction` (which stops the
+`executed_tx` clock) fires at **commit**, not confirmation --
+`send_transaction_status_batch` is called synchronously inside
+`execute_batch` (`runtime/src/transaction_execution.rs:148`), verified
+directly in the code, with zero dependency on voting. So `executed_tx`
+(first-shred -> commit) should only reflect replay speed -- which we'd
+already measured as fast (`created_bank_to_frozen` ~20ms, implied from the
+two slot-confirmation stages above). The ~400+ms in `executed_tx` therefore
+could *not* actually be vote-propagation time; it had to be hiding somewhere
+between shred arrival and replay starting on the slot, a gap ("replay
+wake-up latency," the original plan's Phase 3 candidate #7) that had never
+been directly measured -- only inferred around.
+
+**Implemented (2026-10-01):** `agave_slot_confirmation_duration_us{stage=
+"first_shred_to_created_bank"}` -- `ExecutedTxLatencyTracker::mark_bank_created`
+(`metrics/src/pipeline_latency.rs`) reads (does not remove) the tracker's
+existing per-slot start timestamp when `CreatedBank` fires, observing the
+delta. Wired into `geyser-plugin-manager/src/slot_status_notifier.rs::
+notify_bank_status`'s `CreatedBank` arm, alongside the existing
+`SLOT_CONFIRMATION_LATENCY.mark_created_bank` call.
+
+Verification: `cargo check` on `solana-metrics`, `solana-geyser-plugin-manager`,
+`solana-core`, `agave-validator` bins, `solana-local-cluster` (`--features
+agave-unstable-api`) all clean. `solana-metrics::pipeline_latency` (2 new
+tests, 8 total) and `solana-geyser-plugin-manager::slot_status_notifier`
+(1/1) pass. Dashboard panel description updated in place (now version 10).
+Not yet deployed/re-baselined.
+
+**What to look for once pulled:** if `first_shred_to_created_bank` alone
+accounts for most of `executed_tx`'s p90/p99, that confirms the real
+bottleneck for this specific metric is replay wake-up/scheduling latency --
+not voting (which only governs `frozen_to_confirmed`, a separate, later
+stage) and not replay execution itself (which stays fast per
+`created_bank_to_frozen`). This would also mean the earlier "~96% vote
+propagation" conclusion needs to be read as applying specifically to
+*confirmation* timing (`created_bank_to_confirmed`/`frozen_to_confirmed`),
+not to `executed_tx`, which is a different span entirely and was always
+going to be dominated by whatever happens *before* `created_bank`, not after
+`frozen`.

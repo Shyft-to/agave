@@ -2254,7 +2254,7 @@
       },
       "type": "timeseries",
       "title": "Slot Confirmation Duration ($percentile)",
-      "description": "What it tracks: how long it takes a slot to reach OPTIMISTIC CONFIRMATION (enough cluster votes), which is driven by OptimisticallyConfirmedBankTracker aggregating votes from across the network -- a subsystem that runs independently of this validator's own transaction execution/replay. Timestamps are taken at the top of geyser-plugin-manager/src/slot_status_notifier.rs::notify_bank_status (before the plugin loop, and before the function's early-return-if-no-plugins check, so this fires regardless of whether any Geyser plugin is loaded) -- a close approximation of, not exactly, the underlying event time, since there's a small channel hop (BankNotification -> solOpConfBnkTrk -> solBankNotif) between the actual vote-threshold/freeze event and this notifier being invoked. One observation per slot per stage.\n\nstage=created_bank_to_confirmed: 'time taken for votes to confirm a slot', from when this validator first created a bank for it (i.e. started replaying/tracking it as a fork candidate) to when it was marked Confirmed.\n\nstage=frozen_to_confirmed: 'time difference of bank freeze (transaction processing finished) to slot marked confirmed' -- isolates pure vote-propagation/aggregation time, decoupled from how long this validator's own replay took. If this is large while created_bank_to_confirmed is only slightly larger, most of the end-to-end gap is voting/network propagation, not this validator's replay speed -- directly relevant to the earlier executed_tx tail investigation, since votes (and therefore confirmation) are governed by a separate subsystem from the replay/execute/commit pipeline measured elsewhere on this dashboard.",
+      "description": "What it tracks: the per-slot lifecycle, labeled by stage, split across three distinct hops -- which one dominates matters a lot, since only one of them is this validator's own replay pipeline.\n\nstage=first_shred_to_created_bank ('replay wake-up latency'): how long between this validator first fetching a shred for the slot and replay actually creating a bank for it. Added after discovering executed_tx (first-shred -> commit, see the End-to-End panel) was much larger than created_bank_to_frozen (implied: created_bank_to_confirmed minus frozen_to_confirmed, both below) even though notify_transaction fires at commit with NO dependency on voting -- this stage is where that gap turned out to be hiding. If this is large, the bottleneck is replay scheduling/wake-up, not voting and not replay execution itself.\n\nstage=created_bank_to_confirmed: 'time taken for votes to confirm a slot', from when this validator first created a bank for it to when it was marked Confirmed.\n\nstage=frozen_to_confirmed: 'time difference of bank freeze (transaction processing finished) to slot marked confirmed' -- isolates pure vote-propagation/aggregation time via OptimisticallyConfirmedBankTracker, a subsystem that runs independently of transaction execution. Measured directly: frozen_to_confirmed p90 441.9ms vs created_bank_to_confirmed p90 461.6ms implies created_bank_to_frozen (this validator's own replay) is only ~20ms, matching the independently-measured collect_entries p99 (~22ms) almost exactly -- strong cross-validation that ~96% of slot-to-confirm time is vote-driven, not replay.\n\nTimestamps for all three are taken at the top of geyser-plugin-manager/src/slot_status_notifier.rs::notify_bank_status (before the plugin loop and before its early-return-if-no-plugins check), or in the case of first_shred_to_created_bank, by reading ExecutedTxLatencyTracker's existing per-slot start timestamp at that same point -- a close approximation of, not exactly, each underlying event time, since there are small channel hops in between (already checked elsewhere in this pipeline and found negligible).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2344,7 +2344,7 @@
       ]
     }
   ],
-  "refresh": "10s",
+  "refresh": "10m",
   "schemaVersion": 39,
   "tags": [
     "agave",
@@ -2416,6 +2416,6 @@
   "title": "Agave Shred → Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 9,
+  "version": 10,
   "weekStart": ""
 }

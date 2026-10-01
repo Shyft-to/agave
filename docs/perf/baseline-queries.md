@@ -179,6 +179,16 @@ that runs independently of transaction execution/replay. If this is large
 while `created_bank_to_confirmed` is only slightly larger, most of the gap is
 voting, not this validator's own replay speed.
 
+`stage="first_shred_to_created_bank"` ("replay wake-up latency"): added after
+`executed_tx` (first-shred -> commit) turned out much larger than
+`created_bank_to_frozen` (implied from the two queries above), even though
+`notify_transaction` fires at commit with no dependency on voting at all --
+the only place that gap could be hiding is between shred arrival and replay
+actually creating a bank for the slot. Compare this directly against
+`executed_tx` p90/p99 from section 1: if `first_shred_to_created_bank` alone
+accounts for most of it, replay wake-up (not voting, not replay itself) is
+the real bottleneck for `executed_tx`.
+
 ## 12. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
