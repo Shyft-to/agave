@@ -79,6 +79,8 @@ impl TransactionNotifier for TransactionNotifierImpl {
             .with_label_values(&["transaction"])
             .observe(notify_start.elapsed().as_micros() as f64);
         solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_tx_notified(slot);
+        solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+            .mark_tx_notified((*signature).into());
     }
 }
 

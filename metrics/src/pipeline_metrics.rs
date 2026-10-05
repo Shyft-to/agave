@@ -6,8 +6,10 @@
 //! Prometheus's usual base-unit-in-seconds convention).
 
 use {
-    crate::prometheus_metrics::{register_gauge_vec, register_histogram_vec, register_int_counter},
-    prometheus::{GaugeVec, HistogramVec, IntCounter},
+    crate::prometheus_metrics::{
+        register_gauge_vec, register_histogram, register_histogram_vec, register_int_counter,
+    },
+    prometheus::{GaugeVec, Histogram, HistogramVec, IntCounter},
     std::sync::LazyLock,
 };
 
@@ -40,6 +42,20 @@ pub static SHRED_PACKETS_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| 
     register_int_counter(
         "agave_shred_packets_dropped_total",
         "Shred packets dropped before reaching sigverify",
+    )
+});
+
+/// Time from a slot's first shred fetched to its LAST shred fetched (the
+/// shred carrying the `LAST_SHRED_IN_SLOT` flag) -- i.e. how long it takes
+/// this validator to receive all of a slot's shreds, start to finish. One
+/// observation per slot. Added per explicit request, alongside
+/// `path="tx_pipeline"` on `agave_end_to_end_duration_us`, to separate "how
+/// spread out is shred arrival for a slot" from "how fast is the pipeline
+/// once a shred has arrived."
+pub static SHRED_ARRIVAL_SPREAD_US: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram(
+        "agave_shred_arrival_spread_us",
+        "Time from first to last shred fetched for a slot, in microseconds",
     )
 });
 
@@ -222,10 +238,22 @@ pub static SLOT_CONFIRMATION_DURATION_US: LazyLock<HistogramVec> = LazyLock::new
     )
 });
 
-/// Top-line end-to-end latency, labeled by `path`: `deshred` (first shred
-/// received for a data set -> deshred transaction notified) or
-/// `executed_tx` (first shred received for a slot -> last transaction
-/// notified for that slot).
+/// Top-line end-to-end latency, labeled by `path`:
+/// - `deshred`: first shred received for a data set -> deshred transaction
+///   notified.
+/// - `executed_tx`: first shred received for a SLOT -> each transaction
+///   notified for that slot. This conflates true pipeline speed with how
+///   late in the slot a transaction happens to land (a transaction near the
+///   end of a large/slow-replaying slot will show a large value here even
+///   if its own shred was processed quickly) -- kept because it's still
+///   useful for understanding slot-replay-time-weighted, end-user-facing
+///   latency, but do not read it as "how fast is the pipeline."
+/// - `tx_pipeline`: TRUE per-transaction pipeline latency -- from the first
+///   shred of the DATA SET containing that specific transaction being
+///   fetched, to that transaction being sent over the Geyser channel. This
+///   is the one to use for understanding and optimizing actual pipeline
+///   speed, independent of slot position. See
+///   `pipeline_latency::TxPipelineLatencyTracker` for how it's computed.
 pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_end_to_end_duration_us",

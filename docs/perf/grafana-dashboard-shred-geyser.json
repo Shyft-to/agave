@@ -45,7 +45,7 @@
       },
       "type": "timeseries",
       "title": "End-to-End Latency by Path ($percentile)",
-      "description": "What it tracks: two independent cross-thread timers, each sampled once (not per-shred).\n\n- path=deshred: wall-clock time from the FIRST shred fetched for a (slot, fec_set_index) data set (timestamped in the fetch-stage filter loop, core/src/shred_fetch_stage.rs) to the moment notify_deshred_transaction() returns for that data set's last transaction (core/src/completed_data_sets_service.rs). One observation per completed data set that had a Geyser deshred-transaction plugin loaded. This is the priority-1 target: shred-in to earliest-possible Geyser notification.\n\n- path=executed_tx: wall-clock time from the FIRST shred fetched for a SLOT to EACH transaction notified via notify_transaction() for that slot (geyser-plugin-manager/src/transaction_notifier.rs). Observed once per notified transaction (not just the last one), so within one slot you get a whole distribution of 'time since first shred' values, one per tx -- the histogram naturally captures the spread across early vs. late transactions in a block.\n\nGranularity: batch/end-to-end span, not a single instant. Buckets are 10us-500ms; values above 500ms still count (in the +Inf bucket) but individual outliers beyond that aren't separately visible here.",
+      "description": "What it tracks: three independent cross-thread timers, each sampled per-event (not per-slot).\n\n- path=deshred: wall-clock time from the FIRST shred fetched for a (slot, fec_set_index) data set to notify_deshred_transaction() returning for that data set's last transaction (core/src/completed_data_sets_service.rs). One observation per completed data set.\n\n- path=executed_tx: wall-clock time from the FIRST shred fetched for a SLOT to EACH transaction notified via notify_transaction() for that slot. CONFLATES true pipeline speed with how late in the slot a transaction happens to land -- a transaction near the end of a large/slow-replaying slot shows a large value here even if its own shred was processed quickly by the pipeline. Kept because it's still useful for understanding slot-replay-time-weighted, end-user-facing latency (and because docs/perf/shred-to-geyser-prometheus-plan.md's investigation into why this exceeds a single slot's nominal duration concluded replay/execution of the whole slot, not voting, is the dominant cost) -- but do NOT read it as 'how fast is the pipeline.' Use path=tx_pipeline for that.\n\n- path=tx_pipeline: TRUE per-transaction pipeline latency, added per explicit request to separate this from executed_tx's slot-position effect -- from the FIRST shred of the DATA SET containing THAT SPECIFIC transaction being fetched (not the slot's first shred), to that transaction being sent over the Geyser channel. Implemented in metrics/src/pipeline_latency.rs::TxPipelineLatencyTracker: ledger/src/blockstore_processor.rs's confirm_slot loop records each transaction's signature against its own data set's start instant before scheduling execution; geyser-plugin-manager/src/transaction_notifier.rs reads it back (keyed by signature) at notify time. This is the metric to use for understanding and optimizing actual pipeline speed, independent of slot position.\n\nGranularity: batch/end-to-end span, not a single instant. Buckets span 10us-5s; values above that still count (in the +Inf bucket) but individual outliers beyond it aren't separately visible here.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2342,6 +2342,118 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 34,
+      "type": "row",
+      "title": "Shred Arrival Spread (new, per explicit request)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 107
+      },
+      "panels": []
+    },
+    {
+      "id": 35,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 108
+      },
+      "type": "timeseries",
+      "title": "Shred Arrival Spread ($percentile)",
+      "description": "What it tracks: how long it takes this validator to receive ALL of a slot's shreds, start to finish -- time from the slot's FIRST shred fetched to its LAST shred fetched (the shred carrying the LAST_SHRED_IN_SLOT wire flag, core/src/shred_fetch_stage.rs reading it directly off raw shred bytes via ledger/src/shred/wire.rs::get_flags). One observation per slot.\n\nWhy this matters: this is the natural upper bound on how fast ANY pipeline could notify the LAST transaction in a block, no matter how fast replay/execution itself is -- the data simply isn't fully available until this much time has passed. Compare it against End-to-End Latency's path=executed_tx and the Slot Confirmation Duration panel's created_bank_to_frozen: if shred arrival spread is itself large, that's a turbine/network-propagation property (upstream of anything measured elsewhere on this dashboard), not a replay or pipeline inefficiency. If it's small while created_bank_to_frozen/executed_tx stay large, that rules out shred arrival as the cause and points squarely at replay/execution itself.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_shred_arrival_spread_us_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "arrival spread",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "10m",
@@ -2416,6 +2528,6 @@
   "title": "Agave Shred → Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 12,
+  "version": 13,
   "weekStart": ""
 }

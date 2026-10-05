@@ -115,6 +115,14 @@ impl ShredFetchStage {
                         if let Some(fec_set_index) = shred::wire::get_fec_set_index(shred_bytes) {
                             solana_metrics::pipeline_latency::DESHRED_LATENCY
                                 .mark_started(slot, fec_set_index);
+                            solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                                .mark_data_set_started(slot, fec_set_index);
+                        }
+                        if shred::wire::get_flags(shred_bytes)
+                            .is_ok_and(|f| f.contains(shred::ShredFlags::LAST_SHRED_IN_SLOT))
+                        {
+                            solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY
+                                .mark_last_shred(slot);
                         }
                     }
                 }

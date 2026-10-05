@@ -137,10 +137,28 @@ impl ExecutedTxLatencyTracker {
     /// Observe how long after the slot's first shred this transaction was
     /// notified. Called once per notified transaction (not just the last),
     /// so the histogram reflects the full per-transaction distribution.
+    ///
+    /// NOTE: this measures position-within-slot, not true pipeline latency --
+    /// a transaction late in a large/slow-replaying slot will show a large
+    /// value here even if the pipeline processed *it* (from its own shreds)
+    /// quickly. For true per-transaction pipeline latency, see
+    /// `TX_PIPELINE_LATENCY` / `path="tx_pipeline"` below, which starts the
+    /// clock at that transaction's own data set's first shred instead.
     pub fn mark_tx_notified(&self, slot: u64) {
         if let Some(start) = self.started.get(&slot) {
             END_TO_END_DURATION_US
                 .with_label_values(&["executed_tx"])
+                .observe(start.elapsed().as_micros() as f64);
+        }
+    }
+
+    /// Observes `agave_shred_arrival_spread_us` -- time from this slot's
+    /// first shred fetched to its LAST shred fetched (the shred carrying the
+    /// `LAST_SHRED_IN_SLOT` flag) -- if a start was recorded. Does not
+    /// remove the entry (`mark_tx_notified` may still need it).
+    pub fn mark_last_shred(&self, slot: u64) {
+        if let Some(start) = self.started.get(&slot) {
+            crate::pipeline_metrics::SHRED_ARRIVAL_SPREAD_US
                 .observe(start.elapsed().as_micros() as f64);
         }
     }
@@ -257,6 +275,88 @@ impl SlotConfirmationLatencyTracker {
 pub static SLOT_CONFIRMATION_LATENCY: LazyLock<SlotConfirmationLatencyTracker> =
     LazyLock::new(SlotConfirmationLatencyTracker::new);
 
+/// True per-transaction pipeline latency: from the first shred of the DATA
+/// SET containing this transaction being fetched, to this transaction being
+/// sent over the Geyser channel -- as opposed to `ExecutedTxLatencyTracker`
+/// (`path="executed_tx"`), which measures from the SLOT's first shred and
+/// therefore conflates true pipeline latency with how late in the slot a
+/// transaction happens to land. This tracker answers "how fast is the
+/// pipeline itself," independent of slot position -- added per explicit
+/// request after the `executed_tx`/slot-replay-time investigation
+/// (see docs/perf/shred-to-geyser-prometheus-plan.md) made clear the two
+/// questions need separate metrics.
+///
+/// Deliberately keeps its OWN `(slot, fec_set_index) -> Instant` map rather
+/// than reading `DeshredLatencyTracker`'s: that one is raced-and-removed by
+/// the separate, concurrent `CompletedDataSetsService` consumer of the same
+/// underlying shred data, so it can't be read reliably from here (the
+/// replay path, a different, independent consumer of the same shreds).
+pub struct TxPipelineLatencyTracker {
+    data_set_started: DashMap<(u64, u32), Instant>,
+    /// Signature bytes -> (slot, start instant). Slot is kept alongside the
+    /// instant purely for age-based pruning, since this map isn't keyed by
+    /// slot directly like the others in this file.
+    tx_started: DashMap<[u8; 64], (u64, Instant)>,
+    max_slot_seen: AtomicU64,
+}
+
+impl TxPipelineLatencyTracker {
+    fn new() -> Self {
+        Self {
+            data_set_started: DashMap::new(),
+            tx_started: DashMap::new(),
+            max_slot_seen: AtomicU64::new(0),
+        }
+    }
+
+    /// Mirrors `DeshredLatencyTracker::mark_started` -- records the
+    /// first-shred-seen instant for a data set, independently.
+    pub fn mark_data_set_started(&self, slot: u64, fec_set_index: u32) {
+        self.data_set_started
+            .entry((slot, fec_set_index))
+            .or_insert_with(Instant::now);
+        self.maybe_prune(slot);
+    }
+
+    /// Called once per transaction when replay processes the data set
+    /// containing it (before scheduling execution), recording that
+    /// transaction's true pipeline start time -- its own data set's first
+    /// shred, not the slot's. A no-op if no start was recorded for that data
+    /// set (e.g. the data set arrived via repair/leader-local path with no
+    /// fetch-stage timestamp).
+    pub fn mark_tx_data_set(&self, signature: [u8; 64], slot: u64, fec_set_index: u32) {
+        if let Some(start) = self.data_set_started.get(&(slot, fec_set_index)) {
+            self.tx_started.insert(signature, (slot, *start));
+        }
+    }
+
+    /// Observes `agave_end_to_end_duration_us{path="tx_pipeline"}` if a
+    /// start was recorded for this signature, and removes the entry. A
+    /// transaction that never reaches this (e.g. dropped before commit) is
+    /// cleaned up later by age-based pruning instead, bounding memory.
+    pub fn mark_tx_notified(&self, signature: [u8; 64]) {
+        if let Some((_, (_, start))) = self.tx_started.remove(&signature) {
+            END_TO_END_DURATION_US
+                .with_label_values(&["tx_pipeline"])
+                .observe(start.elapsed().as_micros() as f64);
+        }
+    }
+
+    fn maybe_prune(&self, slot: u64) {
+        let previous_max = self.max_slot_seen.fetch_max(slot, Ordering::Relaxed);
+        if slot <= previous_max || slot < MAX_TRACKED_SLOT_AGE {
+            return;
+        }
+        let cutoff = slot - MAX_TRACKED_SLOT_AGE;
+        self.data_set_started
+            .retain(|(entry_slot, _), _| *entry_slot >= cutoff);
+        self.tx_started.retain(|_, (entry_slot, _)| *entry_slot >= cutoff);
+    }
+}
+
+pub static TX_PIPELINE_LATENCY: LazyLock<TxPipelineLatencyTracker> =
+    LazyLock::new(TxPipelineLatencyTracker::new);
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -312,6 +412,21 @@ mod test {
     }
 
     #[test]
+    fn test_executed_tx_tracker_last_shred_does_not_remove_start() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_slot_started(11);
+        tracker.mark_last_shred(11);
+        assert!(tracker.started.contains_key(&11));
+        tracker.mark_tx_notified(11);
+    }
+
+    #[test]
+    fn test_executed_tx_tracker_last_shred_with_no_start_does_not_panic() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_last_shred(999_995);
+    }
+
+    #[test]
     fn test_slot_confirmation_tracker_no_prior_marks_does_not_panic() {
         // mark_confirmed with no prior created_bank/frozen marks must not panic
         // and must not observe anything.
@@ -346,6 +461,38 @@ mod test {
         tracker.mark_frozen(4);
         tracker.mark_created_bank(4);
         tracker.mark_confirmed(4);
+    }
+
+    #[test]
+    fn test_tx_pipeline_tracker_no_data_set_start_is_a_noop() {
+        let tracker = TxPipelineLatencyTracker::new();
+        // No mark_data_set_started call -- mark_tx_data_set must not panic
+        // and must not record a start.
+        tracker.mark_tx_data_set([1u8; 64], 1, 0);
+        assert!(!tracker.tx_started.contains_key(&[1u8; 64]));
+        // mark_tx_notified with no recorded start must not panic either.
+        tracker.mark_tx_notified([1u8; 64]);
+    }
+
+    #[test]
+    fn test_tx_pipeline_tracker_full_flow() {
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(5, 100);
+        tracker.mark_tx_data_set([2u8; 64], 5, 100);
+        assert!(tracker.tx_started.contains_key(&[2u8; 64]));
+        tracker.mark_tx_notified([2u8; 64]);
+        // Removed after notify.
+        assert!(!tracker.tx_started.contains_key(&[2u8; 64]));
+    }
+
+    #[test]
+    fn test_tx_pipeline_tracker_multiple_tx_same_data_set() {
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(6, 200);
+        tracker.mark_tx_data_set([3u8; 64], 6, 200);
+        tracker.mark_tx_data_set([4u8; 64], 6, 200);
+        tracker.mark_tx_notified([3u8; 64]);
+        tracker.mark_tx_notified([4u8; 64]);
     }
 
     #[test]

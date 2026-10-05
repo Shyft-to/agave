@@ -189,7 +189,31 @@ actually creating a bank for the slot. Compare this directly against
 accounts for most of it, replay wake-up (not voting, not replay itself) is
 the real bottleneck for `executed_tx`.
 
-## 12. Host facts (not queries — note manually alongside the results above)
+## 12. True pipeline latency and shred arrival spread (added per explicit request)
+
+```promql
+histogram_quantile(0.5, sum(rate(agave_end_to_end_duration_us_bucket{path="tx_pipeline"}[1h])) by (le))
+histogram_quantile(0.9, sum(rate(agave_end_to_end_duration_us_bucket{path="tx_pipeline"}[1h])) by (le))
+histogram_quantile(0.99, sum(rate(agave_end_to_end_duration_us_bucket{path="tx_pipeline"}[1h])) by (le))
+
+histogram_quantile(0.5, sum(rate(agave_shred_arrival_spread_us_bucket[1h])) by (le))
+histogram_quantile(0.9, sum(rate(agave_shred_arrival_spread_us_bucket[1h])) by (le))
+histogram_quantile(0.99, sum(rate(agave_shred_arrival_spread_us_bucket[1h])) by (le))
+```
+
+`path="tx_pipeline"`: TRUE per-transaction pipeline latency -- from the first
+shred of THAT SPECIFIC transaction's own data set being fetched (not the
+slot's first shred) to that transaction being sent over Geyser. Unlike
+`path="executed_tx"`, this is NOT inflated by how late in the slot a
+transaction happens to land -- use this one to judge actual pipeline speed.
+
+`agave_shred_arrival_spread_us`: time from a slot's first shred fetched to
+its last (`LAST_SHRED_IN_SLOT` flag). The natural upper bound on notifying
+the last transaction in a block, independent of replay speed -- compare
+against `tx_pipeline`/`executed_tx`/`created_bank_to_frozen` to separate
+"shred propagation is slow" from "replay is slow."
+
+## 13. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

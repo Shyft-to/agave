@@ -992,3 +992,148 @@ would mean the real Phase 3-relevant lead for `executed_tx` is somewhere
 measured at a few-ms scale -- collect_entries, execute, commit are all
 small individually, so the cost must be in how many of them a slot requires,
 or in something not yet broken out per-slot).
+
+### Result (deployed and pulled, 2026-10-05): `created_bank_to_frozen` = 388.7ms -- CONFIRMED, replay is the dominant cost
+
+```
+created_bank_to_frozen p90 = 388,685us (388.7ms)   <- direct measurement
+first_shred_to_frozen p90  = 468,122us (468.1ms)   <- direct measurement, from an earlier pull
+first_shred_to_created_bank p90 = 19,289us (19.3ms) <- direct measurement
+```
+
+388.7ms is close to the implied 468.1 - 19.3 = 448.8ms (same ballpark; the
+two numbers come from different pulls/time windows, so exact agreement isn't
+expected, but both land firmly in the "few hundred ms" range, not the "~20ms"
+the earlier invalid subtraction suggested). **This is now a conclusively,
+directly-measured result: replay/execution of the whole slot -- not vote
+propagation -- is the dominant contributor to this validator's
+first-shred-to-commit and first-shred-to-confirm latency.**
+
+**The earlier "~96% vote propagation" conclusion (see the "Result...
+conclusive -- confirmation is ~96% vote-driven" section above) is formally
+RETRACTED.** It was built on a percentile subtraction
+(`created_bank_to_confirmed` minus `frozen_to_confirmed`) that this whole
+investigation has since shown is not valid math for inferring a third,
+unobserved quantity. `created_bank_to_confirmed` and `frozen_to_confirmed`
+remain individually true, directly-measured facts -- they just don't tell
+you the replay/voting split when subtracted from each other.
+
+**Why would created_bank_to_frozen genuinely be ~389ms, given every
+individual replay-stage call we've measured is fast (execute p50 45-50us,
+p90 626-809us; commit p50 17us, p90 46-47us)?** The most likely explanation,
+using only data already collected, needs no further instrumentation to be
+plausible: **sum-of-a-heavy-tailed-distribution dominated by the tail, not
+the median, combined with account-lock serialization.** execute's own p50-to-
+p90 ratio is already >10x (45-50us vs 626-809us) -- a slot with on the order
+of 1,000+ transactions (consistent with the ~3800-5000 tx/sec throughput
+measured earlier) only needs a modest fraction of them to land in that
+heavier tail (e.g. larger/compute-heavier instructions, or transactions that
+must serialize behind others touching the same hot/popular account under the
+unified scheduler's account-lock rules) for the SUM across the whole slot to
+reach several hundred ms, even though the median transaction is trivially
+fast. This is a property of the transaction workload and the scheduler's
+locking semantics, not a pipeline inefficiency or a bug.
+
+**Where this leaves the investigation:** every un-fixable-from-this-pipeline
+explanation (vote propagation, channel backlog at any of the four hops
+checked, any single mis-measured stage) has now been ruled out with direct
+evidence. The remaining open question -- whether the ~389ms is explained by
+simple tail-sum arithmetic or by something scheduler-specific like account-
+lock contention or dispatch-queue wait time between a transaction being
+scheduled and a handler thread actually starting it -- would require either
+(a) a per-slot transaction-count-weighted analysis (no new instrumentation,
+just correlating existing throughput/count metrics against
+created_bank_to_frozen), or (b) new instrumentation inside
+unified-scheduler-pool/unified-scheduler-logic (the scheduler's own dispatch
+layer), which is materially riskier/more complex code than anything touched
+in this plan so far. Decide with the user before proceeding further in this
+direction -- this is a natural checkpoint, not a dead end.
+
+## Two new metrics, per explicit request (2026-10-05)
+
+User correctly identified that `executed_tx` (first shred of the SLOT ->
+each transaction notified) conflates two different things: true pipeline
+speed, and how late in the slot a transaction happens to land. A transaction
+near the end of a large/slow-replaying slot shows a large `executed_tx`
+value even if the pipeline processed *that transaction's own shreds*
+quickly. Requested two fixes:
+
+1. **A metric that measures true pipeline latency**: time from the shred(s)
+   actually carrying a transaction arriving, to that transaction being sent
+   over the Geyser channel -- not from the slot's first shred.
+2. **A new histogram**: how long it takes to receive all shreds for a slot.
+
+### Implementation
+
+**`agave_end_to_end_duration_us{path="tx_pipeline"}`** (new `path` label on
+the existing end-to-end metric family, `executed_tx` kept as-is alongside
+it -- see below for why):
+- `metrics/src/pipeline_latency.rs::TxPipelineLatencyTracker` -- keeps its
+  OWN `(slot, fec_set_index) -> Instant` map (independent of
+  `DeshredLatencyTracker`'s, which is raced-and-removed by the separate,
+  concurrent `CompletedDataSetsService` consumer of the same shreds -- can't
+  be read reliably from the replay path) plus a `signature -> (slot, Instant)`
+  map for in-flight per-transaction tracking.
+- `core/src/shred_fetch_stage.rs`'s filter loop (where `DESHRED_LATENCY`/
+  `EXECUTED_TX_LATENCY` already mark first-shred timestamps) now also calls
+  `TX_PIPELINE_LATENCY.mark_data_set_started(slot, fec_set_index)`.
+- `ledger/src/blockstore_processor.rs`'s `confirm_slot` loop -- which already
+  knows the current data set's `(slot, completed_range.start)` per iteration
+  -- now iterates every transaction in that data set's entries and calls
+  `TX_PIPELINE_LATENCY.mark_tx_data_set(signature, slot, fec_set_index)`
+  *before* the entries are handed to `confirm_slot_entries` (i.e. before
+  scheduling). This is the key plumbing: it tags each transaction with its
+  OWN data set's start time, not the slot's, without touching the unified
+  scheduler itself (deliberately avoided -- that's performance-critical code
+  carrying strict size/layout constraints, materially riskier than anything
+  else touched in this plan).
+- `geyser-plugin-manager/src/transaction_notifier.rs::notify_transaction`
+  (which already has the transaction's `signature`) calls
+  `TX_PIPELINE_LATENCY.mark_tx_notified(signature)`, observing and removing
+  the entry.
+- Transactions that never reach `notify_transaction` (e.g. dropped before
+  commit, such as a cost-limit-exceeded early return) aren't explicitly
+  cleaned up by a remove -- they're bounded by the same slot-age pruning as
+  everything else, so this doesn't leak, just delays cleanup for those rare
+  cases.
+
+**Why `executed_tx` was kept rather than replaced**: `ExecutedTxLatencyTracker`'s
+per-slot start map also feeds `SLOT_CONFIRMATION_DURATION_US`'s
+`first_shred_to_created_bank`/`first_shred_to_frozen` stages (both
+inherently slot-level concepts), so it couldn't be removed anyway. Repurposing
+`executed_tx` itself to mean `tx_pipeline` would also discard a genuinely
+useful (if differently-scoped) signal -- slot-replay-time-weighted,
+end-user-facing latency -- so it's kept, now clearly documented as
+NOT a pipeline-speed metric.
+
+**`agave_shred_arrival_spread_us`** (new standalone `Histogram`, no labels):
+- `core/src/shred_fetch_stage.rs`'s filter loop also now checks
+  `shred::wire::get_flags(shred_bytes)` for the `LAST_SHRED_IN_SLOT` wire
+  flag (same raw-bytes-accessor pattern already used for `get_slot`/
+  `get_fec_set_index`); when set, calls
+  `EXECUTED_TX_LATENCY.mark_last_shred(slot)`, which reads (does not
+  remove) that slot's existing first-shred start and observes the delta.
+  One observation per slot.
+
+### Verification
+
+`cargo check` on `solana-metrics`, `solana-core`, `solana-ledger`,
+`solana-geyser-plugin-manager`, `agave-validator` bins, `solana-local-cluster`
+(`--features agave-unstable-api`) all clean. `solana-metrics::pipeline_latency`
+(16/16, 5 new tests), `solana-ledger::blockstore_processor` (57/57, 1
+pre-existing ignore), `solana-geyser-plugin-manager` (18/18) all pass.
+Dashboard: `End-to-End Latency by Path` panel description rewritten to
+explain all three `path` values and when to use which; new "Shred Arrival
+Spread" row added (now version 13). `baseline-queries.md` (section 12) and
+`run-baseline-queries.sh` updated. Not yet deployed/re-baselined.
+
+**What to look for once pulled**: compare `tx_pipeline` against `executed_tx`
+-- if `tx_pipeline` is dramatically smaller, that confirms the pipeline
+itself is fast and `executed_tx`'s tail really is a pure slot-position
+artifact (consistent with everything found in this plan so far). Compare
+`shred_arrival_spread` against `created_bank_to_frozen` -- if arrival spread
+alone is already large (hundreds of ms), that reframes the ~389ms
+`created_bank_to_frozen` finding: some of it may be waiting for shreds to
+finish arriving (a turbine/network property), not pure replay/execution
+compute time, since `confirm_slot` can only process entries as their shreds
+arrive.

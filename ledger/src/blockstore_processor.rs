@@ -1435,6 +1435,26 @@ pub fn confirm_slot(
             BlockComponent::EntryBatch(entries) => {
                 let slot_full = slot_full && ix == last_entry_batch_index.unwrap();
 
+                // Records each transaction's TRUE pipeline start time (its own
+                // data set's first shred fetched, not the slot's) before it's
+                // scheduled for execution, for agave_end_to_end_duration_us
+                // {path="tx_pipeline"}. completed_range.start is this data
+                // set's starting shred index, matching the fec_set_index
+                // convention used elsewhere in this plan (see
+                // docs/perf/shred-to-geyser-prometheus-plan.md).
+                for entry in &entries {
+                    for tx in &entry.transactions {
+                        if let Some(signature) = tx.signatures.first() {
+                            solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                                .mark_tx_data_set(
+                                    (*signature).into(),
+                                    slot,
+                                    completed_range.start,
+                                );
+                        }
+                    }
+                }
+
                 // Skip block component validation for genesis block. Slot 0 is handled specially,
                 // since it won't have the required block markers.
                 if slot != 0 {
