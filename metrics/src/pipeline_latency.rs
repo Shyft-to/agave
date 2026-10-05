@@ -203,12 +203,23 @@ impl SlotConfirmationLatencyTracker {
         self.maybe_prune(slot);
     }
 
+    /// Records the freeze timestamp and, if `created_bank` was already
+    /// recorded for this slot, directly observes `created_bank_to_frozen`
+    /// as the true `Instant`-to-`Instant` delta between the two -- NOT by
+    /// subtracting two independently-computed percentiles of other metrics
+    /// (that approach was tried and gave a wildly different, wrong answer
+    /// for this same quantity; see the doc comment on
+    /// `ExecutedTxLatencyTracker::mark_bank_frozen`).
     pub fn mark_frozen(&self, slot: u64) {
-        self.slots
-            .entry(slot)
-            .or_default()
-            .frozen
-            .get_or_insert_with(Instant::now);
+        let now = Instant::now();
+        let mut entry = self.slots.entry(slot).or_default();
+        let frozen = *entry.frozen.get_or_insert(now);
+        if let Some(created_bank) = entry.created_bank {
+            crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
+                .with_label_values(&["created_bank_to_frozen"])
+                .observe(frozen.saturating_duration_since(created_bank).as_micros() as f64);
+        }
+        drop(entry);
         self.maybe_prune(slot);
     }
 
@@ -321,8 +332,20 @@ mod test {
     fn test_slot_confirmation_tracker_both_marks() {
         let tracker = SlotConfirmationLatencyTracker::new();
         tracker.mark_created_bank(3);
+        // Exercises the new created_bank_to_frozen direct observation inside
+        // mark_frozen (created_bank was already recorded above).
         tracker.mark_frozen(3);
         tracker.mark_confirmed(3);
+    }
+
+    #[test]
+    fn test_slot_confirmation_tracker_frozen_before_created_bank_does_not_panic() {
+        let tracker = SlotConfirmationLatencyTracker::new();
+        // No created_bank recorded yet -- mark_frozen must not observe
+        // created_bank_to_frozen and must not panic.
+        tracker.mark_frozen(4);
+        tracker.mark_created_bank(4);
+        tracker.mark_confirmed(4);
     }
 
     #[test]

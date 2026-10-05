@@ -177,30 +177,39 @@ pub static DESHRED_TRACKING_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLoc
     )
 });
 
-/// Slot lifecycle latency, labeled by `stage`:
+/// Slot lifecycle latency, labeled by `stage`. Every stage here is measured
+/// directly as an `Instant`-to-`Instant` (or `Instant`-to-`now`) delta for a
+/// single tracked slot -- none of them are inferred by subtracting two
+/// independently-computed percentiles of other stages. (An earlier version
+/// of this comment inferred `created_bank_to_frozen` that way and drew a
+/// wrong conclusion from it; see `SlotConfirmationLatencyTracker::mark_frozen`'s
+/// doc comment for what went wrong and why percentile subtraction across
+/// different histograms is invalid in general.)
+///
 /// - `first_shred_to_created_bank`: "replay wake-up latency" -- how long
 ///   between this validator first fetching a shred for the slot and replay
-///   actually creating a bank for it. Came back small in practice (~19ms
-///   p90), ruling this out as the explanation for `executed_tx`'s much
-///   larger tail.
-/// - `first_shred_to_frozen`: first shred fetched -> bank freeze (all
-///   transactions in the slot executed and committed), measured directly.
-///   Added because composing this from `created_bank_to_confirmed` minus
-///   `frozen_to_confirmed` (two independently-computed percentiles) is not
-///   valid math (p90(A) - p90(B) != p90(A - B)) -- this is the real number.
-///   No transaction's `executed_tx` observation can exceed roughly this
-///   value for its own slot (plus the already-measured small tx-status
-///   queue/notify overhead), so comparing the two directly is the way to
-///   tell whether `executed_tx`'s tail is explained by slow slots or
-///   something else entirely.
+///   actually creating a bank for it. Measured small in practice (~19ms
+///   p90), ruling this out as a bottleneck.
+/// - `created_bank_to_frozen`: replay's own execution time for the whole
+///   slot, from bank creation to freeze (all transactions executed and
+///   committed). The one stage that directly answers "is replay itself
+///   slow" without composing it from anything else.
+/// - `first_shred_to_frozen`: first shred fetched -> bank freeze, i.e.
+///   `first_shred_to_created_bank` + `created_bank_to_frozen` for the same
+///   slot (also measured directly, not summed from the other two). No
+///   transaction's `executed_tx` observation can exceed roughly this value
+///   for its own slot (plus the already-measured small tx-status
+///   queue/notify overhead) -- compare the two directly to see whether
+///   `executed_tx`'s tail is explained by slow replay or something else.
 /// - `created_bank_to_confirmed`: "time taken for votes to confirm a slot",
 ///   measured from when this validator first created a bank for the slot.
 /// - `frozen_to_confirmed`: "time difference of bank freeze -- transaction
 ///   processing finished -- to slot marked confirmed". Confirmation is
 ///   driven by `OptimisticallyConfirmedBankTracker` aggregating cluster
-///   votes, a subsystem that runs independently of transaction execution --
-///   so this is not downstream replay latency, it's primarily
-///   vote-propagation/aggregation time.
+///   votes, a subsystem that runs independently of transaction execution.
+///   Do NOT assume this stage alone tells you "how much of the total is
+///   voting vs. replay" -- compare it against the directly-measured
+///   `created_bank_to_frozen` instead of subtracting percentiles.
 ///
 /// See `metrics/src/pipeline_latency.rs::SlotConfirmationLatencyTracker` and
 /// `ExecutedTxLatencyTracker::mark_bank_created` for exactly where each

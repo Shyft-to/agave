@@ -940,3 +940,55 @@ that's a genuine, currently-unexplained discrepancy worth investigating
 further -- possibly pointing at something in the tx-status/notify path we
 haven't caught, or a measurement issue specific to `executed_tx`'s own
 tracker.
+
+### Result (deployed and pulled, 2026-10-01): `first_shred_to_frozen` = 468.1ms -- tracks `executed_tx`, and a second percentile-subtraction error found
+
+`first_shred_to_frozen` p90 = 468,122us (468.1ms) -- closely tracks (and
+slightly exceeds, as expected: it's the last-tx-equivalent bound)
+`executed_tx`'s own p90 (~428-437ms across earlier pulls). **This resolves
+the contradiction cleanly: replay genuinely does take that long end-to-end,
+and `executed_tx`'s tail is explained by real slot replay time, not by
+anything hidden in the tx-status/notify path.**
+
+But this immediately created a SECOND contradiction with the earlier
+(invalid) `created_bank_to_frozen` estimate: `first_shred_to_frozen` (468.1ms)
+minus `first_shred_to_created_bank` (19.3ms, both now directly measured) begs
+`created_bank_to_frozen` to be ~449ms -- yet the earlier subtraction
+(`created_bank_to_confirmed` 461.6ms minus `frozen_to_confirmed` 441.9ms) had
+implied ~20ms for the exact same quantity. Two different subtraction-based
+estimates for one quantity, ~449ms vs. ~20ms, cannot both be right -- this is
+the same error as before (percentile subtraction across independently-
+computed histograms), now caught a second time via an independent route. The
+underlying **source metrics themselves** (`created_bank_to_confirmed`,
+`frozen_to_confirmed`, `first_shred_to_created_bank`, `first_shred_to_frozen`)
+are each individually valid, directly-measured per-slot quantities -- the
+mistake was ever subtracting two of them to infer a third that was never
+itself observed.
+
+**Fix: added `created_bank_to_frozen` as a direct measurement too**, closing
+the gap properly instead of composing it. `SlotConfirmationLatencyTracker`
+already stores both `created_bank` and `frozen` `Instant`s per slot
+(`metrics/src/pipeline_latency.rs`); `mark_frozen` now also computes
+`frozen.saturating_duration_since(created_bank)` -- a true per-slot
+`Instant`-to-`Instant` delta, not a percentile-level subtraction -- and
+observes it when both timestamps are present.
+
+Verification: `cargo check` on `solana-metrics`, `solana-geyser-plugin-manager`,
+`solana-core`, `agave-validator` bins, `solana-local-cluster` (`--features
+agave-unstable-api`) all clean. `solana-metrics::pipeline_latency` (2 new
+tests, 11 total) pass. Dashboard panel description rewritten to explain the
+full corrected picture and all five stages (now version 12). Not yet
+deployed/re-baselined.
+
+**What to look for once pulled:** compare `created_bank_to_frozen` directly
+against `frozen_to_confirmed`. Given `first_shred_to_frozen` (468.1ms) is
+already close to `first_shred_to_created_bank` (19.3ms) plus whatever
+`created_bank_to_frozen` turns out to be, expect `created_bank_to_frozen` to
+land close to 440-450ms -- i.e. replay/execution itself, not vote
+propagation, is almost certainly the dominant cost for this validator, the
+OPPOSITE of the earlier (retracted) "~96% vote propagation" conclusion. This
+would mean the real Phase 3-relevant lead for `executed_tx` is somewhere
+*inside* replay/execution for the whole slot (not any single stage already
+measured at a few-ms scale -- collect_entries, execute, commit are all
+small individually, so the cost must be in how many of them a slot requires,
+or in something not yet broken out per-slot).
