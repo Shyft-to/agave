@@ -1327,3 +1327,35 @@ do they converge back toward the original baseline (360.50/4934) over time,
 or hold steady at the current +18%/+74% level (which would indicate a
 standing cost, not a lingering catch-up tail). Same query set as the last
 two pulls.
+
+## Phase 3, hypothesis 6: disable replay-stage verification (TEMPORARY, UNSAFE experiment) (2026-10-12)
+
+Per explicit user request, after discussing what `collect_entries` measures
+(verify_ticks/PoH + transaction signature verification + account-lock
+validation + unified-scheduler dispatch) and flagging the risk: `skip_verification`
+is now hardcoded `true` in `core/src/replay_stage.rs::replay_blockstore_into_bank`
+(the live ReplayStage call site -- previously always `false`, unconditionally,
+with no CLI flag; the only other `skip_verification` caller in this codebase is
+`process_blockstore_from_root`'s *startup*, already-rooted-history replay, gated
+behind `--skip-startup-ledger-verification`, off by default).
+
+**This disables PoH tick verification and transaction signature verification on
+every live-replayed slot.** A malicious or buggy leader's invalid entry sequence,
+or a forged/unauthorized transaction, will be silently executed instead of
+rejected. **MUST NOT run against a real cluster (mainnet or a shared testnet) or
+on a staked/voting validator** -- isolated-node measurement only. A one-time
+`error!` log fires on first replay call to make this impossible to miss if the
+binary is ever run. Revert the single `true` back to `false`
+(`core/src/replay_stage.rs`, `replay_blockstore_into_bank`) before any other use.
+
+Purpose: measure `collect_entries`'s cost with verification removed, to isolate
+how much of its p50/p90/p99 is verification vs. the synchronous
+account-lock-validation + unified-scheduler-dispatch work that remains either way.
+
+Verification: `cargo check -p solana-core -p agave-validator --features agave-unstable-api` clean.
+
+**Not yet deployed/measured.** Next step: deploy to the isolated test node only,
+pull the same `agave_replay_stage_duration_us{stage="collect_entries"}` queries
+used in hypothesis 5, and compare against the steady-state numbers already
+recorded there (p50/p90/p99 = 505.73/1085.01/8603.50us) to see what fraction of
+that cost verification accounted for.
