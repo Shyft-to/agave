@@ -13,6 +13,7 @@ use {
             WriteBatch,
         },
         blockstore_meta::*,
+        decoded_entries_cache,
         blockstore_options::{
             BLOCKSTORE_DIRECTORY_ROCKS_LEVEL, BlockstoreOptions, LedgerColumnOptions,
         },
@@ -4968,6 +4969,59 @@ impl Blockstore {
             self.get_slot_components_in_block(slot, &completed_ranges, Some(&slot_meta))?;
         debug_assert_eq!(completed_ranges.len(), components.len());
         Ok((components, completed_ranges, slot_meta.is_full()))
+    }
+
+    /// Like [`Self::get_slot_components_with_shred_info`], but first checks
+    /// `decoded_entries_cache` for every completed range and, if all of them are
+    /// present, reuses those already-decoded entries instead of re-reading the
+    /// data shred payloads from RocksDB and re-deshredding/re-deserializing them
+    /// (see `decoded_entries_cache` module docs for who populates this and why).
+    ///
+    /// Any miss -- including a `BlockMarker` range, which the cache never
+    /// covers -- falls back to the exact `get_slot_components_in_block` call
+    /// `get_slot_components_with_shred_info` would have made, so this function
+    /// is behaviorally identical to it, just sometimes faster.
+    pub fn get_slot_components_with_shred_info_fast(
+        &self,
+        slot: Slot,
+        start_index: u64,
+        allow_dead_slots: bool,
+    ) -> Result<(Vec<BlockComponent>, Vec<Range<u32>>, bool)> {
+        let Some((completed_ranges, slot_meta, _)) =
+            self.get_slot_data_with_shred_info_common(slot, start_index, allow_dead_slots)?
+        else {
+            return Ok((vec![], vec![], false));
+        };
+
+        if let Some(entries_per_range) =
+            decoded_entries_cache::take_if_fully_cached(slot, &completed_ranges)
+        {
+            let components = entries_per_range
+                .into_iter()
+                .map(BlockComponent::EntryBatch)
+                .collect();
+            return Ok((components, completed_ranges, slot_meta.is_full()));
+        }
+
+        let components =
+            self.get_slot_components_in_block(slot, &completed_ranges, Some(&slot_meta))?;
+        debug_assert_eq!(completed_ranges.len(), components.len());
+        Ok((components, completed_ranges, slot_meta.is_full()))
+    }
+
+    /// Decodes a completed data set's entries directly from already-verified,
+    /// in-memory shred payloads (see `window_service::run_insert`'s
+    /// `ShredPayloadCache`), without touching RocksDB at all. Returns `None`
+    /// for a `BlockMarker` component (out of scope for the in-memory fast
+    /// path; `confirm_slot`'s normal RocksDB-backed path handles those) or on
+    /// any decode failure -- callers should treat `None` the same as "not
+    /// cached" and fall back to the normal read path.
+    pub fn decode_completed_data_set_from_payloads(payloads: Vec<Payload>) -> Option<Vec<Entry>> {
+        let buf = Shredder::deshred(payloads).ok()?;
+        match wincode::deserialize::<BlockComponent>(&buf).ok()? {
+            BlockComponent::EntryBatch(entries) => Some(entries),
+            BlockComponent::BlockMarker(_) => None,
+        }
     }
 
     /// Gets accounts used in transactions in the slot range [starting_slot, ending_slot].

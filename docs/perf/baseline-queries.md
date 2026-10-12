@@ -213,7 +213,25 @@ the last transaction in a block, independent of replay speed -- compare
 against `tx_pipeline`/`executed_tx`/`created_bank_to_frozen` to separate
 "shred propagation is slow" from "replay is slow."
 
-## 13. Host facts (not queries — note manually alongside the results above)
+## 13. Decoded-entries cache hit rate (Phase 3 hypothesis 5)
+
+```promql
+sum(rate(agave_decoded_entries_cache_total[1h])) by (outcome)
+histogram_quantile(0.5, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
+histogram_quantile(0.9, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
+histogram_quantile(0.99, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
+```
+
+`agave_decoded_entries_cache_total{outcome="hit"|"miss"}`: whether
+`confirm_slot`'s `read_blockstore` step found every completed range for its
+call already decoded in `window_service`'s in-memory shred-payload cache
+(`hit`, skips the RocksDB read-and-deshred entirely) or not (`miss`, falls
+back to the exact pre-change behavior). Read the hit rate together with
+`read_blockstore`: a high hit rate with no corresponding drop in that
+histogram's p50/p90/p99 vs. the "before" baseline (section 4) would mean the
+cache is being hit but isn't actually saving the time expected.
+
+## 14. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

@@ -22,6 +22,7 @@ use {
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
+        decoded_entries_cache::{self, DecodedCompletedDataSet},
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -31,7 +32,9 @@ use {
     solana_streamer::evicting_sender::EvictingSender,
     std::{
         borrow::Cow,
+        collections::{HashMap, VecDeque},
         net::UdpSocket,
+        ops::Range,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -216,6 +219,64 @@ fn run_check_duplicate(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A small, bounded, in-memory cache of recently-inserted data shred
+/// payloads, keyed by `(slot, index)`. Lets a just-completed data set's
+/// entries be decoded without reading its shred payloads back from RocksDB
+/// -- see `ledger::decoded_entries_cache` (the consumer side) for why this
+/// is purely a latency optimization, never relied on for correctness: any
+/// shred not found here just means the fast path isn't used for that data
+/// set, and `confirm_slot` falls back to its normal RocksDB-backed read.
+///
+/// Owned by the single `solWinInsert` thread (`run_insert` is called in a
+/// loop from that one thread only, see `start_window_insert_thread`), so no
+/// locking is needed here.
+struct ShredPayloadCache {
+    /// Slots currently cached, oldest first; bounds memory regardless of
+    /// per-slot shred counts. Normal operation should only ever need the
+    /// current and perhaps previous slot -- this is deliberately generous.
+    slots: VecDeque<Slot>,
+    max_slots: usize,
+    payloads: HashMap<Slot, HashMap<u32, shred::Payload>>,
+}
+
+impl ShredPayloadCache {
+    fn new(max_slots: usize) -> Self {
+        Self {
+            slots: VecDeque::with_capacity(max_slots),
+            max_slots,
+            payloads: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, slot: Slot, index: u32, payload: shred::Payload) {
+        if !self.payloads.contains_key(&slot) {
+            self.slots.push_back(slot);
+            self.payloads.insert(slot, HashMap::new());
+            while self.slots.len() > self.max_slots {
+                if let Some(oldest) = self.slots.pop_front() {
+                    self.payloads.remove(&oldest);
+                }
+            }
+        }
+        // `self.payloads` always has an entry for `slot` at this point, either
+        // from this call or an earlier one.
+        self.payloads.get_mut(&slot).unwrap().insert(index, payload);
+    }
+
+    /// Returns the raw wire bytes for `indices.start..indices.end`, in index
+    /// order, only if every one of them is present in the cache for `slot`.
+    /// `Payload`'s inner `Bytes` makes this a cheap refcount bump per shred,
+    /// not a copy.
+    fn get_contiguous(&self, slot: Slot, indices: &Range<u32>) -> Option<Vec<shred::Payload>> {
+        let slot_payloads = self.payloads.get(&slot)?;
+        indices
+            .clone()
+            .map(|index| slot_payloads.get(&index).cloned())
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_insert<'db, F>(
     thread_pool: &ThreadPool,
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
@@ -227,6 +288,8 @@ fn run_insert<'db, F>(
     metrics: &mut BlockstoreInsertionMetrics,
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
+    shred_payload_cache: &mut ShredPayloadCache,
+    decoded_entries_sender: &Sender<DecodedCompletedDataSet>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -251,7 +314,7 @@ where
         Some((Cow::Owned(shred), repair, block_location))
     };
     let now = Instant::now();
-    let shreds: Vec<_> = thread_pool.install(|| {
+    let shreds: Vec<(Cow<'_, Shred>, bool, BlockLocation)> = thread_pool.install(|| {
         shreds
             .into_par_iter()
             .with_min_len(32)
@@ -263,6 +326,19 @@ where
     solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
         .with_label_values(&["deserialize"])
         .observe(now.elapsed().as_micros() as f64);
+
+    // Cache data shred payloads before they're handed to the blockstore
+    // insertion call below (which consumes `shreds` by value), so that any
+    // data set completed by this call can potentially be decoded straight
+    // from memory afterwards -- see `ShredPayloadCache`. Kept outside the
+    // `store_start` timer: this is bookkeeping for a *different* stage
+    // (confirm_slot's read_blockstore, measured on the replay side), not
+    // part of the blockstore store cost this timer tracks.
+    for (shred, _repair, _block_location) in &shreds {
+        if shred.is_data() {
+            shred_payload_cache.insert(shred.slot(), shred.index(), shred.payload().clone());
+        }
+    }
 
     let store_start = Instant::now();
     let before_insert_shreds_us = metrics.insert_shreds_elapsed_us;
@@ -300,6 +376,26 @@ where
     blockstore_store_us
         .with_label_values(&["commit_working_sets"])
         .observe((metrics.commit_working_sets_elapsed_us - before_commit_working_sets_us) as f64);
+
+    // Opportunistically decode each just-completed data set straight from the
+    // shred payloads cached above, and hand it to `decoded_entries_cache` for
+    // ReplayStage to pick up -- skipped (not an error) whenever any of the
+    // set's shreds aren't in the cache (e.g. erasure-recovered, or inserted
+    // by an earlier call now evicted) or decoding fails for any reason; the
+    // existing RocksDB-backed path in `confirm_slot` is always the fallback.
+    for info in &completed_data_sets {
+        let Some(payloads) = shred_payload_cache.get_contiguous(info.slot, &info.indices) else {
+            continue;
+        };
+        let Some(entries) = Blockstore::decode_completed_data_set_from_payloads(payloads) else {
+            continue;
+        };
+        let _ = decoded_entries_sender.try_send(DecodedCompletedDataSet {
+            slot: info.slot,
+            indices: info.indices.clone(),
+            entries,
+        });
+    }
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;
@@ -488,6 +584,12 @@ impl WindowService {
                 );
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
                 let mut write_batch = blockstore.get_write_batch().unwrap();
+                // Bound of 16 slots is deliberately generous: normal operation only
+                // ever needs the current (and perhaps the just-previous) slot, since
+                // this cache exists only to let a just-completed data set skip the
+                // RocksDB round trip in confirm_slot (see ShredPayloadCache docs).
+                let mut shred_payload_cache = ShredPayloadCache::new(16);
+                let decoded_entries_sender = decoded_entries_cache::sender();
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
@@ -503,6 +605,8 @@ impl WindowService {
                         &mut metrics,
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
+                        &mut shred_payload_cache,
+                        &decoded_entries_sender,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e) {

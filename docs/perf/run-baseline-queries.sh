@@ -89,3 +89,9 @@ run "p99 tx_pipeline latency" "histogram_quantile(0.99, sum(rate(agave_end_to_en
 run "p50 shred arrival spread" "histogram_quantile(0.5, sum(rate(agave_shred_arrival_spread_us_bucket[$RANGE])) by (le))"
 run "p90 shred arrival spread" "histogram_quantile(0.9, sum(rate(agave_shred_arrival_spread_us_bucket[$RANGE])) by (le))"
 run "p99 shred arrival spread" "histogram_quantile(0.99, sum(rate(agave_shred_arrival_spread_us_bucket[$RANGE])) by (le))"
+
+echo "== 13. Decoded-entries cache hit rate =="
+run "decoded-entries cache outcome (hit vs miss)" "sum(rate(agave_decoded_entries_cache_total[$RANGE])) by (outcome)"
+run "p50 read_blockstore" "histogram_quantile(0.5, sum(rate(agave_replay_stage_duration_us_bucket{stage=\"read_blockstore\"}[$RANGE])) by (le))"
+run "p90 read_blockstore" "histogram_quantile(0.9, sum(rate(agave_replay_stage_duration_us_bucket{stage=\"read_blockstore\"}[$RANGE])) by (le))"
+run "p99 read_blockstore" "histogram_quantile(0.99, sum(rate(agave_replay_stage_duration_us_bucket{stage=\"read_blockstore\"}[$RANGE])) by (le))"

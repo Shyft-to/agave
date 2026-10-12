@@ -1137,3 +1137,124 @@ alone is already large (hundreds of ms), that reframes the ~389ms
 finish arriving (a turbine/network property), not pure replay/execution
 compute time, since `confirm_slot` can only process entries as their shreds
 arrive.
+
+## Phase 3, hypothesis 5: decouple blockstore write from replay wake (shred bypass) (2026-10-12)
+
+Rationale: today, `window_service::run_insert` writes verified/decoded shreds
+to RocksDB (`insert_shreds_at_location_handle_duplicate` -> `write_batch`),
+*then* signals ReplayStage (`send_signals`, only after the write commits,
+`ledger/src/blockstore.rs:6273`). ReplayStage wakes and immediately re-reads
+the same data back out of RocksDB (`confirm_slot`'s `read_blockstore` stage,
+`get_slot_components_with_shred_info`) before executing. Question: skip the
+round trip -- write to blockstore in the background, hand the already-decoded
+entries to ReplayStage directly.
+
+**Feasibility note (recorded before implementing):** the theoretical ceiling
+on this change, using the two metrics that already bracket the round trip
+(`agave_blockstore_store_duration_us{phase="total"}` and
+`agave_replay_stage_duration_us{stage="read_blockstore"}`), is small relative
+to `created_bank_to_frozen` (389ms p90, confirmed dominant cost, see above).
+Proceeding anyway per explicit user instruction, using these two existing
+metrics (rather than a new single direct-sampled metric) as the before/after
+signal -- note this means store-side and read-side are two independent
+before/after comparisons, not a single composed round-trip number (see the
+vote-latency retraction above for why composing two independently-sampled
+percentiles is invalid).
+
+**Before (deployed, live `promtool` pull, `[1h]` range, 2026-10-12):**
+
+| metric | p50 | p90 | p99 | throughput/sec |
+|---|---|---|---|---|
+| `agave_blockstore_store_duration_us{phase="total"}` | 134.16 | 451.70 | 924.04 | 439.3 |
+| `agave_replay_stage_duration_us{stage="read_blockstore"}` | 54.25 | 147.40 | 360.50 | 155.9 |
+
+Queries used (`docs/perf/baseline-queries.md` style):
+```promql
+histogram_quantile(0.5, sum(rate(agave_blockstore_store_duration_us_bucket{phase="total"}[1h])) by (le))
+histogram_quantile(0.9, sum(rate(agave_blockstore_store_duration_us_bucket{phase="total"}[1h])) by (le))
+histogram_quantile(0.99, sum(rate(agave_blockstore_store_duration_us_bucket{phase="total"}[1h])) by (le))
+sum(rate(agave_blockstore_store_duration_us_count{phase="total"}[1h]))
+histogram_quantile(0.5, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
+histogram_quantile(0.9, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
+histogram_quantile(0.99, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
+sum(rate(agave_replay_stage_duration_us_count{stage="read_blockstore"}[1h]))
+```
+
+**Implementation (2026-10-12):** scoped, per user decision, to the full
+in-memory bypass (no new metric; no change to blockstore's write-before-signal
+ordering -- that half, which would need a durability-before-vote redesign to
+stay crash-safe, is explicitly NOT done here).
+
+- `core/src/window_service.rs`: new `ShredPayloadCache` -- a small,
+  slot-bounded (16 slots) `HashMap<Slot, HashMap<u32, shred::Payload>>`, owned
+  solely by the single `solWinInsert` thread (confirmed via
+  `start_window_insert_thread`: `run_insert` is called in a loop from one OS
+  thread; the `rayon` thread_pool inside it only parallelizes shred
+  deserialization, not insertion), so no locking needed for the cache itself.
+  `run_insert` populates it with every data shred's payload (`Payload`'s inner
+  `Bytes` makes this a refcount bump, not a copy) right before the existing
+  `insert_shreds_at_location_handle_duplicate` call (which consumes the shred
+  Vec), then after that call returns, for each `CompletedDataSetInfo` tries to
+  pull a contiguous run of payloads for its exact index range out of the
+  cache and decode it.
+- `ledger/src/blockstore.rs`: new `Blockstore::decode_completed_data_set_from_payloads`
+  (`Shredder::deshred` + `wincode::deserialize::<BlockComponent>`, reusing the
+  exact decode logic `get_slot_components_in_block` already uses, just fed
+  from in-memory payloads instead of a RocksDB read) -- returns `None` for a
+  `BlockMarker` component (out of scope; `confirm_slot`'s normal path still
+  handles those) or any decode failure.
+- `ledger/src/decoded_entries_cache.rs` (new file): the single hand-off point
+  between window_service and ReplayStage. A process-global
+  `Mutex<HashMap<(Slot, u32), Vec<Entry>>>` plus an `unbounded` channel;
+  `sender()` for window_service to push `DecodedCompletedDataSet{slot, indices,
+  entries}` on, `take_if_fully_cached(slot, ranges)` (crate-internal) for
+  `confirm_slot`'s read path. **All-or-nothing by design**: a hit requires
+  every range in the call to be cached, because `get_slot_components_in_block`'s
+  RocksDB batching assumes the ranges it's given are contiguous (one
+  `multi_get` spanning first.start..last.end, walked sequentially) -- splicing
+  a partial hit into an otherwise-RocksDB-backed read would misattribute shred
+  indices. Any miss leaves the cache untouched and the caller falls back to
+  the exact pre-existing RocksDB path. Bounded at 4096 cached data sets
+  (oldest evicted) as a hard ceiling if replay ever stalls for a long period.
+- `ledger/src/blockstore.rs`: new `Blockstore::get_slot_components_with_shred_info_fast`,
+  behaviorally identical to `get_slot_components_with_shred_info` (same
+  metadata lookup via `get_slot_data_with_shred_info_common`) except it tries
+  `decoded_entries_cache::take_if_fully_cached` before the RocksDB-backed
+  `get_slot_components_in_block` call. `blockstore_processor.rs::confirm_slot`
+  now calls this instead of the original -- the only change to `confirm_slot`
+  itself is that one call-site swap; `read_blockstore`'s existing timer wraps
+  it exactly as before, so it's the direct before/after signal.
+- `metrics/src/pipeline_metrics.rs`: new `agave_decoded_entries_cache_total{outcome="hit"|"miss"}`
+  (IntCounterVec) -- without this, a flat `read_blockstore` number after
+  deploying would be ambiguous (cache not helping vs. cache never hitting).
+- Dashboard/query files updated to match: `docs/perf/baseline-queries.md`
+  section 13 (bumped host-facts to 14), `run-baseline-queries.sh` section 13.
+- Deliberately NOT changed: blockstore's write-before-signal ordering (no
+  durability/crash-safety change), `WindowServiceChannels`, `tvu.rs`,
+  `validator.rs`, `ReplayStageConfig`, `ProcessActiveBanksContext` -- the
+  channel is a process-global pair (`decoded_entries_cache::sender()`/internal
+  receiver), not threaded through the validator's wiring, keeping this change
+  isolated to three files plus the one metric.
+
+**Verification:**
+- `cargo check -p solana-ledger -p solana-core -p agave-validator --features agave-unstable-api`: clean.
+- `cargo clippy -p solana-ledger -p solana-core -p solana-metrics --features agave-unstable-api --no-deps`:
+  clean (one `too_many_arguments` warning on `run_insert`, now at 12 params --
+  `#[allow(clippy::too_many_arguments)]` added, matching existing precedent
+  elsewhere in this codebase, e.g. `confirm_slot_entries`).
+- New tests, `solana-ledger::decoded_entries_cache` (3/3): full-hit decodes
+  and removes every range; partial-hit returns `None` and leaves the cache
+  untouched (verified by a follow-up full hit on just the cached range);
+  no-hit-at-all returns `None`.
+- Existing suites unaffected: `solana-core::window_service` (4/4),
+  `solana-core::completed_data_sets_service` (10/10),
+  `solana-ledger::blockstore::tests` (125/125),
+  `solana-ledger::blockstore_processor` (57/57, 1 pre-existing ignore, same
+  count as the pre-change baseline run) -- all pass unchanged.
+- Not yet deployed/re-baselined. **Next step**: deploy, pull section 13's
+  queries (`agave_decoded_entries_cache_total` hit/miss rate +
+  `read_blockstore` p50/p90/p99), and compare against this entry's "before"
+  numbers (134/452/924us store-side is unaffected by this change and not
+  expected to move; 54/147/361us read_blockstore p50/p90/p99 is the number to
+  watch, expected to drop toward the no-cost "hit" floor in proportion to the
+  hit rate).

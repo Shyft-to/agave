@@ -261,3 +261,20 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["path"],
     )
 });
+
+/// Phase 3, hypothesis 5 (docs/perf/shred-to-geyser-prometheus-plan.md):
+/// whether `confirm_slot`'s `read_blockstore` step found every completed
+/// range for its call already decoded in `ledger::decoded_entries_cache`
+/// (populated by `window_service::run_insert`'s in-memory shred-payload
+/// cache) -- "hit" skips the RocksDB read-and-deshred entirely, "miss" falls
+/// back to the normal path, functionally identical to before this change.
+/// Read together with `agave_replay_stage_duration_us{stage="read_blockstore"}`:
+/// a high hit rate with no corresponding drop in that histogram would mean
+/// the cache is being hit but isn't actually saving the time expected.
+pub static DECODED_ENTRIES_CACHE_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_decoded_entries_cache_total",
+        "Whether confirm_slot's read_blockstore step found a fully in-memory-cached decode",
+        &["outcome"],
+    )
+});
