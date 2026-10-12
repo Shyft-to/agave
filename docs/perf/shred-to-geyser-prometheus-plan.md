@@ -1258,3 +1258,72 @@ stay crash-safe, is explicitly NOT done here).
   expected to move; 54/147/361us read_blockstore p50/p90/p99 is the number to
   watch, expected to drop toward the no-cost "hit" floor in proportion to the
   hit rate).
+
+**First redeploy pull (2026-10-12, during active replay catch-up -- misleading):**
+`read_blockstore` p50/p90/p99 = 50.24/151.65/1666.71us (p99 4.6x worse than
+before), `collect_entries` p99 = 36769.45us (7.5x worse than before's 4934),
+hit/miss rate (of real decode attempts) ~40%. Root-caused to lock contention:
+`decoded_entries_cache`'s single global `Mutex<HashMap>` is taken on every
+real attempt across every concurrent `solReplayFork` thread, drains the
+whole channel backlog inside the lock, and runs an O(n log n) eviction sort
+inline once over 4096 entries -- during active catch-up (many confirm_slot
+calls firing back-to-back across forks, replay not yet draining as fast as
+window_service produces), this is exactly the shape of a lock-contention
+spike. User correctly identified the validator was still catching up when
+this was pulled.
+
+**Second pull, 30 minutes later, steady state (2026-10-12):**
+
+| metric | before (hypothesis 5) | during catch-up | steady state |
+|---|---|---|---|
+| `read_blockstore` p50 | 54.25 | 50.24 | **7.36** |
+| `read_blockstore` p90 | 147.40 | 151.65 | **137.94** |
+| `read_blockstore` p99 | 360.50 | 1666.71 | 424.56 |
+| `collect_entries` p50 | 597 | 519.44 | 505.73 |
+| `collect_entries` p90 | 1194 | 1214.47 | 1085.01 |
+| `collect_entries` p99 | 4934 | 36769.45 | 8603.50 |
+| hit rate (of real attempts) | -- | ~40% | ~45% |
+| `blockstore_store{total}` p50/p90/p99 (untouched -- noise floor) | 134/452/924 | 135/472/990 | 132/446/913 |
+
+**Conclusion: the catch-up hypothesis is confirmed, and at steady state this
+is a real win on the targeted metric** -- `read_blockstore` p50 dropped 86%
+(54.25us -> 7.36us), p90 improved ~6%, consistent with ~45% of real attempts
+now being a near-free cache hit. The untouched `blockstore_store` sanity
+check moved <2% between pulls, establishing the real noise floor.
+
+**But a smaller residual tail cost remains, not fully explained by catch-up
+alone:** `read_blockstore` p99 is still +18% over the original baseline
+(360.50 -> 424.56), and `collect_entries` p99 -- a stage this change doesn't
+even touch directly -- is still +74% (4934 -> 8603.50), both far below the
+catch-up spike but clearly above the <2% noise floor. With only a ~45% hit
+rate, the other ~55% of decoded entries window_service produces are never
+consumed and continue to flow through the same global-mutex drain+eviction
+path every real attempt pays for, win or not -- plausible that this is an
+*ongoing*, lower-level version of the same contention mechanism, not purely
+a one-time catch-up artifact.
+
+**Known data-quality issue:** the "replay stage duration, throughput by
+stage" query produced bit-identical values across semantically unrelated
+stages (`commit`/`execute`/`tx_status_queue_wait` all exactly
+5032.964574616458, twice, in two separate pulls) -- almost certainly a
+terminal-wrap/paste artifact, not real data. Not used in the table above;
+re-run that one query in isolation if per-stage throughput is needed.
+
+**Next step (not yet decided):** reduce the residual contention -- shard the
+cache's lock (e.g. by `slot % N`), bound the channel so a lagging consumer
+can't let it grow unboundedly, and move the eviction sort off the
+lock-held hot path -- then re-pull to see whether the remaining +18%/+74%
+tail cost disappears too, or keep the current steady-state result as net
+positive given the clear p50/p90 win. `created_bank_to_frozen` p90 continues
+to not improve (389 -> 448 -> 456ms across the three pulls), consistent with
+the standing conclusion that this metric is dominated by tail-sum-of-execute
+/ workload effects unrelated to this change, not evidence against it.
+
+**Decision (2026-10-12):** rather than fix-or-keep off two data points (30 min
+apart), let it run longer and re-pull before deciding. Watch, in order of
+priority: (1) hit rate trend -- does it climb above ~45% as things settle
+further, or plateau; (2) `read_blockstore` p99 and `collect_entries` p99 --
+do they converge back toward the original baseline (360.50/4934) over time,
+or hold steady at the current +18%/+74% level (which would indicate a
+standing cost, not a lingering catch-up tail). Same query set as the last
+two pulls.
