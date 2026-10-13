@@ -28,6 +28,17 @@
 //! cache's effective window and measurably hurt the hit rate in production
 //! (~45% -> ~21% at steady state) before being caught and reverted; see the
 //! plan doc's "hypothesis 5" section for the numbers.
+//!
+//! A second bug, caught right after fixing the first one, kept the hit rate
+//! flat at ~22% even once eviction was decoupled: `BoundedCache::insert`'s
+//! `insertion_order` queue grew on every call, including ones that only
+//! overwrote an already-present key (the same `(slot, start_index)` decoded
+//! and inserted more than once before replay consumed it). That inflated
+//! `order.len()` past the `DashMap`'s real distinct-key count, so the
+//! eviction loop fired far more often than the `cap` intended -- including
+//! evicting entries that had just been refreshed. Fixed by only pushing to
+//! `insertion_order` when the key is genuinely new (`DashMap::insert`
+//! returned `None`).
 
 use {
     dashmap::DashMap,
@@ -69,7 +80,17 @@ impl BoundedCache {
     }
 
     fn insert(&self, key: (Slot, u32), entries: Vec<Entry>) {
-        self.cache.insert(key, entries);
+        // Only a genuinely new key grows `insertion_order`. Without this
+        // check, re-inserting an already-present key (overwriting its value)
+        // would push a second order entry for the same key, inflating
+        // `order.len()` past the `DashMap`'s actual distinct-key count and
+        // making the eviction loop below evict far more aggressively than
+        // the `cap` intends -- including entries that were just refreshed.
+        // This is exactly what happened in production: see the module docs.
+        let is_new_key = self.cache.insert(key, entries).is_none();
+        if !is_new_key {
+            return;
+        }
         let mut order = self.insertion_order.lock().unwrap();
         order.push_back(key);
         while order.len() > self.cap {
@@ -198,5 +219,34 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn reinserting_same_key_does_not_inflate_eviction_accounting() {
+        // Regression test for the second bug described in the module docs:
+        // re-inserting an already-present key (e.g. a completed data set
+        // decoded and cached more than once before replay consumes it) must
+        // not count as a second entry toward `cap`, or genuinely distinct,
+        // still-unconsumed entries get evicted early. Uses its own isolated
+        // `BoundedCache`, same reasoning as the test above.
+        let base_slot = 30_000;
+        let cap = 4;
+        let cache = BoundedCache::new(cap);
+        for i in 0..cap {
+            cache.insert((base_slot + i as u64, 0), vec![entry(i as u64)]);
+        }
+        // Re-insert the very first key again. If this wrongly grew the
+        // order queue, the next genuinely-new insert below would evict two
+        // entries instead of one.
+        cache.insert((base_slot, 0), vec![entry(100)]);
+        cache.insert((base_slot + cap as u64, 0), vec![entry(99)]);
+
+        // The second-oldest key must still be present -- only the oldest
+        // (`base_slot`, now refreshed) should have been evicted, not it too.
+        assert!(
+            cache
+                .take_if_fully_cached(base_slot + 1, &[0..1])
+                .is_some()
+        );
     }
 }

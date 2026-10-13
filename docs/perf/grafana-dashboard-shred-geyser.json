@@ -99,7 +99,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -310,7 +310,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -719,7 +719,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -930,7 +930,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -1141,7 +1141,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -1352,7 +1352,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -1563,7 +1563,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -1662,7 +1662,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -1774,7 +1774,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -1985,7 +1985,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -2308,7 +2308,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -2420,7 +2420,7 @@
               }
             ]
           },
-          "unit": "µs"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -2448,6 +2448,217 @@
           },
           "expr": "histogram_quantile($percentile, sum(rate(agave_shred_arrival_spread_us_bucket[$__rate_interval])) by (le))",
           "legendFormat": "arrival spread",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "row",
+      "title": "Collect Entries Breakdown (added after noting ~1ms p90 on the collect_entries stage)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 116
+      },
+      "panels": []
+    },
+    {
+      "id": 37,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 117
+      },
+      "type": "timeseries",
+      "title": "Collect Entries Phase Duration ($percentile)",
+      "description": "What it tracks: a finer breakdown of the 'collect_entries' stage in the Replay Stage Duration panel. Unlike the Execute Phase panels, these are direct Instant-to-Instant timers at each sub-step's call site (collect_entries had no pre-existing cumulative-counters struct granular enough to reuse).\n\nphase=tx_pipeline_mark: recording each tx's pipeline-start timestamp for agave_end_to_end_duration_us{path=\"tx_pipeline\"}. on_entry_batch: BlockComponentProcessor::on_entry_batch. entry_bookkeeping: building per-entry tx-starting-indexes and sending EntryNotification::Entry if a plugin is registered. verify_ticks: synchronous PoH tick-count/hash-chain shape check. spawn_poh_verification / spawn_signature_verification: dispatch overhead only for handing work to ReplayVerificationWorkerPool -- NOT the actual async verify time. validate_and_hash_transactions: synchronous message-hash validation. process_entries: handing entries to the bank/scheduler for execution -- the single biggest expected contributor. collect_verification_results: non-blocking drain of already-finished async results, expected to stay near zero. wait_for_completed_scheduler / on_marker: BlockMarker-arm costs, included because they run inside the same timed region as agave_replay_stage_duration_us{stage=\"collect_entries\"}.\n\nWhy this was added: collect_entries showed ~1ms at p90 as a single number, not broken down further. This panel exists to see which sub-step actually drives that, rather than guessing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "\u00b5s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile($percentile, sum(rate(agave_collect_entries_phase_duration_us_bucket[$__rate_interval])) by (le, phase))",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "instant": false,
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 117
+      },
+      "type": "timeseries",
+      "title": "Collect Entries Phase Throughput",
+      "description": "What it tracks: invocation rate per second per phase label above (derived from each histogram's _count). tx_pipeline_mark/on_entry_batch/entry_bookkeeping/verify_ticks/spawn_poh_verification/validate_and_hash_transactions/spawn_signature_verification/process_entries/collect_verification_results fire once per EntryBatch component; wait_for_completed_scheduler/on_marker fire once per BlockMarker component -- the two groups' rates are not directly comparable to each other for that reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(agave_collect_entries_phase_duration_us_count[$__rate_interval])) by (phase)",
+          "legendFormat": "{{phase}}",
           "range": true,
           "instant": false,
           "editorMode": "code",
@@ -2525,9 +2736,9 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Agave Shred → Geyser Latency",
+  "title": "Agave Shred \u2192 Geyser Latency",
   "description": "Prometheus-backed dashboard for docs/perf/shred-to-geyser-prometheus-plan.md. Requires a Prometheus datasource scraping the validator's --metrics-listen-address /metrics endpoint.",
   "uid": "agave-shred-geyser-latency",
-  "version": 13,
+  "version": 14,
   "weekStart": ""
 }

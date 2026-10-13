@@ -262,6 +262,46 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     )
 });
 
+/// Fine-grained breakdown of the `collect_entries` stage above (observed
+/// p90 ~1ms), labeled by `phase`. Unlike `EXECUTE_PHASE_DURATION_US`, these
+/// are NOT derived from a pre-existing cumulative counters struct --
+/// `collect_entries` had no such struct granular enough -- so each phase is
+/// its own direct `Instant`-to-`Instant` timer at the call site:
+///
+/// - `tx_pipeline_mark`: recording each transaction's pipeline-start
+///   timestamp for `agave_end_to_end_duration_us{path="tx_pipeline"}`.
+/// - `on_entry_batch`: `BlockComponentProcessor::on_entry_batch`.
+/// - `entry_bookkeeping`: building per-entry tx-starting-indexes and, if a
+///   plugin is registered, sending `EntryNotification::Entry`.
+/// - `verify_ticks`: synchronous PoH tick-count/hash-chain shape check
+///   (not the full PoH verify itself -- see `spawn_poh_verification`).
+/// - `spawn_poh_verification` / `spawn_signature_verification`: cost of
+///   building the job and handing it to `ReplayVerificationWorkerPool` --
+///   dispatch overhead only, NOT the actual verification time (that runs
+///   asynchronously on worker threads and is folded into
+///   `ConfirmationTiming::{poh,transaction}_verify_elapsed`, still reported
+///   only through the legacy datapoint path as of this writing).
+/// - `validate_and_hash_transactions`: synchronous message-hash validation
+///   (`TransactionVerificationMode::HashOnly`) on the calling thread.
+/// - `process_entries`: handing entries to the bank/scheduler for
+///   execution -- reuses the same timer already kept in
+///   `ConfirmationTiming::replay_elapsed`, just also observed here. The
+///   single biggest expected contributor.
+/// - `collect_verification_results`: non-blocking drain of already-finished
+///   async verification results (`try_recv`); expected to stay near zero --
+///   a nonzero value here would mean something upstream changed this from
+///   non-blocking to blocking.
+/// - `wait_for_completed_scheduler` / `on_marker`: the `BlockMarker` arm's
+///   own costs, included because they run inside the same timed region as
+///   `REPLAY_STAGE_DURATION_US{stage="collect_entries"}`.
+pub static COLLECT_ENTRIES_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_collect_entries_phase_duration_us",
+        "Fine-grained breakdown of the collect_entries replay stage, in microseconds",
+        &["phase"],
+    )
+});
+
 /// Phase 3, hypothesis 5 (docs/perf/shred-to-geyser-prometheus-plan.md):
 /// whether `confirm_slot`'s `read_blockstore` step found every completed
 /// range for its call already decoded in `ledger::decoded_entries_cache`

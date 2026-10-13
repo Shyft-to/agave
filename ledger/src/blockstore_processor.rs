@@ -1442,6 +1442,7 @@ pub fn confirm_slot(
                 // set's starting shred index, matching the fec_set_index
                 // convention used elsewhere in this plan (see
                 // docs/perf/shred-to-geyser-prometheus-plan.md).
+                let tx_pipeline_mark_start = std::time::Instant::now();
                 for entry in &entries {
                     for tx in &entry.transactions {
                         if let Some(signature) = tx.signatures.first() {
@@ -1454,19 +1455,27 @@ pub fn confirm_slot(
                         }
                     }
                 }
+                solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+                    .with_label_values(&["tx_pipeline_mark"])
+                    .observe(tx_pipeline_mark_start.elapsed().as_micros() as f64);
 
                 // Skip block component validation for genesis block. Slot 0 is handled specially,
                 // since it won't have the required block markers.
-                if slot != 0 {
-                    processor
-                        .on_entry_batch(migration_status, slot, &entries, is_final)
-                        .inspect_err(|err| {
-                            warn!(
-                                "BlockComponentProcessor::on_entry_batch() for slot {slot} failed \
-                                 with {err}"
-                            );
-                        })?;
-                }
+                let on_entry_batch_start = std::time::Instant::now();
+                let on_entry_batch_result = if slot != 0 {
+                    processor.on_entry_batch(migration_status, slot, &entries, is_final)
+                } else {
+                    Ok(())
+                };
+                solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+                    .with_label_values(&["on_entry_batch"])
+                    .observe(on_entry_batch_start.elapsed().as_micros() as f64);
+                on_entry_batch_result.inspect_err(|err| {
+                    warn!(
+                        "BlockComponentProcessor::on_entry_batch() for slot {slot} failed with \
+                         {err}"
+                    );
+                })?;
 
                 confirm_slot_entries(
                     bank,
@@ -1487,7 +1496,12 @@ pub fn confirm_slot(
                 if block_footer.is_some() {
                     // The footer path mutates vote accounts directly to pay rewards.
                     // All prior transactions must finish first so vote account view is deterministic.
-                    if let Some((result, execute_time)) = bank.wait_for_completed_scheduler() {
+                    let wait_for_completed_scheduler_start = std::time::Instant::now();
+                    let completed = bank.wait_for_completed_scheduler();
+                    solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+                        .with_label_values(&["wait_for_completed_scheduler"])
+                        .observe(wait_for_completed_scheduler_start.elapsed().as_micros() as f64);
+                    if let Some((result, execute_time)) = completed {
                         timing.batch_execute.totals.accumulate(&execute_time);
                         result?;
                     }
@@ -1495,28 +1509,31 @@ pub fn confirm_slot(
                 if let Some(parent_bank) = bank.parent() {
                     let allow_initial_update_parent =
                         replay_starts_at_update_parent && marker.is_update_parent();
-                    processor
-                        .on_marker(
-                            bank.clone_without_scheduler(),
-                            parent_bank,
-                            shred_version,
-                            marker,
-                            allow_initial_update_parent,
-                            finalization_cert_sender,
-                            migration_status,
-                        )
-                        .inspect_err(|err| {
-                            if !matches!(
-                                err,
-                                BlockComponentProcessorError::AbandonedBank(_)
-                                    | BlockComponentProcessorError::AlpenglowMigrationTransition
-                            ) {
-                                warn!(
-                                    "BlockComponentProcessor::on_marker() for slot {slot} failed \
-                                     with {err}"
-                                );
-                            }
-                        })?;
+                    let on_marker_start = std::time::Instant::now();
+                    let on_marker_result = processor.on_marker(
+                        bank.clone_without_scheduler(),
+                        parent_bank,
+                        shred_version,
+                        marker,
+                        allow_initial_update_parent,
+                        finalization_cert_sender,
+                        migration_status,
+                    );
+                    solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+                        .with_label_values(&["on_marker"])
+                        .observe(on_marker_start.elapsed().as_micros() as f64);
+                    on_marker_result.inspect_err(|err| {
+                        if !matches!(
+                            err,
+                            BlockComponentProcessorError::AbandonedBank(_)
+                                | BlockComponentProcessorError::AlpenglowMigrationTransition
+                        ) {
+                            warn!(
+                                "BlockComponentProcessor::on_marker() for slot {slot} failed with \
+                                 {err}"
+                            );
+                        }
+                    })?;
                     if let Some(block_footer) = block_footer
                         && let Some(entry_notification_sender) = entry_notification_sender
                         && let Err(err) =
@@ -1584,6 +1601,7 @@ fn confirm_slot_entries(
     let num_entries = entries.len();
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index = progress.num_txs;
+    let entry_bookkeeping_start = std::time::Instant::now();
     let num_txs = entries
         .iter()
         .enumerate()
@@ -1610,14 +1628,23 @@ fn confirm_slot_entries(
             num_txs
         })
         .sum::<usize>();
+    solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+        .with_label_values(&["entry_bookkeeping"])
+        .observe(entry_bookkeeping_start.elapsed().as_micros() as f64);
     trace!(
         "Fetched entries for slot {slot}, num_entries: {num_entries}, num_shreds: {num_shreds}, \
          num_txs: {num_txs}, slot_full: {slot_full}",
     );
 
     if !skip_verification {
+        let verify_ticks_start = std::time::Instant::now();
         let tick_hash_count = &mut progress.tick_hash_count;
-        verify_ticks(bank, &entries, slot_full, tick_hash_count, migration_status).map_err(
+        let verify_ticks_result =
+            verify_ticks(bank, &entries, slot_full, tick_hash_count, migration_status);
+        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+            .with_label_values(&["verify_ticks"])
+            .observe(verify_ticks_start.elapsed().as_micros() as f64);
+        verify_ticks_result.map_err(
             |err| {
                 warn!(
                     "{:#?}, slot: {}, entry len: {}, tick_height: {}, last entry: {}, \
@@ -1638,20 +1665,25 @@ fn confirm_slot_entries(
 
     let last_entry_hash = entries.last().map(|e| e.hash);
     if !skip_verification {
+        let spawn_poh_verification_start = std::time::Instant::now();
         let start_hash = progress.last_entry;
         let verify_entries = entry::entries_to_verification_data(&entries);
         datapoint_debug!(
             "verify-batch-size",
             ("size", verify_entries.len() as i64, i64)
         );
-        progress
+        let result = progress
             .async_verification(replay_verification_worker_pool)
             .spawn_poh_verification(
                 replay_verification_worker_pool,
                 verify_entries,
                 start_hash,
                 slot,
-            )?;
+            );
+        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+            .with_label_values(&["spawn_poh_verification"])
+            .observe(spawn_poh_verification_start.elapsed().as_micros() as f64);
+        result?;
     }
 
     let validate_and_hash_transaction = {
@@ -1665,15 +1697,20 @@ fn confirm_slot_entries(
         }
     };
 
-    let entry::ValidatedHashedTransactions {
-        entries,
-        unverified_signatures,
-    } = match entry::validate_and_hash_transactions(
+    let validate_and_hash_transactions_start = std::time::Instant::now();
+    let validate_and_hash_result = entry::validate_and_hash_transactions(
         entries,
         num_txs,
         transaction_hash_verify_thread_pool(),
         validate_and_hash_transaction,
-    ) {
+    );
+    solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+        .with_label_values(&["validate_and_hash_transactions"])
+        .observe(validate_and_hash_transactions_start.elapsed().as_micros() as f64);
+    let entry::ValidatedHashedTransactions {
+        entries,
+        unverified_signatures,
+    } = match validate_and_hash_result {
         Ok(txs) => txs,
         Err(err) => {
             warn!(
@@ -1696,8 +1733,9 @@ fn confirm_slot_entries(
             }
         }
     } else {
+        let spawn_signature_verification_start = std::time::Instant::now();
         let replay_vote_sender = replay_vote_sender.cloned();
-        progress
+        let result = progress
             .async_verification(replay_verification_worker_pool)
             .spawn_signature_verification(
                 replay_verification_worker_pool,
@@ -1705,7 +1743,11 @@ fn confirm_slot_entries(
                 slot,
                 bank_id,
                 replay_vote_sender,
-            )?;
+            );
+        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+            .with_label_values(&["spawn_signature_verification"])
+            .observe(spawn_signature_verification_start.elapsed().as_micros() as f64);
+        result?;
     }
 
     let mut replay_timer = Measure::start("replay_elapsed");
@@ -1742,10 +1784,18 @@ fn confirm_slot_entries(
         process_entries(bank, replay_entries).map_err(BlockstoreProcessorError::from);
     replay_timer.stop();
     *replay_elapsed += replay_timer.as_us();
+    solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+        .with_label_values(&["process_entries"])
+        .observe(replay_timer.as_us() as f64);
 
     process_result?;
-    progress
-        .collect_available_verification_results(poh_verify_elapsed, transaction_verify_elapsed)?;
+    let collect_verification_results_start = std::time::Instant::now();
+    let verification_results = progress
+        .collect_available_verification_results(poh_verify_elapsed, transaction_verify_elapsed);
+    solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+        .with_label_values(&["collect_verification_results"])
+        .observe(collect_verification_results_start.elapsed().as_micros() as f64);
+    verification_results?;
 
     progress.num_shreds += num_shreds;
     progress.num_entries += num_entries;

@@ -231,7 +231,32 @@ back to the exact pre-change behavior). Read the hit rate together with
 histogram's p50/p90/p99 vs. the "before" baseline (section 4) would mean the
 cache is being hit but isn't actually saving the time expected.
 
-## 14. Host facts (not queries — note manually alongside the results above)
+## 14. Collect-entries phase breakdown (added after noting ~1ms p90 on collect_entries)
+
+```promql
+histogram_quantile(0.5, sum(rate(agave_collect_entries_phase_duration_us_bucket[1h])) by (le, phase))
+histogram_quantile(0.9, sum(rate(agave_collect_entries_phase_duration_us_bucket[1h])) by (le, phase))
+histogram_quantile(0.99, sum(rate(agave_collect_entries_phase_duration_us_bucket[1h])) by (le, phase))
+sum(rate(agave_collect_entries_phase_duration_us_count[1h])) by (phase)
+```
+
+Fine-grained breakdown of the `collect_entries` stage in section 4, labeled by
+`phase`: `tx_pipeline_mark`, `on_entry_batch`, `entry_bookkeeping`,
+`verify_ticks`, `spawn_poh_verification`, `validate_and_hash_transactions`,
+`spawn_signature_verification`, `process_entries`,
+`collect_verification_results` (one per `EntryBatch` component), plus
+`wait_for_completed_scheduler` and `on_marker` (one per `BlockMarker`
+component instead, so their rate isn't directly comparable to the others).
+Each is a direct `Instant`-to-`Instant` timer at its call site in
+`blockstore_processor.rs` (`confirm_slot`/`confirm_slot_entries`) --
+`process_entries` is expected to be the single biggest contributor (it hands
+entries to the bank/scheduler for execution); `spawn_poh_verification` and
+`spawn_signature_verification` measure only the dispatch overhead of handing
+work to `ReplayVerificationWorkerPool`, not the actual async verification
+time; `collect_verification_results` is a non-blocking drain and should stay
+near zero.
+
+## 15. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

@@ -399,12 +399,17 @@ pub struct Blockstore {
     /// Write-through, in-memory mirror of `dead_slots_cf`: every
     /// `set_dead_slot` call inserts here in the same call, so `is_dead` can
     /// skip the RocksDB round trip for any slot this process has itself
-    /// marked dead. Since a slot is never un-marked dead (no
-    /// `clear_dead_slot` exists), a hit here is always correct; a miss falls
-    /// back to RocksDB, which stays authoritative for slots marked dead
-    /// before this process started. Unbounded, but bounded in practice by
-    /// how many slots are ever marked dead across this process's lifetime --
-    /// a vanishingly small fraction of all slots.
+    /// marked dead. A miss falls back to RocksDB, which stays authoritative
+    /// for slots marked dead before this process started (and backfills the
+    /// cache on that fallback). `remove_dead_slot` -- the one place that
+    /// un-marks a slot as dead (e.g. Alpenglow genesis cleanup repurposing a
+    /// provisionally-dead slot) -- MUST also remove from here, or `is_dead`
+    /// would keep returning `true` from a stale entry after `dead_slots_cf`
+    /// itself was cleared; this was caught by
+    /// `test_cleanup_alpenglow_genesis_cleans_pending_slots` failing once
+    /// this cache was introduced. Unbounded, but bounded in practice by how
+    /// many slots are ever marked dead across this process's lifetime -- a
+    /// vanishingly small fraction of all slots.
     dead_slots_cache: DashSet<Slot>,
     certificate_forwarder: OnceLock<CertificateForwarder>,
     pub lowest_cleanup_slot: RwLock<Slot>,
@@ -5450,6 +5455,14 @@ impl Blockstore {
     }
 
     pub fn remove_dead_slot(&self, slot: Slot) -> Result<()> {
+        // `dead_slots_cache` must be invalidated here too, or `is_dead` keeps
+        // returning `true` for this slot from the stale cache entry even
+        // after RocksDB's `dead_slots_cf` is cleared below -- this function
+        // is the one place that un-marks a slot as dead (e.g. Alpenglow
+        // genesis cleanup repurposing a slot that was provisionally marked
+        // dead), so dead-marking is NOT monotonic and the cache can't just
+        // backfill on a miss the way it does for the `true` case.
+        self.dead_slots_cache.remove(&slot);
         self.dead_slots_cf.delete(slot)
     }
 
