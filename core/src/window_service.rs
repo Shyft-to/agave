@@ -292,9 +292,6 @@ impl ShredPayloadCache {
             while self.slots.len() > self.max_slots {
                 if let Some(oldest) = self.slots.pop_front() {
                     self.payloads.remove(&oldest);
-                    // Keep `decoded_entries_cache`'s lifetime tied to this
-                    // cache's own recency window -- see its module docs.
-                    decoded_entries_cache::evict_slot(oldest);
                 }
             }
         }
