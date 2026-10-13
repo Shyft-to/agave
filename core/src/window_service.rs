@@ -22,7 +22,7 @@ use {
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
-        decoded_entries_cache::{self, DecodedCompletedDataSet},
+        decoded_entries_cache,
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -32,6 +32,7 @@ use {
     solana_streamer::evicting_sender::EvictingSender,
     std::{
         borrow::Cow,
+        cell::RefCell,
         collections::{HashMap, VecDeque},
         net::UdpSocket,
         ops::Range,
@@ -218,6 +219,42 @@ fn run_check_duplicate(
         .try_for_each(check_duplicate)
 }
 
+/// A `(slot, index)` or whole-`slot` cache entry that `ShredPayloadCache`
+/// must drop because `do_insert_shreds` reported the corresponding shred(s)
+/// as a duplicate conflict rather than actually storing them.
+enum CacheConflict {
+    Shred { slot: Slot, index: u32 },
+    Slot(Slot),
+}
+
+impl CacheConflict {
+    /// Only data-shred conflicts matter here -- `ShredPayloadCache` only
+    /// ever caches data shreds (see its `insert` call site below), so a
+    /// coding-shred conflict has nothing in the cache to invalidate.
+    fn from_duplicate(possible_duplicate: &PossibleDuplicateShred) -> Option<Self> {
+        match possible_duplicate {
+            PossibleDuplicateShred::Exists(shred)
+            | PossibleDuplicateShred::LastIndexConflict(shred, _)
+            | PossibleDuplicateShred::ErasureConflict(shred, _)
+            | PossibleDuplicateShred::MerkleRootConflict(shred, _)
+                if shred.is_data() =>
+            {
+                Some(CacheConflict::Shred {
+                    slot: shred.slot(),
+                    index: shred.index(),
+                })
+            }
+            PossibleDuplicateShred::Exists(_)
+            | PossibleDuplicateShred::LastIndexConflict(..)
+            | PossibleDuplicateShred::ErasureConflict(..)
+            | PossibleDuplicateShred::MerkleRootConflict(..) => None,
+            PossibleDuplicateShred::FixedFECChainedMerkleRootConflict(slot) => {
+                Some(CacheConflict::Slot(*slot))
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// A small, bounded, in-memory cache of recently-inserted data shred
 /// payloads, keyed by `(slot, index)`. Lets a just-completed data set's
@@ -255,12 +292,37 @@ impl ShredPayloadCache {
             while self.slots.len() > self.max_slots {
                 if let Some(oldest) = self.slots.pop_front() {
                     self.payloads.remove(&oldest);
+                    // Keep `decoded_entries_cache`'s lifetime tied to this
+                    // cache's own recency window -- see its module docs.
+                    decoded_entries_cache::evict_slot(oldest);
                 }
             }
         }
         // `self.payloads` always has an entry for `slot` at this point, either
         // from this call or an earlier one.
         self.payloads.get_mut(&slot).unwrap().insert(index, payload);
+    }
+
+    /// Drops a single `(slot, index)` entry, used when `do_insert_shreds`
+    /// reports that the shred we speculatively cached for it was actually
+    /// rejected as a duplicate -- see the `conflicts` handling in
+    /// `run_insert`. Removing it (rather than trying to recover whatever was
+    /// really stored) is the safe choice: we can no longer tell whether the
+    /// payload we're holding is the accepted one or the rejected one, so a
+    /// cache miss (falling back to RocksDB) is the only guaranteed-correct
+    /// outcome.
+    fn remove(&mut self, slot: Slot, index: u32) {
+        if let Some(slot_payloads) = self.payloads.get_mut(&slot) {
+            slot_payloads.remove(&index);
+        }
+    }
+
+    /// Drops every cached payload for `slot`, used for conflicts that aren't
+    /// tied to a single shred index (e.g. a chained-merkle-root conflict).
+    fn invalidate_slot(&mut self, slot: Slot) {
+        if let Some(slot_payloads) = self.payloads.get_mut(&slot) {
+            slot_payloads.clear();
+        }
     }
 
     /// Returns the raw wire bytes for `indices.start..indices.end`, in index
@@ -289,7 +351,6 @@ fn run_insert<'db, F>(
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
     shred_payload_cache: &mut ShredPayloadCache,
-    decoded_entries_sender: &Sender<DecodedCompletedDataSet>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -347,13 +408,30 @@ where
     let before_insert_lock_us = metrics.insert_lock_elapsed_us;
     let before_commit_working_sets_us = metrics.commit_working_sets_elapsed_us;
 
+    // The payload cache above is populated speculatively, before duplicate
+    // detection runs below -- a data shred that turns out to conflict with
+    // one already in the blockstore (rejected, never written) would
+    // otherwise sit in the cache under the same `(slot, index)` key as the
+    // one actually stored, and a later cache hit could hand back the wrong
+    // bytes. Record every conflict `do_insert_shreds` reports here (via
+    // interior mutability, since `handle_duplicate` must stay `Fn`) and
+    // invalidate the corresponding cache entries once the call returns --
+    // see `ShredPayloadCache::remove`/`invalidate_slot`.
+    let shred_payload_conflicts: RefCell<Vec<CacheConflict>> = RefCell::new(Vec::new());
+    let wrapped_handle_duplicate = |possible_duplicate: PossibleDuplicateShred| {
+        if let Some(conflict) = CacheConflict::from_duplicate(&possible_duplicate) {
+            shred_payload_conflicts.borrow_mut().push(conflict);
+        }
+        handle_duplicate(possible_duplicate);
+    };
+
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         false, // is_trusted
         shred_recovery_context,
         pinnable_slice,
         write_batch,
-        &handle_duplicate,
+        &wrapped_handle_duplicate,
         metrics,
     )?;
 
@@ -377,12 +455,20 @@ where
         .with_label_values(&["commit_working_sets"])
         .observe((metrics.commit_working_sets_elapsed_us - before_commit_working_sets_us) as f64);
 
+    for conflict in shred_payload_conflicts.into_inner() {
+        match conflict {
+            CacheConflict::Shred { slot, index } => shred_payload_cache.remove(slot, index),
+            CacheConflict::Slot(slot) => shred_payload_cache.invalidate_slot(slot),
+        }
+    }
+
     // Opportunistically decode each just-completed data set straight from the
     // shred payloads cached above, and hand it to `decoded_entries_cache` for
     // ReplayStage to pick up -- skipped (not an error) whenever any of the
-    // set's shreds aren't in the cache (e.g. erasure-recovered, or inserted
-    // by an earlier call now evicted) or decoding fails for any reason; the
-    // existing RocksDB-backed path in `confirm_slot` is always the fallback.
+    // set's shreds aren't in the cache (e.g. erasure-recovered, invalidated
+    // as a duplicate-conflict above, or inserted by an earlier call now
+    // evicted) or decoding fails for any reason; the existing RocksDB-backed
+    // path in `confirm_slot` is always the fallback.
     for info in &completed_data_sets {
         let Some(payloads) = shred_payload_cache.get_contiguous(info.slot, &info.indices) else {
             continue;
@@ -390,11 +476,7 @@ where
         let Some(entries) = Blockstore::decode_completed_data_set_from_payloads(payloads) else {
             continue;
         };
-        let _ = decoded_entries_sender.try_send(DecodedCompletedDataSet {
-            slot: info.slot,
-            indices: info.indices.clone(),
-            entries,
-        });
+        decoded_entries_cache::insert(info.slot, info.indices.clone(), entries);
     }
 
     if let Some(sender) = completed_data_sets_sender {
@@ -589,7 +671,6 @@ impl WindowService {
                 // this cache exists only to let a just-completed data set skip the
                 // RocksDB round trip in confirm_slot (see ShredPayloadCache docs).
                 let mut shred_payload_cache = ShredPayloadCache::new(16);
-                let decoded_entries_sender = decoded_entries_cache::sender();
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
@@ -606,7 +687,6 @@ impl WindowService {
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
                         &mut shred_payload_cache,
-                        &decoded_entries_sender,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e) {

@@ -1359,3 +1359,31 @@ pull the same `agave_replay_stage_duration_us{stage="collect_entries"}` queries
 used in hypothesis 5, and compare against the steady-state numbers already
 recorded there (p50/p90/p99 = 505.73/1085.01/8603.50us) to see what fraction of
 that cost verification accounted for.
+
+### Hypothesis 6 result (2026-10-12, 30-min window post-deploy)
+
+`skip_verification = true` in `replay_blockstore_into_bank` (PoH tick + transaction
+signature verification disabled). Compared against hypothesis-5 steady-state baseline.
+
+| percentile | collect_entries, verify ON (baseline) | collect_entries, verify OFF | delta |
+|---|---|---|---|
+| p50 | 505.73 us | 204.31 us | -59.6% |
+| p90 | 1085.01 us | 747.22 us | -31.1% |
+| p99 | 8603.50 us | 4763.26 us | -44.6% |
+
+Other metrics in the same window (context, not directly affected by this change):
+- `read_blockstore` p50/p90/p99 = 7.37 / 111.80 / 297.17 us -- unchanged from hypothesis-5
+  steady state, as expected (verification is downstream of the read).
+- Decoded-entries cache hit rate = 44.1%.
+- `blockstore_store` p99 = 494.38 us (noise-floor metric, stable).
+
+**Conclusion**: PoH tick verification + transaction signature verification account for
+roughly 30-60% of `collect_entries`'s cost (growing with percentile, i.e. the heavier
+slots in the tail pay proportionally more). This is a real, substantial cost center, but
+it is also the only thing standing between this node and executing an invalid PoH
+sequence or an unauthorized/forged transaction from a malicious or buggy leader -- it
+cannot be disabled on any node whose output (votes, served data, indexed state) anything
+else trusts.
+
+**Action**: measurement complete. Revert `skip_verification` back to `false` in
+`core/src/replay_stage.rs::replay_blockstore_into_bank` now that this number is recorded.

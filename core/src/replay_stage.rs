@@ -3044,24 +3044,6 @@ impl ReplayStage {
         // dead, otherwise `check_slot_agrees_with_cluster()` in `replay_active_banks()` will
         // break. A migration transition is handled synchronously after replay results are
         // processed; enabling Alpenglow purges this interrupted TowerBFT bank.
-        //
-        // TEMPORARY EXPERIMENT (2026-10-12, docs/perf/shred-to-geyser-prometheus-plan.md,
-        // "collect_entries" investigation) -- `skip_verification` is hardcoded `true` here to
-        // measure PoH tick verification + transaction signature verification's contribution to
-        // `collect_entries`. This disables the only checks that stop this node from executing
-        // an invalid PoH sequence or a forged/unauthorized transaction from a malicious or
-        // buggy leader. MUST NOT run on a staked/voting validator or against a real cluster
-        // (mainnet or a shared testnet) -- only on an isolated node whose vote/consensus
-        // behavior nothing else depends on. Revert this one `true` back to `false` before any
-        // other use. See the loud warning below, logged once.
-        static WARNED_VERIFICATION_DISABLED: std::sync::Once = std::sync::Once::new();
-        WARNED_VERIFICATION_DISABLED.call_once(|| {
-            error!(
-                "EXPERIMENT: replay-stage verification (PoH ticks + transaction signatures) is \
-                 DISABLED. This node will execute invalid/unauthorized entries without \
-                 detecting them. Do not run this against a real cluster or while staked."
-            );
-        });
         blockstore_processor::confirm_slot(
             &process_active_banks_context.blockstore,
             bank,
@@ -3069,7 +3051,7 @@ impl ReplayStage {
             &process_active_banks_context.replay_verification_worker_pool,
             &mut w_replay_stats,
             &mut w_replay_progress,
-            true, // see TEMPORARY EXPERIMENT comment above
+            false,
             process_active_banks_context
                 .entry_notification_sender
                 .as_ref(),

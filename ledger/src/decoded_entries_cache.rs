@@ -3,8 +3,8 @@
 //! `window_service::run_insert` (in `solana-core`) keeps the raw shred payloads
 //! it has just inserted into the blockstore in memory for a short while (see
 //! its `ShredPayloadCache`). When a data set completes and every one of its
-//! shreds is still in that cache, it decodes the entries right there and sends
-//! them here, over [`sender`]. `Blockstore::get_slot_components_with_shred_info_fast`
+//! shreds is still in that cache, it decodes the entries right there and
+//! [`insert`]s them here directly. `Blockstore::get_slot_components_with_shred_info_fast`
 //! (used by `confirm_slot` in `blockstore_processor.rs`) checks this cache
 //! before falling back to its normal RocksDB-backed read, letting ReplayStage
 //! skip re-reading and re-deshredding shred payloads it, through
@@ -12,63 +12,45 @@
 //!
 //! This is purely a latency optimization, never a correctness dependency:
 //! every lookup that misses (a `BlockMarker` range, a cache eviction, replay
-//! falling behind window_service, or no Geyser^Wno sender registered at all)
-//! falls back to the exact, unchanged RocksDB-backed path. See
+//! falling behind window_service, or no decoded entry ever produced) falls
+//! back to the exact, unchanged RocksDB-backed path. See
 //! `docs/perf/shred-to-geyser-prometheus-plan.md`, "Phase 3, hypothesis 5".
+//!
+//! There is no dedicated eviction policy or size cap here: `window_service`
+//! is the single writer, and it already keeps its own bounded, FIFO-by-slot
+//! recency window for `ShredPayloadCache` (see its docs); [`evict_slot`] is
+//! called from that same eviction point, so this cache's lifetime always
+//! tracks `ShredPayloadCache`'s window rather than needing a second,
+//! independent bound.
 
 use {
-    crossbeam_channel::{Receiver, Sender, unbounded},
+    dashmap::DashMap,
     solana_clock::Slot,
     solana_entry::entry::Entry,
-    std::{
-        collections::HashMap,
-        ops::Range,
-        sync::{LazyLock, Mutex},
-    },
+    std::{ops::Range, sync::LazyLock},
 };
 
-/// A completed data set's shreds, already decoded into entries.
-pub struct DecodedCompletedDataSet {
-    pub slot: Slot,
-    /// Data shred indices this data set spans, matching the `indices` field of
-    /// `blockstore::CompletedDataSetInfo` that `window_service` derived this from.
-    pub indices: Range<u32>,
-    pub entries: Vec<Entry>,
+static CACHE: LazyLock<DashMap<(Slot, u32), Vec<Entry>>> = LazyLock::new(DashMap::new);
+
+/// Called by `window_service::run_insert` right after it decodes a
+/// just-completed data set from its in-memory shred payload cache.
+/// `indices` matches the `indices` field of the `CompletedDataSetInfo` this
+/// was derived from; only its `start` is used as the cache key, matching
+/// `take_if_fully_cached`.
+pub fn insert(slot: Slot, indices: Range<u32>, entries: Vec<Entry>) {
+    CACHE.insert((slot, indices.start), entries);
 }
 
-/// Hard cap on the number of cached data sets, so a replay stall (or a bug)
-/// can't grow this cache unboundedly. Comfortably above normal in-flight
-/// counts -- window_service's own per-slot shred-payload cache is already
-/// bounded to a small number of slots, so this would only be reached if
-/// replay fell far behind for a sustained period.
-const MAX_CACHED_DATA_SETS: usize = 4096;
-
-struct Shared {
-    sender: Sender<DecodedCompletedDataSet>,
-    receiver: Receiver<DecodedCompletedDataSet>,
-    cache: Mutex<HashMap<(Slot, u32), Vec<Entry>>>,
+/// Called by `window_service::run_insert` when it evicts `slot` from its own
+/// `ShredPayloadCache` recency window, so this cache never outlives that one.
+pub fn evict_slot(slot: Slot) {
+    CACHE.retain(|&(s, _), _| s != slot);
 }
 
-static SHARED: LazyLock<Shared> = LazyLock::new(|| {
-    let (sender, receiver) = unbounded();
-    Shared {
-        sender,
-        receiver,
-        cache: Mutex::new(HashMap::new()),
-    }
-});
-
-/// Returns a cloned sender for `window_service::run_insert` to send decoded
-/// data sets on. Cheap to call (clones a crossbeam `Sender`); callers should
-/// still hoist it out of their hot loop for clarity.
-pub fn sender() -> Sender<DecodedCompletedDataSet> {
-    SHARED.sender.clone()
-}
-
-/// Drains any newly-arrived decoded data sets into the cache, then checks
-/// whether EVERY range in `ranges` (for `slot`) is present. On a full hit,
+/// Checks whether EVERY range in `ranges` (for `slot`) is present, and if so,
 /// removes and returns them in the same order as `ranges`. On any miss,
-/// leaves the cache untouched and returns `None`.
+/// returns `None`; ranges that *were* present are left in place (a lookup
+/// never discards an entry it can't use).
 ///
 /// Callers must treat this as all-or-nothing for the whole `ranges` slice:
 /// `Blockstore::get_slot_components_in_block`'s RocksDB batching assumes the
@@ -77,31 +59,24 @@ pub fn sender() -> Sender<DecodedCompletedDataSet> {
 /// a partial hit into an otherwise-RocksDB-backed read isn't safe -- a miss
 /// on any single range means the whole call falls back to RocksDB.
 pub(crate) fn take_if_fully_cached(slot: Slot, ranges: &[Range<u32>]) -> Option<Vec<Vec<Entry>>> {
-    let mut cache = SHARED.cache.lock().unwrap();
-    for decoded in SHARED.receiver.try_iter() {
-        cache.insert((decoded.slot, decoded.indices.start), decoded.entries);
-    }
-    if cache.len() > MAX_CACHED_DATA_SETS {
-        let mut keys: Vec<_> = cache.keys().copied().collect();
-        keys.sort_unstable();
-        for key in keys.into_iter().take(cache.len() - MAX_CACHED_DATA_SETS) {
-            cache.remove(&key);
-        }
-    }
-
-    let hit = ranges.iter().all(|r| cache.contains_key(&(slot, r.start)));
+    let hit = ranges.iter().all(|r| CACHE.contains_key(&(slot, r.start)));
     solana_metrics::pipeline_metrics::DECODED_ENTRIES_CACHE_TOTAL
         .with_label_values(&[if hit { "hit" } else { "miss" }])
         .inc();
     if !hit {
         return None;
     }
-    Some(
-        ranges
-            .iter()
-            .map(|r| cache.remove(&(slot, r.start)).unwrap())
-            .collect(),
-    )
+    // Re-checked via `remove`, not just the `contains_key` above: in the rare
+    // case of two concurrent lookups for the same slot racing on completion,
+    // one of these removes can still come back empty even though the
+    // `contains_key` scan above saw it. Falling back to `None` (and losing
+    // whichever entries this call *did* remove along the way) is safe --
+    // RocksDB remains the source of truth -- just not maximally efficient
+    // for that vanishingly rare race.
+    ranges
+        .iter()
+        .map(|r| CACHE.remove(&(slot, r.start)).map(|(_, entries)| entries))
+        .collect()
 }
 
 #[cfg(test)]
@@ -121,21 +96,8 @@ mod tests {
     #[test]
     fn hit_when_fully_cached() {
         let slot = 10_001;
-        let sender = sender();
-        sender
-            .send(DecodedCompletedDataSet {
-                slot,
-                indices: 0..4,
-                entries: vec![entry(1)],
-            })
-            .unwrap();
-        sender
-            .send(DecodedCompletedDataSet {
-                slot,
-                indices: 4..7,
-                entries: vec![entry(2), entry(3)],
-            })
-            .unwrap();
+        insert(slot, 0..4, vec![entry(1)]);
+        insert(slot, 4..7, vec![entry(2), entry(3)]);
 
         let result = take_if_fully_cached(slot, &[0..4, 4..7]).unwrap();
         assert_eq!(result, vec![vec![entry(1)], vec![entry(2), entry(3)]]);
@@ -147,13 +109,7 @@ mod tests {
     #[test]
     fn miss_when_partially_cached_leaves_cache_untouched() {
         let slot = 10_002;
-        sender()
-            .send(DecodedCompletedDataSet {
-                slot,
-                indices: 0..4,
-                entries: vec![entry(1)],
-            })
-            .unwrap();
+        insert(slot, 0..4, vec![entry(1)]);
 
         assert!(take_if_fully_cached(slot, &[0..4, 4..7]).is_none());
         // the range that *was* cached must still be there for a later retry
@@ -167,5 +123,21 @@ mod tests {
     fn miss_when_not_cached_at_all() {
         let slot = 10_003;
         assert!(take_if_fully_cached(slot, &[0..4]).is_none());
+    }
+
+    #[test]
+    fn evict_slot_removes_only_that_slot() {
+        let slot_a = 10_004;
+        let slot_b = 10_005;
+        insert(slot_a, 0..4, vec![entry(1)]);
+        insert(slot_b, 0..4, vec![entry(2)]);
+
+        evict_slot(slot_a);
+
+        assert!(take_if_fully_cached(slot_a, &[0..4]).is_none());
+        assert_eq!(
+            take_if_fully_cached(slot_b, &[0..4]),
+            Some(vec![vec![entry(2)]])
+        );
     }
 }

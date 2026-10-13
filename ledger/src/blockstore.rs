@@ -396,6 +396,16 @@ pub struct Blockstore {
     /// parent. This tiny cache avoids a blockstore lookup for each later shred
     /// in small insertion batches.
     update_parent_shred_parent_cache: Mutex<UpdateParentShredParentCache>,
+    /// Write-through, in-memory mirror of `dead_slots_cf`: every
+    /// `set_dead_slot` call inserts here in the same call, so `is_dead` can
+    /// skip the RocksDB round trip for any slot this process has itself
+    /// marked dead. Since a slot is never un-marked dead (no
+    /// `clear_dead_slot` exists), a hit here is always correct; a miss falls
+    /// back to RocksDB, which stays authoritative for slots marked dead
+    /// before this process started. Unbounded, but bounded in practice by
+    /// how many slots are ever marked dead across this process's lifetime --
+    /// a vanishingly small fraction of all slots.
+    dead_slots_cache: DashSet<Slot>,
     certificate_forwarder: OnceLock<CertificateForwarder>,
     pub lowest_cleanup_slot: RwLock<Slot>,
     // A sender that feeds into the BlockstoreCleanupService request channel
@@ -748,6 +758,7 @@ impl Blockstore {
             update_parent_shred_parent_cache: Mutex::new(LruCache::new(
                 UPDATE_PARENT_SHRED_PARENT_CACHE_CAPACITY,
             )),
+            dead_slots_cache: DashSet::new(),
             certificate_forwarder: OnceLock::new(),
             insert_shreds_lock: Mutex::<()>::default(),
             switch_block_lock: SwitchBlockLock(FairMutex::new(())),
@@ -5404,15 +5415,26 @@ impl Blockstore {
     }
 
     pub fn is_dead(&self, slot: Slot) -> bool {
-        matches!(
+        if self.dead_slots_cache.contains(&slot) {
+            return true;
+        }
+        let dead = matches!(
             self.dead_slots_cf
                 .get(slot)
                 .expect("fetch from DeadSlots column family failed"),
             Some(true)
-        )
+        );
+        // Backfill so a slot marked dead by a *previous* process run (the
+        // only way this branch is reached; see `dead_slots_cache`'s docs)
+        // skips RocksDB on every subsequent check too, not just the first.
+        if dead {
+            self.dead_slots_cache.insert(slot);
+        }
+        dead
     }
 
     pub fn set_dead_slot(&self, slot: Slot) -> Result<()> {
+        self.dead_slots_cache.insert(slot);
         self.dead_slots_cf.put(slot, &true)
     }
 
