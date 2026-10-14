@@ -17,7 +17,16 @@ impl FromClapArgMatches for AccountSecondaryIndexes {
                 "program-id" => AccountIndex::ProgramId,
                 "spl-token-mint" => AccountIndex::SplTokenMint,
                 "spl-token-owner" => AccountIndex::SplTokenOwner,
-                _ => unreachable!(),
+                s => {
+                    if s.starts_with("custom-") {
+                        let mut v = s.split("-").skip(1);
+                        let key = v.next().map(|k| Pubkey::from_str_const(k)).expect("ProgramID for custom index not found, expected value custom-pid-offset-length format");
+                        let offset = v.next().and_then(|o| o.parse::<usize>().ok()).expect("Offset of data for custom index not found, expected value custom-pid-offset-length format");
+                        AccountIndex::Custom(key, offset)
+                    } else {
+                        unreachable!()
+                    }
+                }
             })
             .collect();
 
@@ -55,6 +64,7 @@ impl FromClapArgMatches for AccountSecondaryIndexes {
         Ok(AccountSecondaryIndexes {
             keys,
             indexes: account_indexes,
+            custom_indexes: HashSet::new(),
         })
     }
 }
@@ -83,6 +93,7 @@ mod tests {
                 account_indexes: AccountSecondaryIndexes {
                     keys: None,
                     indexes: HashSet::from([expected_index]),
+                    custom_indexes: HashSet::new(),
                 },
                 ..default_run_args.json_rpc_config.clone()
             },
@@ -107,6 +118,7 @@ mod tests {
                         AccountIndex::SplTokenMint,
                         AccountIndex::SplTokenOwner,
                     ]),
+                    custom_indexes: HashSet::new(),
                 },
                 ..default_run_args.json_rpc_config.clone()
             },
@@ -140,6 +152,7 @@ mod tests {
                             keys: HashSet::from([account_pubkey_1]),
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
+                        custom_indexes: HashSet::new(),
                     },
                     ..default_run_args.json_rpc_config.clone()
                 },
@@ -175,6 +188,7 @@ mod tests {
                             ]),
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
+                        custom_indexes: HashSet::new(),
                     },
                     ..default_run_args.json_rpc_config.clone()
                 },
@@ -211,6 +225,7 @@ mod tests {
                             keys: HashSet::from([account_pubkey_1]),
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
+                        custom_indexes: HashSet::new(),
                     },
                     ..default_run_args.json_rpc_config.clone()
                 },
@@ -246,6 +261,7 @@ mod tests {
                             ]),
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
+                        custom_indexes: HashSet::new(),
                     },
                     ..default_run_args.json_rpc_config.clone()
                 },

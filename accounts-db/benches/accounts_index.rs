@@ -25,6 +25,7 @@ fn bench_accounts_index(c: &mut Criterion) {
     let mut reclaims = ReclaimsSlotList::new();
     let index = AccountsIndex::<AccountInfo, AccountInfo>::new(
         &ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS,
+        None,
         Arc::default(),
     );
     for f in 0..NUM_FORKS {
