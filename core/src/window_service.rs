@@ -337,11 +337,12 @@ where
     // erasure-recovered ones) or in `shred_payload_cache` (accepted by an
     // earlier call).
     //
-    // No RocksDB fallback exists for replay, so a data set that can't be
-    // decoded (a sibling shred evicted from the cache, or corrupt payloads)
-    // has its slot marked dead -- replay then errors out via the existing
-    // dead-slot path instead of stalling on it forever. Expected to be
-    // vanishingly rare given `shred_payload_cache`'s size.
+    // If a data set can't be assembled from memory (a sibling shred was
+    // persisted before a restart, or aged out of `shred_payload_cache`),
+    // tell replay to read the rest of that slot from the persisted
+    // blockstore. This is the rare recovery path; the steady state is the
+    // channel. It never marks a slot dead -- a genuinely corrupt data set
+    // surfaces through the normal blockstore read path.
     let mut before_write = |completed: &[CompletedDataSetInfo],
                             accepted: &[(Slot, u32, shred::Payload)]| {
         for (slot, index, payload) in accepted {
@@ -356,7 +357,7 @@ where
                 .and_then(Blockstore::decode_completed_data_set_from_payloads);
             match decoded {
                 Some(component) => {
-                    let _ = live_replay_sender.send(LiveReplayMessage {
+                    let _ = live_replay_sender.send(LiveReplayMessage::Entries {
                         slot: info.slot,
                         indices: info.indices.clone(),
                         component,
@@ -364,12 +365,13 @@ where
                     });
                 }
                 None => {
-                    error!(
-                        "could not decode completed data set {:?} for slot {} for live replay; \
-                         marking slot dead (replay has no blockstore fallback)",
+                    warn!(
+                        "completed data set {:?} of slot {} not assembled from memory; replay \
+                         will read this slot from the blockstore",
                         info.indices, info.slot
                     );
-                    let _ = blockstore.set_dead_slot(info.slot);
+                    let _ = live_replay_sender
+                        .send(LiveReplayMessage::ReplayFromBlockstore { slot: info.slot });
                 }
             }
         }

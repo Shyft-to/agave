@@ -177,8 +177,7 @@ impl ProcessActiveBanksContext {
 
 /// Stand-in for what `window_service` does in production: hands the entries
 /// already persisted in `blockstore` for `slot` to the live replay queue.
-/// Mirrors its failure behavior too -- undecodable data marks the slot dead,
-/// since live replay has no blockstore fallback.
+/// Undecodable data degrades to replaying the slot from the blockstore.
 fn feed_live_replay_entries_from_blockstore(
     context: &ProcessActiveBanksContext,
     blockstore: &Blockstore,
@@ -188,7 +187,7 @@ fn feed_live_replay_entries_from_blockstore(
         Ok((components, ranges, slot_full)) => {
             let last = components.len().saturating_sub(1);
             for (i, (component, indices)) in components.into_iter().zip(ranges).enumerate() {
-                context.live_replay_entries.push(LiveReplayMessage {
+                context.live_replay_entries.push(LiveReplayMessage::Entries {
                     slot,
                     indices,
                     component,
@@ -196,7 +195,9 @@ fn feed_live_replay_entries_from_blockstore(
                 });
             }
         }
-        Err(_) => blockstore.set_dead_slot(slot).unwrap(),
+        Err(_) => context
+            .live_replay_entries
+            .push(LiveReplayMessage::ReplayFromBlockstore { slot }),
     }
 }
 
@@ -1047,13 +1048,12 @@ fn test_dead_fork_entry_deserialize_failure() {
             .collect()
     });
 
-    // Live replay has no blockstore fallback: window_service marks a slot
-    // whose data set can't be decoded dead, so replay sees `DeadSlot` here
-    // (not `InvalidShredData`, which only the bulk/RocksDB path can produce).
+    // window_service can't decode this data set, so replay reads the slot
+    // from the blockstore, whose normal path reports the real error.
     assert_matches!(
         res,
         Err(BlockstoreProcessorError::FailedToLoadEntries(
-            BlockstoreError::DeadSlot
+            BlockstoreError::InvalidShredData(_)
         ),)
     );
 }
@@ -2949,6 +2949,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for i in 5..=7 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -2989,6 +2990,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for i in 4..=6 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -3012,6 +3014,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for i in 1..=6 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -3079,6 +3082,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for slot in &[3, 5, 6, 7] {
         assert!(bank_forks.read().unwrap().get(*slot).is_none());
@@ -4640,6 +4644,7 @@ fn test_dump_then_repair_correct_slots() {
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
     assert_eq!(should_be_dumped, dumped_slots_receiver.recv().ok().unwrap());
 
@@ -4759,6 +4764,7 @@ fn setup_vote_then_rollback(
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
 
     // Check everything was purged properly
@@ -6153,6 +6159,7 @@ fn test_dumped_slot_not_causing_panic() {
         &dumped_slots_sender,
         my_pubkey,
         &leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
     assert_eq!(
         dumped_slots_receiver.recv_timeout(Duration::from_secs(1)),
@@ -6238,6 +6245,7 @@ fn test_dump_own_slots_fails() {
         &dumped_slots_sender,
         my_pubkey,
         leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
 }
 

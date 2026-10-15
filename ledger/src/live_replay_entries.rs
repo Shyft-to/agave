@@ -30,18 +30,29 @@
 
 use {
     crossbeam_channel::{Receiver, Sender},
-    dashmap::DashMap,
+    dashmap::{DashMap, DashSet},
     solana_clock::Slot,
     solana_entry::block_component::BlockComponent,
     std::ops::Range,
 };
 
-/// One decoded, completed data set on its way to replay.
-pub struct LiveReplayMessage {
-    pub slot: Slot,
-    pub indices: Range<u32>,
-    pub component: BlockComponent,
-    pub slot_full: bool,
+/// What `window_service` sends to replay over the live channel.
+#[allow(clippy::large_enum_variant)]
+pub enum LiveReplayMessage {
+    /// One decoded, completed data set.
+    Entries {
+        slot: Slot,
+        indices: Range<u32>,
+        component: BlockComponent,
+        slot_full: bool,
+    },
+    /// `window_service` could not assemble this slot's next data set from
+    /// memory (e.g. some of its shreds were persisted before a restart, or
+    /// aged out of its payload cache). Replay must read the rest of this
+    /// slot from the persisted blockstore. Never marks anything dead:
+    /// whether the persisted data is actually bad is for the normal
+    /// blockstore read path to decide.
+    ReplayFromBlockstore { slot: Slot },
 }
 
 pub type LiveReplaySender = Sender<LiveReplayMessage>;
@@ -58,16 +69,29 @@ struct Queued {
 #[derive(Default)]
 pub struct LiveReplayEntries {
     queued: DashMap<(Slot, u32), Queued>,
+    /// Slots whose replay was restarted by a dump/purge while their shreds
+    /// were left in the blockstore (see `replay_stage::purge_unconfirmed_slot`).
+    /// Their data sets were already consumed from `queued` and will never be
+    /// sent again, so they must be replayed from the persisted blockstore.
+    /// A rare recovery path, not the steady-state one.
+    replay_from_blockstore: DashSet<Slot>,
 }
 
 impl LiveReplayEntries {
     pub fn push(&self, message: LiveReplayMessage) {
-        let LiveReplayMessage {
-            slot,
-            indices,
-            component,
-            slot_full,
-        } = message;
+        let (slot, indices, component, slot_full) = match message {
+            LiveReplayMessage::Entries {
+                slot,
+                indices,
+                component,
+                slot_full,
+            } => (slot, indices, component, slot_full),
+            LiveReplayMessage::ReplayFromBlockstore { slot } => {
+                self.remove_slot(slot);
+                self.mark_replay_from_blockstore(slot);
+                return;
+            }
+        };
         self.queued.insert(
             (slot, indices.start),
             Queued {
@@ -121,6 +145,23 @@ impl LiveReplayEntries {
     /// Drops everything queued for slots `<= root`.
     pub fn prune_through(&self, root: Slot) {
         self.queued.retain(|(slot, _), _| *slot > root);
+        self.replay_from_blockstore.retain(|slot| *slot > root);
+    }
+
+    /// Drops everything queued for `slot`. Called when a slot is purged: its
+    /// queued entries belong to a version of the block that is being
+    /// discarded and must not mix with the repaired one.
+    pub fn remove_slot(&self, slot: Slot) {
+        self.queued.retain(|(queued_slot, _), _| *queued_slot != slot);
+    }
+
+    /// See `replay_from_blockstore`'s docs.
+    pub fn mark_replay_from_blockstore(&self, slot: Slot) {
+        self.replay_from_blockstore.insert(slot);
+    }
+
+    pub fn replays_from_blockstore(&self, slot: Slot) -> bool {
+        self.replay_from_blockstore.contains(&slot)
     }
 }
 
@@ -137,7 +178,7 @@ mod tests {
     }
 
     fn message(slot: Slot, indices: Range<u32>, num: u64, slot_full: bool) -> LiveReplayMessage {
-        LiveReplayMessage {
+        LiveReplayMessage::Entries {
             slot,
             indices,
             component: entry_batch(num),
@@ -189,6 +230,25 @@ mod tests {
         let (components, _, slot_full) = live.drain_ready(4, 0);
         assert_eq!(components, vec![entry_batch(1)]);
         assert!(slot_full);
+    }
+
+    #[test]
+    fn replay_from_blockstore_message_clears_queue_and_flags_slot() {
+        let live = LiveReplayEntries::default();
+        live.push(message(6, 4..7, 2, false));
+        live.push(LiveReplayMessage::ReplayFromBlockstore { slot: 6 });
+        assert!(live.replays_from_blockstore(6));
+        assert!(live.drain_ready(6, 4).0.is_empty());
+    }
+
+    #[test]
+    fn remove_slot_drops_only_that_slot() {
+        let live = LiveReplayEntries::default();
+        live.push(message(7, 0..2, 1, true));
+        live.push(message(8, 0..2, 2, true));
+        live.remove_slot(7);
+        assert!(live.drain_ready(7, 0).0.is_empty());
+        assert_eq!(live.drain_ready(8, 0).0, vec![entry_batch(2)]);
     }
 
     #[test]
