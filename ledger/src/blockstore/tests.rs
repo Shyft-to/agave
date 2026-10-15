@@ -675,6 +675,8 @@ fn test_data_set_completed_on_insert() {
         vec![CompletedDataSetInfo {
             slot,
             indices: 0..num_shreds as u32,
+            slot_full: true,
+            location: BlockLocation::Original,
         }]
     );
     // Inserting shreds again doesn't trigger notification
@@ -4689,6 +4691,7 @@ fn test_recovery() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     let shred_bufs: Vec<_> = data_shreds.iter().map(Shred::payload).cloned().collect();
@@ -4735,6 +4738,7 @@ fn test_skip_alt_recovery() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
 
@@ -4763,6 +4767,7 @@ fn test_skip_alt_recovery() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut metrics,
+            None,
         )
         .unwrap();
 
@@ -4863,6 +4868,7 @@ fn test_recovery_discards_unexpected_data_complete_shreds() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut metrics,
+            None,
         )
         .unwrap();
 
@@ -6457,6 +6463,7 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     assert!(insert_results.duplicate_shreds.is_empty());
@@ -6555,6 +6562,7 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     assert!(insert_results.duplicate_shreds.is_empty());
@@ -6588,6 +6596,7 @@ fn insert_test_block_at_location(
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     assert!(insert_results.duplicate_shreds.is_empty());
@@ -6723,6 +6732,7 @@ fn test_get_data_shreds_for_slot() {
                 &mut pinnable_slice,
                 &mut write_batch,
                 &mut BlockstoreInsertionMetrics::default(),
+                None,
             )
             .unwrap();
         assert!(insert_results.duplicate_shreds.is_empty());

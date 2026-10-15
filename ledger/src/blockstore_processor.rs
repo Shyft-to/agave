@@ -5,6 +5,7 @@ use {
         blockstore_meta::SlotMeta,
         entry_notifier_service::{EntryNotification, EntryNotifierSender},
         leader_schedule_cache::LeaderScheduleCache,
+        live_replay_entries::LiveReplayEntries,
         shred::MAX_FEC_SETS_PER_SLOT,
         thread_pool::{WorkerJob, WorkerPool},
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
@@ -602,6 +603,7 @@ fn confirm_full_slot(
         None,
         opts.allow_dead_slots,
         migration_status,
+        /* live_entries */ None,
     )?;
 
     timing.accumulate(&confirmation_timing.batch_execute.totals);
@@ -1370,14 +1372,31 @@ pub fn confirm_slot(
     finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
     allow_dead_slots: bool,
     migration_status: &MigrationStatus,
+    // `Some` for ReplayStage's live incremental call: entries are read
+    // exclusively from it, fed directly by `window_service` with no RocksDB
+    // fallback, so this does not wait on the blockstore write (see
+    // `live_replay_entries`). `None` for bulk/offline replay
+    // (`confirm_full_slot`: startup catch-up, ledger-tool), which has no
+    // `window_service` feeding it and reads the persisted blockstore.
+    live_entries: Option<&LiveReplayEntries>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
 
     let (slot_components, completed_ranges, slot_full) = {
         let mut load_elapsed = Measure::start("load_elapsed");
-        let load_result = blockstore
-            .get_slot_components_with_shred_info_fast(slot, progress.num_shreds, allow_dead_slots)
-            .map_err(BlockstoreProcessorError::FailedToLoadEntries);
+        let load_result = if let Some(live_entries) = live_entries {
+            if blockstore.is_dead(slot) && !allow_dead_slots {
+                Err(BlockstoreProcessorError::FailedToLoadEntries(
+                    BlockstoreError::DeadSlot,
+                ))
+            } else {
+                Ok(live_entries.drain_ready(slot, progress.num_shreds))
+            }
+        } else {
+            blockstore
+                .get_slot_components_with_shred_info(slot, progress.num_shreds, allow_dead_slots)
+                .map_err(BlockstoreProcessorError::FailedToLoadEntries)
+        };
         load_elapsed.stop();
         if load_result.is_err() {
             timing.fetch_fail_elapsed += load_elapsed.as_us();
@@ -5888,6 +5907,7 @@ pub mod tests {
             None,
             false,
             &MigrationStatus::default(),
+            /* live_entries */ None,
         )
         .unwrap_err();
     }
@@ -5923,6 +5943,7 @@ pub mod tests {
             None,
             false,
             &MigrationStatus::post_migration_status(),
+            /* live_entries */ None,
         )
         .unwrap();
 
@@ -5995,6 +6016,7 @@ pub mod tests {
             None,
             false,
             &MigrationStatus::post_migration_status(),
+            /* live_entries */ None,
         );
         assert_matches!(
             result,

@@ -403,6 +403,9 @@ impl Tvu {
         );
 
         let (verified_sender, verified_receiver) = unbounded();
+        // window_service -> ReplayStage: decoded entries, sent before the
+        // blockstore write; the send also wakes replay.
+        let (live_replay_sender, live_replay_receiver) = unbounded();
 
         let (retransmit_sender, retransmit_receiver) =
             EvictingSender::new_bounded(CHANNEL_SIZE_RETRANSMIT_INGRESS);
@@ -490,6 +493,7 @@ impl Tvu {
                 verified_receiver,
                 retransmit_sender,
                 completed_data_sets_sender,
+                live_replay_sender,
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
                 block_id_repair_channels,
@@ -593,6 +597,7 @@ impl Tvu {
 
         let replay_receivers = ReplayReceivers {
             ledger_signal_receiver,
+            live_replay_receiver,
             update_parent_receiver,
             optimistic_parent_receiver,
             duplicate_slots_receiver,

@@ -46,6 +46,7 @@ use {
         },
         create_new_tmp_ledger,
         entry_notifier_service::EntryNotification,
+        live_replay_entries::{LiveReplayEntries, LiveReplayMessage},
         genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
         get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
         shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
@@ -169,7 +170,33 @@ impl ProcessActiveBanksContext {
             replay_mode: ForkReplayMode::Serial,
             replay_verification_worker_pool,
             migration_status,
+            live_replay_entries: LiveReplayEntries::default(),
         }
+    }
+}
+
+/// Stand-in for what `window_service` does in production: hands the entries
+/// already persisted in `blockstore` for `slot` to the live replay queue.
+/// Mirrors its failure behavior too -- undecodable data marks the slot dead,
+/// since live replay has no blockstore fallback.
+fn feed_live_replay_entries_from_blockstore(
+    context: &ProcessActiveBanksContext,
+    blockstore: &Blockstore,
+    slot: Slot,
+) {
+    match blockstore.get_slot_components_with_shred_info(slot, 0, true) {
+        Ok((components, ranges, slot_full)) => {
+            let last = components.len().saturating_sub(1);
+            for (i, (component, indices)) in components.into_iter().zip(ranges).enumerate() {
+                context.live_replay_entries.push(LiveReplayMessage {
+                    slot,
+                    indices,
+                    component,
+                    slot_full: slot_full && i == last,
+                });
+            }
+        }
+        Err(_) => blockstore.set_dead_slot(slot).unwrap(),
     }
 }
 
@@ -1020,10 +1047,13 @@ fn test_dead_fork_entry_deserialize_failure() {
             .collect()
     });
 
+    // Live replay has no blockstore fallback: window_service marks a slot
+    // whose data set can't be decoded dead, so replay sees `DeadSlot` here
+    // (not `InvalidShredData`, which only the bulk/RocksDB path can produce).
     assert_matches!(
         res,
         Err(BlockstoreProcessorError::FailedToLoadEntries(
-            BlockstoreError::InvalidShredData(_)
+            BlockstoreError::DeadSlot
         ),)
     );
 }
@@ -1159,6 +1189,7 @@ fn do_test_dead_slot_on_complete_bank(failure: CompleteBankFailure) {
         let shreds = entries_to_test_shreds(&entries, slot, bank.parent_slot(), true, 0);
         blockstore.insert_shreds(shreds, false).unwrap();
         let cluster_info = cluster_info_for_tests();
+        feed_live_replay_entries_from_blockstore(&process_active_banks_context, &blockstore, slot);
 
         ReplaySlotFromBlockstore {
             is_slot_dead: false,
@@ -1569,6 +1600,11 @@ where
             replay_vote_sender,
         );
         let cluster_info = cluster_info_for_tests();
+        feed_live_replay_entries_from_blockstore(
+            &process_active_banks_context,
+            &blockstore,
+            bank1.slot(),
+        );
         let res = ReplayStage::replay_blockstore_into_bank(
             cluster_info.my_shred_version(),
             &process_active_banks_context,

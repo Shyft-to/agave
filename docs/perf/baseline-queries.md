@@ -213,23 +213,37 @@ the last transaction in a block, independent of replay speed -- compare
 against `tx_pipeline`/`executed_tx`/`created_bank_to_frozen` to separate
 "shred propagation is slow" from "replay is slow."
 
-## 13. Decoded-entries cache hit rate (Phase 3 hypothesis 5)
+## 13. Live-replay entries readiness rate (superseded the decoded-entries cache)
+
+The old cache-with-RocksDB-fallback design (`agave_decoded_entries_cache_total`,
+`decoded_entries_cache`) never decoupled replay from the blockstore write: it
+only ran AFTER `insert_shreds_at_location_handle_duplicate`'s write had
+completed, so a high hit rate there was never proof replay stopped waiting on
+the write. It is deleted and replaced by `ledger::live_replay_entries`:
+`Blockstore` invokes a `before_write` hook after in-memory insertion and
+*before* the RocksDB write; `window_service` uses it to decode completed data
+sets and send them to ReplayStage over a channel (the send is also replay's
+wake-up). `confirm_slot`'s live branch reads *exclusively* from that channel's
+contents -- no RocksDB fallback. The write itself still happens inline on the
+insert thread, right after the send.
+
+Known remaining dependency: replay still discovers *new* slots/banks via
+`SlotMeta.next_slots` in RocksDB (`generate_new_bank_forks`), so the first data
+set of a brand-new slot is gated by that write; subsequent data sets of an
+existing bank are not.
 
 ```promql
-sum(rate(agave_decoded_entries_cache_total[1h])) by (outcome)
+sum(rate(agave_live_replay_entries_total[1h])) by (outcome)
 histogram_quantile(0.5, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
 histogram_quantile(0.9, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
 histogram_quantile(0.99, sum(rate(agave_replay_stage_duration_us_bucket{stage="read_blockstore"}[1h])) by (le))
 ```
 
-`agave_decoded_entries_cache_total{outcome="hit"|"miss"}`: whether
-`confirm_slot`'s `read_blockstore` step found every completed range for its
-call already decoded in `window_service`'s in-memory shred-payload cache
-(`hit`, skips the RocksDB read-and-deshred entirely) or not (`miss`, falls
-back to the exact pre-change behavior). Read the hit rate together with
-`read_blockstore`: a high hit rate with no corresponding drop in that
-histogram's p50/p90/p99 vs. the "before" baseline (section 4) would mean the
-cache is being hit but isn't actually saving the time expected.
+`agave_live_replay_entries_total{outcome="ready"|"not_ready"}`: whether a
+live-replay poll found newly-completed components queued. `not_ready` means
+nothing new yet, not an error (there is no RocksDB fallback to miss to).
+`read_blockstore` is now an in-memory queue read and should no longer track
+`write_batch`'s cost.
 
 ## 14. Collect-entries phase breakdown (added after noting ~1ms p90 on collect_entries)
 

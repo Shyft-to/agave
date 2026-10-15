@@ -172,6 +172,8 @@ impl Blockstore {
         self.write_batch(write_batch).inspect_err(|e| {
             error!("Error: {e:?} while submitting write batch for slot {slot:?}")
         })?;
+        // Must happen AFTER the write commits -- see `clear_dead_slots_cache_range`'s docs.
+        self.clear_dead_slots_cache_range(slot, slot);
 
         Ok(())
     }
@@ -216,6 +218,8 @@ impl Blockstore {
             )
         })?;
         write_timer.stop();
+        // Must happen AFTER the write commits -- see `clear_dead_slots_cache_range`'s docs.
+        self.clear_dead_slots_cache_range(from_slot, to_slot);
 
         let mut purge_files_in_range_timer = Measure::start("delete_file_in_range");
         // purge_files_in_range delete any files whose slot range is within

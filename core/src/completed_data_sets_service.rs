@@ -164,7 +164,12 @@ impl CompletedDataSetsService {
             .chain(completed_sets_receiver.try_iter())
             .flatten()
             .map(|completed_data_set_info| {
-                let CompletedDataSetInfo { slot, indices } = completed_data_set_info;
+                let CompletedDataSetInfo {
+                    slot,
+                    indices,
+                    slot_full: _,
+                    location: _,
+                } = completed_data_set_info;
                 let completed_data_set_starting_shred_index = indices.start;
                 let completed_data_set_ending_shred_index_exclusive = indices.end;
                 let reread_start = std::time::Instant::now();

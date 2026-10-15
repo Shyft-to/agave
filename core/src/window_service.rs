@@ -19,10 +19,12 @@ use {
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
-        blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
+        blockstore::{
+            Blockstore, BlockstoreInsertionMetrics, CompletedDataSetInfo, PossibleDuplicateShred,
+        },
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
-        decoded_entries_cache,
+        live_replay_entries::{LiveReplayMessage, LiveReplaySender},
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -32,7 +34,6 @@ use {
     solana_streamer::evicting_sender::EvictingSender,
     std::{
         borrow::Cow,
-        cell::RefCell,
         collections::{HashMap, VecDeque},
         net::UdpSocket,
         ops::Range,
@@ -219,58 +220,18 @@ fn run_check_duplicate(
         .try_for_each(check_duplicate)
 }
 
-/// A `(slot, index)` or whole-`slot` cache entry that `ShredPayloadCache`
-/// must drop because `do_insert_shreds` reported the corresponding shred(s)
-/// as a duplicate conflict rather than actually storing them.
-enum CacheConflict {
-    Shred { slot: Slot, index: u32 },
-    Slot(Slot),
-}
-
-impl CacheConflict {
-    /// Only data-shred conflicts matter here -- `ShredPayloadCache` only
-    /// ever caches data shreds (see its `insert` call site below), so a
-    /// coding-shred conflict has nothing in the cache to invalidate.
-    fn from_duplicate(possible_duplicate: &PossibleDuplicateShred) -> Option<Self> {
-        match possible_duplicate {
-            PossibleDuplicateShred::Exists(shred)
-            | PossibleDuplicateShred::LastIndexConflict(shred, _)
-            | PossibleDuplicateShred::ErasureConflict(shred, _)
-            | PossibleDuplicateShred::MerkleRootConflict(shred, _)
-                if shred.is_data() =>
-            {
-                Some(CacheConflict::Shred {
-                    slot: shred.slot(),
-                    index: shred.index(),
-                })
-            }
-            PossibleDuplicateShred::Exists(_)
-            | PossibleDuplicateShred::LastIndexConflict(..)
-            | PossibleDuplicateShred::ErasureConflict(..)
-            | PossibleDuplicateShred::MerkleRootConflict(..) => None,
-            PossibleDuplicateShred::FixedFECChainedMerkleRootConflict(slot) => {
-                Some(CacheConflict::Slot(*slot))
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-/// A small, bounded, in-memory cache of recently-inserted data shred
-/// payloads, keyed by `(slot, index)`. Lets a just-completed data set's
-/// entries be decoded without reading its shred payloads back from RocksDB
-/// -- see `ledger::decoded_entries_cache` (the consumer side) for why this
-/// is purely a latency optimization, never relied on for correctness: any
-/// shred not found here just means the fast path isn't used for that data
-/// set, and `confirm_slot` falls back to its normal RocksDB-backed read.
+/// A small, bounded, in-memory cache of recently-accepted data shred payloads,
+/// keyed by `(slot, index)`. A data set's shreds usually arrive across several
+/// `run_insert` calls, so this lets the call that completes a data set decode
+/// it from memory -- it is the live replay path's only source of content (see
+/// `ledger::live_replay_entries`); there is no RocksDB fallback. It is fed
+/// exclusively with shreds `Blockstore` reports as *accepted* (never
+/// duplicates or conflicts), so a cached payload is always the one stored.
 ///
-/// Owned by the single `solWinInsert` thread (`run_insert` is called in a
-/// loop from that one thread only, see `start_window_insert_thread`), so no
-/// locking is needed here.
+/// Owned by the single `solWinInsert` thread, so no locking is needed.
 struct ShredPayloadCache {
     /// Slots currently cached, oldest first; bounds memory regardless of
-    /// per-slot shred counts. Normal operation should only ever need the
-    /// current and perhaps previous slot -- this is deliberately generous.
+    /// per-slot shred counts.
     slots: VecDeque<Slot>,
     max_slots: usize,
     payloads: HashMap<Slot, HashMap<u32, shred::Payload>>,
@@ -295,37 +256,12 @@ impl ShredPayloadCache {
                 }
             }
         }
-        // `self.payloads` always has an entry for `slot` at this point, either
-        // from this call or an earlier one.
         self.payloads.get_mut(&slot).unwrap().insert(index, payload);
-    }
-
-    /// Drops a single `(slot, index)` entry, used when `do_insert_shreds`
-    /// reports that the shred we speculatively cached for it was actually
-    /// rejected as a duplicate -- see the `conflicts` handling in
-    /// `run_insert`. Removing it (rather than trying to recover whatever was
-    /// really stored) is the safe choice: we can no longer tell whether the
-    /// payload we're holding is the accepted one or the rejected one, so a
-    /// cache miss (falling back to RocksDB) is the only guaranteed-correct
-    /// outcome.
-    fn remove(&mut self, slot: Slot, index: u32) {
-        if let Some(slot_payloads) = self.payloads.get_mut(&slot) {
-            slot_payloads.remove(&index);
-        }
-    }
-
-    /// Drops every cached payload for `slot`, used for conflicts that aren't
-    /// tied to a single shred index (e.g. a chained-merkle-root conflict).
-    fn invalidate_slot(&mut self, slot: Slot) {
-        if let Some(slot_payloads) = self.payloads.get_mut(&slot) {
-            slot_payloads.clear();
-        }
     }
 
     /// Returns the raw wire bytes for `indices.start..indices.end`, in index
     /// order, only if every one of them is present in the cache for `slot`.
-    /// `Payload`'s inner `Bytes` makes this a cheap refcount bump per shred,
-    /// not a copy.
+    /// `Payload`'s inner `Bytes` makes this a refcount bump per shred.
     fn get_contiguous(&self, slot: Slot, indices: &Range<u32>) -> Option<Vec<shred::Payload>> {
         let slot_payloads = self.payloads.get(&slot)?;
         indices
@@ -347,6 +283,7 @@ fn run_insert<'db, F>(
     metrics: &mut BlockstoreInsertionMetrics,
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
+    live_replay_sender: &LiveReplaySender,
     shred_payload_cache: &mut ShredPayloadCache,
 ) -> Result<()>
 where
@@ -385,19 +322,6 @@ where
         .with_label_values(&["deserialize"])
         .observe(now.elapsed().as_micros() as f64);
 
-    // Cache data shred payloads before they're handed to the blockstore
-    // insertion call below (which consumes `shreds` by value), so that any
-    // data set completed by this call can potentially be decoded straight
-    // from memory afterwards -- see `ShredPayloadCache`. Kept outside the
-    // `store_start` timer: this is bookkeeping for a *different* stage
-    // (confirm_slot's read_blockstore, measured on the replay side), not
-    // part of the blockstore store cost this timer tracks.
-    for (shred, _repair, _block_location) in &shreds {
-        if shred.is_data() {
-            shred_payload_cache.insert(shred.slot(), shred.index(), shred.payload().clone());
-        }
-    }
-
     let store_start = Instant::now();
     let before_insert_shreds_us = metrics.insert_shreds_elapsed_us;
     let before_write_batch_us = metrics.write_batch_elapsed_us;
@@ -405,21 +329,50 @@ where
     let before_insert_lock_us = metrics.insert_lock_elapsed_us;
     let before_commit_working_sets_us = metrics.commit_working_sets_elapsed_us;
 
-    // The payload cache above is populated speculatively, before duplicate
-    // detection runs below -- a data shred that turns out to conflict with
-    // one already in the blockstore (rejected, never written) would
-    // otherwise sit in the cache under the same `(slot, index)` key as the
-    // one actually stored, and a later cache hit could hand back the wrong
-    // bytes. Record every conflict `do_insert_shreds` reports here (via
-    // interior mutability, since `handle_duplicate` must stay `Fn`) and
-    // invalidate the corresponding cache entries once the call returns --
-    // see `ShredPayloadCache::remove`/`invalidate_slot`.
-    let shred_payload_conflicts: RefCell<Vec<CacheConflict>> = RefCell::new(Vec::new());
-    let wrapped_handle_duplicate = |possible_duplicate: PossibleDuplicateShred| {
-        if let Some(conflict) = CacheConflict::from_duplicate(&possible_duplicate) {
-            shred_payload_conflicts.borrow_mut().push(conflict);
+    // Runs inside `Blockstore`'s insertion call after the in-memory work and
+    // *before* its RocksDB write: decode every data set this call completed
+    // and send it to ReplayStage. That send is also replay's wake-up, so
+    // replay proceeds without waiting for the write. Everything it needs is
+    // either in `accepted` (this call's accepted data shreds, including
+    // erasure-recovered ones) or in `shred_payload_cache` (accepted by an
+    // earlier call).
+    //
+    // No RocksDB fallback exists for replay, so a data set that can't be
+    // decoded (a sibling shred evicted from the cache, or corrupt payloads)
+    // has its slot marked dead -- replay then errors out via the existing
+    // dead-slot path instead of stalling on it forever. Expected to be
+    // vanishingly rare given `shred_payload_cache`'s size.
+    let mut before_write = |completed: &[CompletedDataSetInfo],
+                            accepted: &[(Slot, u32, shred::Payload)]| {
+        for (slot, index, payload) in accepted {
+            shred_payload_cache.insert(*slot, *index, payload.clone());
         }
-        handle_duplicate(possible_duplicate);
+        for info in completed {
+            if info.location != BlockLocation::Original {
+                continue;
+            }
+            let decoded = shred_payload_cache
+                .get_contiguous(info.slot, &info.indices)
+                .and_then(Blockstore::decode_completed_data_set_from_payloads);
+            match decoded {
+                Some(component) => {
+                    let _ = live_replay_sender.send(LiveReplayMessage {
+                        slot: info.slot,
+                        indices: info.indices.clone(),
+                        component,
+                        slot_full: info.slot_full,
+                    });
+                }
+                None => {
+                    error!(
+                        "could not decode completed data set {:?} for slot {} for live replay; \
+                         marking slot dead (replay has no blockstore fallback)",
+                        info.indices, info.slot
+                    );
+                    let _ = blockstore.set_dead_slot(info.slot);
+                }
+            }
+        }
     };
 
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
@@ -428,8 +381,9 @@ where
         shred_recovery_context,
         pinnable_slice,
         write_batch,
-        &wrapped_handle_duplicate,
+        &handle_duplicate,
         metrics,
+        Some(&mut before_write),
     )?;
 
     let blockstore_store_us = &solana_metrics::pipeline_metrics::BLOCKSTORE_STORE_DURATION_US;
@@ -452,30 +406,6 @@ where
         .with_label_values(&["commit_working_sets"])
         .observe((metrics.commit_working_sets_elapsed_us - before_commit_working_sets_us) as f64);
 
-    for conflict in shred_payload_conflicts.into_inner() {
-        match conflict {
-            CacheConflict::Shred { slot, index } => shred_payload_cache.remove(slot, index),
-            CacheConflict::Slot(slot) => shred_payload_cache.invalidate_slot(slot),
-        }
-    }
-
-    // Opportunistically decode each just-completed data set straight from the
-    // shred payloads cached above, and hand it to `decoded_entries_cache` for
-    // ReplayStage to pick up -- skipped (not an error) whenever any of the
-    // set's shreds aren't in the cache (e.g. erasure-recovered, invalidated
-    // as a duplicate-conflict above, or inserted by an earlier call now
-    // evicted) or decoding fails for any reason; the existing RocksDB-backed
-    // path in `confirm_slot` is always the fallback.
-    for info in &completed_data_sets {
-        let Some(payloads) = shred_payload_cache.get_contiguous(info.slot, &info.indices) else {
-            continue;
-        };
-        let Some(entries) = Blockstore::decode_completed_data_set_from_payloads(payloads) else {
-            continue;
-        };
-        decoded_entries_cache::insert(info.slot, info.indices.clone(), entries);
-    }
-
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;
     }
@@ -487,6 +417,7 @@ pub struct WindowServiceChannels {
     pub verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     pub retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     pub completed_data_sets_sender: Option<CompletedDataSetsSender>,
+    pub live_replay_sender: LiveReplaySender,
     pub duplicate_slots_sender: DuplicateSlotSender,
     pub repair_service_channels: RepairServiceChannels,
     pub block_id_repair_channels: BlockIdRepairChannels,
@@ -497,6 +428,7 @@ impl WindowServiceChannels {
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
+        live_replay_sender: LiveReplaySender,
         duplicate_slots_sender: DuplicateSlotSender,
         repair_service_channels: RepairServiceChannels,
         block_id_repair_channels: BlockIdRepairChannels,
@@ -505,6 +437,7 @@ impl WindowServiceChannels {
             verified_receiver,
             retransmit_sender,
             completed_data_sets_sender,
+            live_replay_sender,
             duplicate_slots_sender,
             repair_service_channels,
             block_id_repair_channels,
@@ -540,6 +473,7 @@ impl WindowService {
             verified_receiver,
             retransmit_sender,
             completed_data_sets_sender,
+            live_replay_sender,
             duplicate_slots_sender,
             repair_service_channels,
             block_id_repair_channels,
@@ -586,6 +520,7 @@ impl WindowService {
             verified_receiver,
             duplicate_sender,
             completed_data_sets_sender,
+            live_replay_sender,
             retransmit_sender,
         );
 
@@ -632,6 +567,7 @@ impl WindowService {
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
+        live_replay_sender: LiveReplaySender,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     ) -> JoinHandle<()> {
         let reed_solomon_cache = ReedSolomonCache::default();
@@ -663,11 +599,10 @@ impl WindowService {
                 );
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
                 let mut write_batch = blockstore.get_write_batch().unwrap();
-                // Bound of 16 slots is deliberately generous: normal operation only
-                // ever needs the current (and perhaps the just-previous) slot, since
-                // this cache exists only to let a just-completed data set skip the
-                // RocksDB round trip in confirm_slot (see ShredPayloadCache docs).
-                let mut shred_payload_cache = ShredPayloadCache::new(16);
+                // 64 slots is deliberately generous: this is the ONLY source live
+                // replay has for a completed data set's content, so a data set whose
+                // payloads are evicted before it completes gets its slot marked dead.
+                let mut shred_payload_cache = ShredPayloadCache::new(64);
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
@@ -683,6 +618,7 @@ impl WindowService {
                         &mut metrics,
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
+                        &live_replay_sender,
                         &mut shred_payload_cache,
                     ) {
                         ws_metrics.record_error(&e);

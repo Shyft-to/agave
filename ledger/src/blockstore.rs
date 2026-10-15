@@ -13,7 +13,6 @@ use {
             WriteBatch,
         },
         blockstore_meta::*,
-        decoded_entries_cache,
         blockstore_options::{
             BLOCKSTORE_DIRECTORY_ROCKS_LEVEL, BlockstoreOptions, LedgerColumnOptions,
         },
@@ -139,11 +138,18 @@ type UpdateParentShredParentKey = (BlockLocation, Slot, u32);
 type UpdateParentShredParentCache =
     LruCache<UpdateParentShredParentKey, /* parent used for shred filtering */ Slot>;
 
+/// Called by `do_insert_shreds_locked` after in-memory insertion and before
+/// the RocksDB write, with the data sets newly completed by this call and
+/// every `BlockLocation::Original` data shred it accepted (received or
+/// erasure-recovered) as `(slot, index, payload)`.
+pub type BeforeWriteHook<'h> = dyn FnMut(&[CompletedDataSetInfo], &[(Slot, u32, Payload)]) + 'h;
+
 struct SignalUpdates {
     should_signal: bool,
     newly_completed_slots_with_last_index: Vec<(u64, u64)>,
     update_parent_signals: Vec<UpdateParentSignal>,
 }
+
 
 #[derive(Debug)]
 struct CertificateForwarder {
@@ -323,6 +329,17 @@ pub struct CompletedDataSetInfo {
     pub slot: Slot,
     /// Data [`Shred`]s' indices in this set.
     pub indices: Range<u32>,
+    /// Whether this data set's last shred is also the slot's last shred
+    /// (`Shred::last_in_slot()`), i.e. this is the final data set of the
+    /// slot. Computed in-memory at insertion time, right where
+    /// `last_in_slot` is already known -- lets a live consumer (see
+    /// `live_replay_entries`) know a slot is fully received without any
+    /// extra blockstore read.
+    pub slot_full: bool,
+    /// Column the shreds were inserted into. Only `BlockLocation::Original`
+    /// completions describe the block replay follows; alternate-block
+    /// completions must not be fed to the live replay path.
+    pub location: BlockLocation,
 }
 
 pub struct BlockstoreSignals {
@@ -2243,6 +2260,7 @@ impl Blockstore {
         pinnable_slice: &mut DBPinnableSlice<'db>,
         write_batch: &mut WriteBatch,
         metrics: &mut BlockstoreInsertionMetrics,
+        before_write: Option<&mut BeforeWriteHook<'_>>,
     ) -> Result<InsertResults> {
         let mut total_start = Measure::start("Total elapsed");
         write_batch.clear();
@@ -2261,6 +2279,7 @@ impl Blockstore {
             pinnable_slice,
             write_batch,
             metrics,
+            before_write,
         );
         write_batch.clear();
 
@@ -2284,6 +2303,7 @@ impl Blockstore {
         pinnable_slice: &mut DBPinnableSlice<'db>,
         write_batch: &mut WriteBatch,
         metrics: &mut BlockstoreInsertionMetrics,
+        before_write: Option<&mut BeforeWriteHook<'_>>,
     ) -> Result<InsertResults> {
         let shreds = shreds.into_iter();
         let mut shred_insertion_tracker = ShredInsertionTracker::new(shreds.len(), write_batch);
@@ -2322,6 +2342,26 @@ impl Blockstore {
             newly_completed_slots_with_last_index,
             update_parent_signals,
         } = self.commit_updates_to_write_batch(&mut shred_insertion_tracker, metrics)?;
+
+        // Everything above is in-memory only; the RocksDB write below is the
+        // only disk I/O in this function. Let the caller act on this call's
+        // results *before* paying for it: `window_service` uses this to decode
+        // completed data sets and send them to replay without waiting on the
+        // write. The hook sees every data shred this call actually accepted
+        // into `BlockLocation::Original` (received and erasure-recovered
+        // alike; duplicates/conflicts are never in this set) and the data
+        // sets they (together with earlier calls' shreds) completed.
+        if let Some(before_write) = before_write {
+            let accepted: Vec<(Slot, u32, Payload)> = shred_insertion_tracker
+                .just_inserted_shreds
+                .iter()
+                .filter(|((location, _), shred)| {
+                    *location == BlockLocation::Original && shred.is_data()
+                })
+                .map(|(_, shred)| (shred.slot(), shred.index(), shred.payload().clone()))
+                .collect();
+            before_write(&shred_insertion_tracker.newly_completed_data_sets, &accepted);
+        }
 
         // Write out the accumulated batch.
         let mut start = Measure::start("Write Batch");
@@ -2381,6 +2421,7 @@ impl Blockstore {
             &mut write_batch,
             handle_duplicate,
             metrics,
+            None,
         )
     }
 
@@ -2402,6 +2443,9 @@ impl Blockstore {
         write_batch: &mut WriteBatch,
         handle_duplicate: &F,
         metrics: &mut BlockstoreInsertionMetrics,
+        // Called after in-memory insertion and before the RocksDB write --
+        // see `do_insert_shreds_locked`.
+        before_write: Option<&mut BeforeWriteHook<'_>>,
     ) -> Result<Vec<CompletedDataSetInfo>>
     where
         F: Fn(PossibleDuplicateShred),
@@ -2416,6 +2460,7 @@ impl Blockstore {
             pinnable_slice,
             write_batch,
             metrics,
+            before_write,
         )?;
 
         for shred in duplicate_shreds {
@@ -2510,6 +2555,7 @@ impl Blockstore {
             pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )?;
 
         Ok(())
@@ -2628,6 +2674,7 @@ impl Blockstore {
             pinnable_slice,
             write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )?;
         Ok(insert_results.completed_data_set_infos)
     }
@@ -2660,6 +2707,7 @@ impl Blockstore {
                 &mut pinnable_slice,
                 &mut write_batch,
                 &mut BlockstoreInsertionMetrics::default(),
+                None,
             )
             .unwrap();
         insert_results.duplicate_shreds
@@ -3629,15 +3677,32 @@ impl Blockstore {
         // We don't want only a subset of these changes going through.
         self.put_data_shred_in_batch(write_batch, slot, index, location, shred.payload());
         data_index.insert(index);
-        let newly_completed_data_sets = update_slot_meta(
+        let newly_completed_ranges = update_slot_meta(
             last_in_slot,
             last_in_data,
             slot_meta,
             index as u32,
             new_consumed,
             data_index,
-        )
-        .map(move |indices| CompletedDataSetInfo { slot, indices });
+        );
+        // Read back AFTER update_slot_meta so this reflects the slot's state
+        // following this shred's insertion -- `is_full`/`last_index` are
+        // plain Copy values, not a borrow, so capturing them below doesn't
+        // tie this function's returned iterator to `slot_meta`'s lifetime.
+        let is_full = slot_meta.is_full();
+        let last_index = slot_meta.last_index;
+        let newly_completed_data_sets = newly_completed_ranges.map(move |indices| {
+            // Of however many ranges this call yields, only the one whose
+            // end reaches the slot's own last index (if the slot is now
+            // fully received) is the slot-final data set.
+            let slot_full = is_full && last_index.is_some_and(|li| u64::from(indices.end) == li + 1);
+            CompletedDataSetInfo {
+                slot,
+                indices,
+                slot_full,
+                location,
+            }
+        });
 
         self.slots_stats.record_shred(
             shred.slot(),
@@ -4987,57 +5052,17 @@ impl Blockstore {
         Ok((components, completed_ranges, slot_meta.is_full()))
     }
 
-    /// Like [`Self::get_slot_components_with_shred_info`], but first checks
-    /// `decoded_entries_cache` for every completed range and, if all of them are
-    /// present, reuses those already-decoded entries instead of re-reading the
-    /// data shred payloads from RocksDB and re-deshredding/re-deserializing them
-    /// (see `decoded_entries_cache` module docs for who populates this and why).
-    ///
-    /// Any miss -- including a `BlockMarker` range, which the cache never
-    /// covers -- falls back to the exact `get_slot_components_in_block` call
-    /// `get_slot_components_with_shred_info` would have made, so this function
-    /// is behaviorally identical to it, just sometimes faster.
-    pub fn get_slot_components_with_shred_info_fast(
-        &self,
-        slot: Slot,
-        start_index: u64,
-        allow_dead_slots: bool,
-    ) -> Result<(Vec<BlockComponent>, Vec<Range<u32>>, bool)> {
-        let Some((completed_ranges, slot_meta, _)) =
-            self.get_slot_data_with_shred_info_common(slot, start_index, allow_dead_slots)?
-        else {
-            return Ok((vec![], vec![], false));
-        };
-
-        if let Some(entries_per_range) =
-            decoded_entries_cache::take_if_fully_cached(slot, &completed_ranges)
-        {
-            let components = entries_per_range
-                .into_iter()
-                .map(BlockComponent::EntryBatch)
-                .collect();
-            return Ok((components, completed_ranges, slot_meta.is_full()));
-        }
-
-        let components =
-            self.get_slot_components_in_block(slot, &completed_ranges, Some(&slot_meta))?;
-        debug_assert_eq!(completed_ranges.len(), components.len());
-        Ok((components, completed_ranges, slot_meta.is_full()))
-    }
-
-    /// Decodes a completed data set's entries directly from already-verified,
+    /// Decodes a completed data set directly from already-verified,
     /// in-memory shred payloads (see `window_service::run_insert`'s
-    /// `ShredPayloadCache`), without touching RocksDB at all. Returns `None`
-    /// for a `BlockMarker` component (out of scope for the in-memory fast
-    /// path; `confirm_slot`'s normal RocksDB-backed path handles those) or on
-    /// any decode failure -- callers should treat `None` the same as "not
-    /// cached" and fall back to the normal read path.
-    pub fn decode_completed_data_set_from_payloads(payloads: Vec<Payload>) -> Option<Vec<Entry>> {
+    /// `ShredPayloadCache`), without touching RocksDB at all. This is the
+    /// SOLE decode path feeding `live_replay_entries` -- unlike the deleted
+    /// `decoded_entries_cache`'s version of this function, it handles
+    /// `BlockMarker` components too (not just `EntryBatch`), since there is
+    /// no RocksDB fallback left to hand those off to. Returns `None` only on
+    /// an actual decode failure (corrupt/incomplete payload set).
+    pub fn decode_completed_data_set_from_payloads(payloads: Vec<Payload>) -> Option<BlockComponent> {
         let buf = Shredder::deshred(payloads).ok()?;
-        match wincode::deserialize::<BlockComponent>(&buf).ok()? {
-            BlockComponent::EntryBatch(entries) => Some(entries),
-            BlockComponent::BlockMarker(_) => None,
-        }
+        wincode::deserialize::<BlockComponent>(&buf).ok()
     }
 
     /// Gets accounts used in transactions in the slot range [starting_slot, ending_slot].
@@ -5457,13 +5482,29 @@ impl Blockstore {
     pub fn remove_dead_slot(&self, slot: Slot) -> Result<()> {
         // `dead_slots_cache` must be invalidated here too, or `is_dead` keeps
         // returning `true` for this slot from the stale cache entry even
-        // after RocksDB's `dead_slots_cf` is cleared below -- this function
-        // is the one place that un-marks a slot as dead (e.g. Alpenglow
-        // genesis cleanup repurposing a slot that was provisionally marked
-        // dead), so dead-marking is NOT monotonic and the cache can't just
-        // backfill on a miss the way it does for the `true` case.
+        // after RocksDB's `dead_slots_cf` is cleared below. This and
+        // `clear_dead_slots_cache_range` (see its docs -- `blockstore_purge`
+        // un-marks slots dead too, via a range delete) are the two places
+        // dead-marking gets undone, so the cache can't just backfill on a
+        // miss the way it does for the `true` case.
         self.dead_slots_cache.remove(&slot);
         self.dead_slots_cf.delete(slot)
+    }
+
+    /// Clears every cached dead-slot marker in `[from_slot, to_slot]`.
+    /// `blockstore_purge::purge_range` range-deletes `dead_slots_cf`
+    /// directly (not through `remove_dead_slot`) as part of the normal
+    /// ledger cleanup/purge path, so `dead_slots_cache` needs its own
+    /// matching invalidation here -- callers MUST call this only after the
+    /// write batch containing that range-delete has actually committed
+    /// (not before/during staging), or a concurrent `is_dead` call could
+    /// read the not-yet-deleted RocksDB value in the gap and backfill the
+    /// cache right back with the stale `true`, reintroducing the same bug.
+    /// Caught by `test_clear_unconfirmed_slot` when this cache was
+    /// introduced without this.
+    pub(crate) fn clear_dead_slots_cache_range(&self, from_slot: Slot, to_slot: Slot) {
+        self.dead_slots_cache
+            .retain(|slot| !(from_slot..=to_slot).contains(slot));
     }
 
     pub fn remove_slot_duplicate_proof(&self, slot: Slot) -> Result<()> {
