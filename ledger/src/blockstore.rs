@@ -3685,17 +3685,16 @@ impl Blockstore {
             new_consumed,
             data_index,
         );
-        // Read back AFTER update_slot_meta so this reflects the slot's state
-        // following this shred's insertion -- `is_full`/`last_index` are
-        // plain Copy values, not a borrow, so capturing them below doesn't
-        // tie this function's returned iterator to `slot_meta`'s lifetime.
-        let is_full = slot_meta.is_full();
+        // `last_index` is set by the time any data set containing the slot's
+        // last shred completes. Deliberately NOT gated on `slot_meta.is_full()`
+        // (all earlier shreds consumed): a range is reported as soon as its own
+        // shreds are all present, so the slot's final data set can complete
+        // while an earlier gap is still open -- and it is reported only once,
+        // so it must already carry the right `slot_full`. Plain Copy value, so
+        // capturing it doesn't tie the returned iterator to `slot_meta`.
         let last_index = slot_meta.last_index;
         let newly_completed_data_sets = newly_completed_ranges.map(move |indices| {
-            // Of however many ranges this call yields, only the one whose
-            // end reaches the slot's own last index (if the slot is now
-            // fully received) is the slot-final data set.
-            let slot_full = is_full && last_index.is_some_and(|li| u64::from(indices.end) == li + 1);
+            let slot_full = last_index.is_some_and(|li| u64::from(indices.end) == li + 1);
             CompletedDataSetInfo {
                 slot,
                 indices,
