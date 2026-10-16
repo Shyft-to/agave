@@ -675,6 +675,8 @@ fn test_data_set_completed_on_insert() {
         vec![CompletedDataSetInfo {
             slot,
             indices: 0..num_shreds as u32,
+            slot_full: true,
+            location: BlockLocation::Original,
         }]
     );
     // Inserting shreds again doesn't trigger notification
@@ -4689,6 +4691,7 @@ fn test_recovery() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     let shred_bufs: Vec<_> = data_shreds.iter().map(Shred::payload).cloned().collect();
@@ -4735,6 +4738,7 @@ fn test_skip_alt_recovery() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
 
@@ -4763,6 +4767,7 @@ fn test_skip_alt_recovery() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut metrics,
+            None,
         )
         .unwrap();
 
@@ -4863,6 +4868,7 @@ fn test_recovery_discards_unexpected_data_complete_shreds() {
             &mut pinnable_slice,
             &mut write_batch,
             &mut metrics,
+            None,
         )
         .unwrap();
 
@@ -6457,6 +6463,7 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     assert!(insert_results.duplicate_shreds.is_empty());
@@ -6555,6 +6562,7 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     assert!(insert_results.duplicate_shreds.is_empty());
@@ -6588,6 +6596,7 @@ fn insert_test_block_at_location(
             &mut pinnable_slice,
             &mut write_batch,
             &mut BlockstoreInsertionMetrics::default(),
+            None,
         )
         .unwrap();
     assert!(insert_results.duplicate_shreds.is_empty());
@@ -6723,6 +6732,7 @@ fn test_get_data_shreds_for_slot() {
                 &mut pinnable_slice,
                 &mut write_batch,
                 &mut BlockstoreInsertionMetrics::default(),
+                None,
             )
             .unwrap();
         assert!(insert_results.duplicate_shreds.is_empty());
@@ -7428,4 +7438,55 @@ fn test_connectivity_does_not_propagate_through_incomplete_slot() {
     // Children stay disconnected since parent 48 is incomplete
     assert!(!blockstore.meta(60).unwrap().unwrap().is_connected());
     assert!(!blockstore.meta(70).unwrap().unwrap().is_connected());
+}
+
+#[test]
+fn test_slot_full_flag_when_final_data_set_completes_before_earlier_gap() {
+    // A data set is reported the moment its own shreds are all present, even
+    // while an earlier data set is still missing. The slot's final data set
+    // must already carry `slot_full`, since it is never reported again.
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    let slot = 1;
+    let parent_slot = 0;
+
+    let first_entries = create_ticks(4, 0, Hash::default());
+    let first_shreds = entries_to_test_shreds(&first_entries, slot, parent_slot, false, 0);
+    let next_shred_index = first_shreds.len() as u32;
+
+    let final_entries = create_ticks(4, 0, Hash::default());
+    let final_shreds: Vec<Shred> = Shredder::new(slot, parent_slot, 0, 0)
+        .unwrap()
+        .make_merkle_shreds_from_entries(
+            &Keypair::new(),
+            &final_entries,
+            true, // is_last_in_slot
+            Hash::new_unique(),
+            next_shred_index,
+            next_shred_index,
+            &ReedSolomonCache::default(),
+            &mut ProcessShredsStats::default(),
+        )
+        .filter(Shred::is_data)
+        .collect();
+    let end_index = next_shred_index + final_shreds.len() as u32;
+
+    // Only the earlier data set's closing shred (marks the boundary) arrives
+    // first; the rest of it stays missing while the final data set completes.
+    let mut first_shreds = first_shreds;
+    let boundary_shred = first_shreds.pop().unwrap();
+    assert!(boundary_shred.data_complete());
+    assert!(blockstore.insert_shreds([boundary_shred], false).unwrap().is_empty());
+
+    let completed = blockstore.insert_shreds(final_shreds, false).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].indices, next_shred_index..end_index);
+    assert!(completed[0].slot_full, "final data set must be slot_full");
+    assert_eq!(completed[0].location, BlockLocation::Original);
+
+    // Earlier data set arrives afterwards and is not the final one.
+    let completed = blockstore.insert_shreds(first_shreds, false).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].indices, 0..next_shred_index);
+    assert!(!completed[0].slot_full);
 }

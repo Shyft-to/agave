@@ -184,6 +184,7 @@ fn recv_loop<P: SocketProvider>(
         };
         packet_batch.resize(PACKETS_PER_BATCH, Packet::default());
 
+        let receive_start = Instant::now();
         loop {
             // Check for exit signal, even if socket is busy
             // (for instance the leader transaction socket)
@@ -198,6 +199,14 @@ fn recv_loop<P: SocketProvider>(
 
             if let Ok(len) = result {
                 if len > 0 {
+                    // `stats.name` is shared by every UDP receiver in the validator (TPU
+                    // fetch, repair, shreds, ...); only the shred-path ones feed the
+                    // shred pipeline latency metrics.
+                    if stats.name.starts_with("shred_fetch") {
+                        solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+                            .with_label_values(&["receive"])
+                            .observe(receive_start.elapsed().as_micros() as f64);
+                    }
                     let StreamerReceiveStats {
                         packets_count,
                         packet_batches_count,

@@ -46,6 +46,7 @@ use {
         },
         create_new_tmp_ledger,
         entry_notifier_service::EntryNotification,
+        live_replay_entries::{LiveReplayEntries, LiveReplayMessage},
         genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
         get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
         shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
@@ -169,7 +170,34 @@ impl ProcessActiveBanksContext {
             replay_mode: ForkReplayMode::Serial,
             replay_verification_worker_pool,
             migration_status,
+            live_replay_entries: LiveReplayEntries::default(),
         }
+    }
+}
+
+/// Stand-in for what `window_service` does in production: hands the entries
+/// already persisted in `blockstore` for `slot` to the live replay queue.
+/// Undecodable data degrades to replaying the slot from the blockstore.
+fn feed_live_replay_entries_from_blockstore(
+    context: &ProcessActiveBanksContext,
+    blockstore: &Blockstore,
+    slot: Slot,
+) {
+    match blockstore.get_slot_components_with_shred_info(slot, 0, true) {
+        Ok((components, ranges, slot_full)) => {
+            let last = components.len().saturating_sub(1);
+            for (i, (component, indices)) in components.into_iter().zip(ranges).enumerate() {
+                context.live_replay_entries.push(LiveReplayMessage::Entries {
+                    slot,
+                    indices,
+                    component,
+                    slot_full: slot_full && i == last,
+                });
+            }
+        }
+        Err(_) => context
+            .live_replay_entries
+            .push(LiveReplayMessage::ReplayFromBlockstore { slot }),
     }
 }
 
@@ -1020,6 +1048,8 @@ fn test_dead_fork_entry_deserialize_failure() {
             .collect()
     });
 
+    // window_service can't decode this data set, so replay reads the slot
+    // from the blockstore, whose normal path reports the real error.
     assert_matches!(
         res,
         Err(BlockstoreProcessorError::FailedToLoadEntries(
@@ -1159,6 +1189,7 @@ fn do_test_dead_slot_on_complete_bank(failure: CompleteBankFailure) {
         let shreds = entries_to_test_shreds(&entries, slot, bank.parent_slot(), true, 0);
         blockstore.insert_shreds(shreds, false).unwrap();
         let cluster_info = cluster_info_for_tests();
+        feed_live_replay_entries_from_blockstore(&process_active_banks_context, &blockstore, slot);
 
         ReplaySlotFromBlockstore {
             is_slot_dead: false,
@@ -1569,6 +1600,11 @@ where
             replay_vote_sender,
         );
         let cluster_info = cluster_info_for_tests();
+        feed_live_replay_entries_from_blockstore(
+            &process_active_banks_context,
+            &blockstore,
+            bank1.slot(),
+        );
         let res = ReplayStage::replay_blockstore_into_bank(
             cluster_info.my_shred_version(),
             &process_active_banks_context,
@@ -2913,6 +2949,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for i in 5..=7 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -2953,6 +2990,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for i in 4..=6 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -2976,6 +3014,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for i in 1..=6 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -3043,6 +3082,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &LiveReplayEntries::default(),
     );
     for slot in &[3, 5, 6, 7] {
         assert!(bank_forks.read().unwrap().get(*slot).is_none());
@@ -4604,6 +4644,7 @@ fn test_dump_then_repair_correct_slots() {
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
     assert_eq!(should_be_dumped, dumped_slots_receiver.recv().ok().unwrap());
 
@@ -4723,6 +4764,7 @@ fn setup_vote_then_rollback(
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
 
     // Check everything was purged properly
@@ -6117,6 +6159,7 @@ fn test_dumped_slot_not_causing_panic() {
         &dumped_slots_sender,
         my_pubkey,
         &leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
     assert_eq!(
         dumped_slots_receiver.recv_timeout(Duration::from_secs(1)),
@@ -6202,6 +6245,7 @@ fn test_dump_own_slots_fails() {
         &dumped_slots_sender,
         my_pubkey,
         leader_schedule_cache,
+        &LiveReplayEntries::default(),
     );
 }
 

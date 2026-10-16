@@ -479,6 +479,9 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
     );
     timer_start.stop();
     stats.total_time += timer_start.as_us();
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["retransmit"])
+        .observe(timer_start.as_us() as f64);
     stats.maybe_submit(
         &root_bank,
         &working_bank,

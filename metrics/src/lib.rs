@@ -3,6 +3,10 @@
 pub mod counter;
 pub mod datapoint;
 pub mod metrics;
+pub mod pipeline_latency;
+pub mod pipeline_metrics;
+pub mod prometheus_metrics;
+pub mod prometheus_server;
 pub use crate::metrics::{flush, set_host_id, set_panic_hook, submit};
 use std::sync::{
     Arc,

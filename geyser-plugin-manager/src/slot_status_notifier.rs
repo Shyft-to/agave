@@ -53,6 +53,7 @@ impl SlotStatusNotifierImpl {
             return;
         }
 
+        let notify_start = std::time::Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             match plugin.update_slot_status(slot, parent, &slot_status) {
                 Err(err) => {
@@ -72,6 +73,9 @@ impl SlotStatusNotifierImpl {
                 }
             }
         }
+        solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+            .with_label_values(&["slot_status"])
+            .observe(notify_start.elapsed().as_micros() as f64);
     }
 
     pub fn notify_bank_status(
@@ -81,11 +85,36 @@ impl SlotStatusNotifierImpl {
         slot_status: SlotStatus,
         bank_id: BankId,
     ) {
+        // Recorded unconditionally (ahead of the early-return below) so slot
+        // confirmation timing doesn't depend on whether any Geyser plugin is
+        // loaded -- it's a validator-level concern, not a plugin one.
+        match slot_status {
+            SlotStatus::CreatedBank => {
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_created_bank(slot);
+                // Also observes "first shred fetched -> bank created" (replay
+                // wake-up latency) against the executed_tx tracker's existing
+                // per-slot start timestamp, without disturbing it.
+                solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_bank_created(slot);
+            }
+            SlotStatus::Processed => {
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_frozen(slot);
+                // Direct measurement of first-shred-to-frozen, to avoid
+                // inferring it by subtracting two independently-computed
+                // percentiles (see mark_bank_frozen's doc comment).
+                solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_bank_frozen(slot);
+            }
+            SlotStatus::Confirmed => {
+                solana_metrics::pipeline_latency::SLOT_CONFIRMATION_LATENCY.mark_confirmed(slot)
+            }
+            _ => {}
+        }
+
         let plugin_manager = self.plugin_manager.load();
         if plugin_manager.plugins.is_empty() {
             return;
         }
 
+        let notify_start = std::time::Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             match plugin.update_bank_status(slot, parent, &slot_status, bank_id) {
                 Err(err) => {
@@ -105,6 +134,9 @@ impl SlotStatusNotifierImpl {
                 }
             }
         }
+        solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+            .with_label_values(&["slot_status"])
+            .observe(notify_start.elapsed().as_micros() as f64);
     }
 }
 

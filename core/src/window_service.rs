@@ -19,9 +19,12 @@ use {
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
-        blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
+        blockstore::{
+            Blockstore, BlockstoreInsertionMetrics, CompletedDataSetInfo, PossibleDuplicateShred,
+        },
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
+        live_replay_entries::{LiveReplayMessage, LiveReplaySender},
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -31,7 +34,9 @@ use {
     solana_streamer::evicting_sender::EvictingSender,
     std::{
         borrow::Cow,
+        collections::{HashMap, VecDeque},
         net::UdpSocket,
+        ops::Range,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -215,6 +220,57 @@ fn run_check_duplicate(
         .try_for_each(check_duplicate)
 }
 
+/// A small, bounded, in-memory cache of recently-accepted data shred payloads,
+/// keyed by `(slot, index)`. A data set's shreds usually arrive across several
+/// `run_insert` calls, so this lets the call that completes a data set decode
+/// it from memory -- it is the live replay path's only source of content (see
+/// `ledger::live_replay_entries`); there is no RocksDB fallback. It is fed
+/// exclusively with shreds `Blockstore` reports as *accepted* (never
+/// duplicates or conflicts), so a cached payload is always the one stored.
+///
+/// Owned by the single `solWinInsert` thread, so no locking is needed.
+struct ShredPayloadCache {
+    /// Slots currently cached, oldest first; bounds memory regardless of
+    /// per-slot shred counts.
+    slots: VecDeque<Slot>,
+    max_slots: usize,
+    payloads: HashMap<Slot, HashMap<u32, shred::Payload>>,
+}
+
+impl ShredPayloadCache {
+    fn new(max_slots: usize) -> Self {
+        Self {
+            slots: VecDeque::with_capacity(max_slots),
+            max_slots,
+            payloads: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, slot: Slot, index: u32, payload: shred::Payload) {
+        if !self.payloads.contains_key(&slot) {
+            self.slots.push_back(slot);
+            self.payloads.insert(slot, HashMap::new());
+            while self.slots.len() > self.max_slots {
+                if let Some(oldest) = self.slots.pop_front() {
+                    self.payloads.remove(&oldest);
+                }
+            }
+        }
+        self.payloads.get_mut(&slot).unwrap().insert(index, payload);
+    }
+
+    /// Returns the raw wire bytes for `indices.start..indices.end`, in index
+    /// order, only if every one of them is present in the cache for `slot`.
+    /// `Payload`'s inner `Bytes` makes this a refcount bump per shred.
+    fn get_contiguous(&self, slot: Slot, indices: &Range<u32>) -> Option<Vec<shred::Payload>> {
+        let slot_payloads = self.payloads.get(&slot)?;
+        indices
+            .clone()
+            .map(|index| slot_payloads.get(&index).cloned())
+            .collect()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_insert<'db, F>(
     thread_pool: &ThreadPool,
@@ -227,6 +283,8 @@ fn run_insert<'db, F>(
     metrics: &mut BlockstoreInsertionMetrics,
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
+    live_replay_sender: &LiveReplaySender,
+    shred_payload_cache: &mut ShredPayloadCache,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -234,9 +292,14 @@ where
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
+    solana_metrics::pipeline_metrics::VERIFIED_SHREDS_QUEUE_LENGTH
+        .set(verified_receiver.len() as f64);
     shreds.extend(verified_receiver.try_iter().flatten());
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["verified_recv_wait"])
+        .observe(shred_receiver_elapsed.as_us() as f64);
     ws_metrics.run_insert_count += 1;
     let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
         if repair {
@@ -246,7 +309,7 @@ where
         Some((Cow::Owned(shred), repair, block_location))
     };
     let now = Instant::now();
-    let shreds: Vec<_> = thread_pool.install(|| {
+    let shreds: Vec<(Cow<'_, Shred>, bool, BlockLocation)> = thread_pool.install(|| {
         shreds
             .into_par_iter()
             .with_min_len(32)
@@ -255,6 +318,65 @@ where
     });
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
     ws_metrics.num_shreds_received += shreds.len();
+    solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+        .with_label_values(&["deserialize"])
+        .observe(now.elapsed().as_micros() as f64);
+
+    let store_start = Instant::now();
+    let before_insert_shreds_us = metrics.insert_shreds_elapsed_us;
+    let before_write_batch_us = metrics.write_batch_elapsed_us;
+    let before_recovery_us = metrics.shred_recovery_elapsed_us;
+    let before_insert_lock_us = metrics.insert_lock_elapsed_us;
+    let before_commit_working_sets_us = metrics.commit_working_sets_elapsed_us;
+
+    // Runs inside `Blockstore`'s insertion call after the in-memory work and
+    // *before* its RocksDB write: decode every data set this call completed
+    // and send it to ReplayStage. That send is also replay's wake-up, so
+    // replay proceeds without waiting for the write. Everything it needs is
+    // either in `accepted` (this call's accepted data shreds, including
+    // erasure-recovered ones) or in `shred_payload_cache` (accepted by an
+    // earlier call).
+    //
+    // If a data set can't be assembled from memory (a sibling shred was
+    // persisted before a restart, or aged out of `shred_payload_cache`),
+    // tell replay to read the rest of that slot from the persisted
+    // blockstore. This is the rare recovery path; the steady state is the
+    // channel. It never marks a slot dead -- a genuinely corrupt data set
+    // surfaces through the normal blockstore read path.
+    let mut before_write = |completed: &[CompletedDataSetInfo],
+                            accepted: &[(Slot, u32, shred::Payload)]| {
+        for (slot, index, payload) in accepted {
+            shred_payload_cache.insert(*slot, *index, payload.clone());
+        }
+        for info in completed {
+            if info.location != BlockLocation::Original {
+                continue;
+            }
+            let decoded = shred_payload_cache
+                .get_contiguous(info.slot, &info.indices)
+                .and_then(Blockstore::decode_completed_data_set_from_payloads);
+            match decoded {
+                Some(component) => {
+                    let _ = live_replay_sender.send(LiveReplayMessage::Entries {
+                        slot: info.slot,
+                        indices: info.indices.clone(),
+                        component,
+                        slot_full: info.slot_full,
+                    });
+                }
+                None => {
+                    warn!(
+                        "completed data set {:?} of slot {} not assembled from memory; replay \
+                         will read this slot from the blockstore",
+                        info.indices, info.slot
+                    );
+                    let _ = live_replay_sender
+                        .send(LiveReplayMessage::ReplayFromBlockstore { slot: info.slot });
+                }
+            }
+        }
+    };
+
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         false, // is_trusted
@@ -263,7 +385,28 @@ where
         write_batch,
         &handle_duplicate,
         metrics,
+        Some(&mut before_write),
     )?;
+
+    let blockstore_store_us = &solana_metrics::pipeline_metrics::BLOCKSTORE_STORE_DURATION_US;
+    blockstore_store_us
+        .with_label_values(&["total"])
+        .observe(store_start.elapsed().as_micros() as f64);
+    blockstore_store_us
+        .with_label_values(&["insert_shreds"])
+        .observe((metrics.insert_shreds_elapsed_us - before_insert_shreds_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["write_batch"])
+        .observe((metrics.write_batch_elapsed_us - before_write_batch_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["recovery"])
+        .observe((metrics.shred_recovery_elapsed_us - before_recovery_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["insert_lock"])
+        .observe((metrics.insert_lock_elapsed_us - before_insert_lock_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["commit_working_sets"])
+        .observe((metrics.commit_working_sets_elapsed_us - before_commit_working_sets_us) as f64);
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;
@@ -276,6 +419,7 @@ pub struct WindowServiceChannels {
     pub verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     pub retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     pub completed_data_sets_sender: Option<CompletedDataSetsSender>,
+    pub live_replay_sender: LiveReplaySender,
     pub duplicate_slots_sender: DuplicateSlotSender,
     pub repair_service_channels: RepairServiceChannels,
     pub block_id_repair_channels: BlockIdRepairChannels,
@@ -286,6 +430,7 @@ impl WindowServiceChannels {
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
+        live_replay_sender: LiveReplaySender,
         duplicate_slots_sender: DuplicateSlotSender,
         repair_service_channels: RepairServiceChannels,
         block_id_repair_channels: BlockIdRepairChannels,
@@ -294,6 +439,7 @@ impl WindowServiceChannels {
             verified_receiver,
             retransmit_sender,
             completed_data_sets_sender,
+            live_replay_sender,
             duplicate_slots_sender,
             repair_service_channels,
             block_id_repair_channels,
@@ -329,6 +475,7 @@ impl WindowService {
             verified_receiver,
             retransmit_sender,
             completed_data_sets_sender,
+            live_replay_sender,
             duplicate_slots_sender,
             repair_service_channels,
             block_id_repair_channels,
@@ -375,6 +522,7 @@ impl WindowService {
             verified_receiver,
             duplicate_sender,
             completed_data_sets_sender,
+            live_replay_sender,
             retransmit_sender,
         );
 
@@ -421,6 +569,7 @@ impl WindowService {
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
+        live_replay_sender: LiveReplaySender,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     ) -> JoinHandle<()> {
         let reed_solomon_cache = ReedSolomonCache::default();
@@ -452,6 +601,10 @@ impl WindowService {
                 );
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
                 let mut write_batch = blockstore.get_write_batch().unwrap();
+                // 64 slots is deliberately generous: this is the ONLY source live
+                // replay has for a completed data set's content, so a data set whose
+                // payloads are evicted before it completes gets its slot marked dead.
+                let mut shred_payload_cache = ShredPayloadCache::new(64);
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
@@ -467,6 +620,8 @@ impl WindowService {
                         &mut metrics,
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
+                        &live_replay_sender,
+                        &mut shred_payload_cache,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e) {
