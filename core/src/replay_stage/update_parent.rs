@@ -192,7 +192,7 @@ fn try_restart_slot_from_update_parent(
         send_invalid_bank(&bank, replay_vote_sender);
         bank.bank_id()
     });
-    ReplayStage::clear_slots([slot], bank_forks, progress, async_verification_freelist);
+    ReplayStage::clear_slots([slot], bank_forks, progress, async_verification_freelist, None);
     if let Some(cleared_bank_id) = cleared_bank_id {
         let update_parent = UpdateParentInfo::from_slot_meta(slot, &slot_meta)
             .expect("UpdateParent metadata must include a parent slot");
@@ -411,6 +411,7 @@ pub(super) fn handle_abandoned_bank(
         bank_forks,
         progress,
         async_verification_freelist,
+        Some(&process_active_banks_context.live_replay_entries),
     );
     notify_entry_update_parent(
         process_active_banks_context

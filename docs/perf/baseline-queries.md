@@ -270,7 +270,59 @@ work to `ReplayVerificationWorkerPool`, not the actual async verification
 time; `collect_verification_results` is a non-blocking drain and should stay
 near zero.
 
-## 15. Host facts (not queries — note manually alongside the results above)
+## 15. tx_pipeline decomposition (every other stage as a part of the total)
+
+`path="tx_pipeline"` (section 12) is the metric being optimized. These
+segments are measured per transaction from the same start instant and chained
+timestamps, so they sum to it. Compare MEANS (percentiles of parts do not sum
+to the percentile of the whole):
+
+```promql
+# mean µs per segment; the five rows should add up to the "total" row
+sum(rate(agave_tx_pipeline_segment_duration_us_sum[30m])) by (segment)
+  / sum(rate(agave_tx_pipeline_segment_duration_us_count[30m])) by (segment)
+
+# total, mean (compare with the sum of the rows above)
+sum(rate(agave_end_to_end_duration_us_sum{path="tx_pipeline"}[30m]))
+  / sum(rate(agave_end_to_end_duration_us_count{path="tx_pipeline"}[30m]))
+
+# share of the total spent in each segment
+sum(rate(agave_tx_pipeline_segment_duration_us_sum[30m])) by (segment)
+  / ignoring(segment) group_left sum(rate(agave_tx_pipeline_segment_duration_us_sum[30m]))
+
+# tail of each segment
+histogram_quantile(0.9,  sum(rate(agave_tx_pipeline_segment_duration_us_bucket[30m])) by (le, segment))
+histogram_quantile(0.99, sum(rate(agave_tx_pipeline_segment_duration_us_bucket[30m])) by (le, segment))
+
+# coverage A (is tx_pipeline a representative sample?): fraction of ALL notified
+# transactions that have a tx_pipeline observation. The denominator is the
+# per-transaction Geyser notify count (one observation per notify_transaction
+# call, the same call that ends tx_pipeline).
+sum(rate(agave_end_to_end_duration_us_count{path="tx_pipeline"}[30m]))
+  / sum(rate(agave_geyser_notify_duration_us_count{notifier="transaction"}[30m]))
+
+# same question for the deshred path's identical (slot, fec_set_index) keying
+sum(rate(agave_deshred_tracking_total{outcome="tracked"}[30m]))
+  / sum(rate(agave_deshred_tracking_total[30m]))
+
+# coverage B: fraction of tx_pipeline observations that have a full breakdown
+sum(rate(agave_tx_pipeline_segment_duration_us_count{segment="fetch_to_data_set_ready"}[30m]))
+  / sum(rate(agave_end_to_end_duration_us_count{path="tx_pipeline"}[30m]))
+```
+
+Segments, in order: `fetch_to_data_set_ready` (first shred of the data set
+fetched -> decoded and sent to replay), `data_set_ready_to_replay_pickup`
+(sent -> `confirm_slot` consumed it), `replay_pickup_to_committed`
+(scheduler dispatch + execution + commit), `commit_to_status_dequeued`
+(tx-status channel wait), `status_dequeued_to_notified` (tx-status service
+work before the Geyser notification returned).
+
+Only transactions with every checkpoint recorded appear in the segments
+(live-replay path, data set starting on a tracked FEC boundary), so use the
+coverage query before trusting the breakdown. Segments need a binary built
+with this change; earlier data has no segment series.
+
+## 16. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,

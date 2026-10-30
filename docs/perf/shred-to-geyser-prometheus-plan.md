@@ -1,8 +1,12 @@
 # Shred → Geyser Latency: Prometheus Instrumentation Plan
 
-> **How to resume:** read this whole doc, find the latest row in the Progress Log at
-> the bottom, and continue from there. After each step, append a row (date / step /
-> result / commit).
+> **How to resume:** read this whole doc, find the latest row in the Progress Log,
+> and continue from there. After each step, append a row (date / step / result /
+> commit). **Start with the final section, "CURRENT STATE AND HANDOFF (2026-10-16)"**:
+> it supersedes the older hypothesis 5/6 sections where they disagree (those record
+> history; the cache design they describe was deleted). The metric being optimized is
+> `agave_end_to_end_duration_us{path="tx_pipeline"}`; every other metric exists to
+> explain a part of it.
 
 ## Context
 
@@ -325,6 +329,10 @@ throughput, Geyser Notify duration + throughput. A `$percentile` dropdown
 | 2026-09-29 | Phase 0: Prometheus registry, metric helpers, HTTP `/metrics` server, CLI flag, `Validator` wiring | `solana-metrics` 27/27 tests pass incl. live HTTP round-trip; `agave-validator`/`solana-core` compile clean | (uncommitted) |
 | 2026-09-29 | Phase 1: shred-path (receive/deserialize/dedup/filter/sign/retransmit), blockstore-store phases, replay (read/collect/execute/commit), geyser-notify (all 4 notifier types), deshred + executed_tx end-to-end trackers | All touched crates compile; every pre-existing unit test in touched modules still passes (see "Verification performed" above) | (uncommitted) |
 | 2026-09-29 | Phase 2 baseline (test node, live `promtool` pull, ~1h range) | See "Phase 2 baseline results" below. **Finding: `receive` (p50 2.99ms/p90 8.21ms/p99 9.82ms) is the single largest shred-path cost and is NOT included in the `deshred` end-to-end number** (the tracker's start point is inside the fetch-filter loop, after receive already happened) -- true socket-to-notify latency is closer to receive + deshred-end-to-end. Everything else (sigverify, blockstore store, replay stages, geyser notify) is comparatively small. Re-ranks Phase 3: coalesce window is priority 1. | — |
+| 2026-10-12 | Hypothesis 5 (cache-with-RocksDB-fallback `decoded_entries_cache`) and 6 (verification-off measurement, reverted) | See their sections. Cache design later found to never decouple replay from the blockstore write; deleted | ccf7b1ad99..a854c2d507 |
+| 2026-10-14/15 | Replaced the cache with a real live-replay channel (`ledger::live_replay_entries`, pre-write hook in `Blockstore`, window_service sends decoded data sets to ReplayStage). Fixed stale-queue panic and `InvalidLastTick` dead-slot loop (`slot_full` flag) | `read_blockstore` p90 147-152us -> 9.3us, but end-to-end metrics unchanged. See handoff section | 7cb29bc96b, ba8deb5e3c, 0c0bd99f3c |
+| 2026-10-15 | Post-deploy pull: arrival spread p90 460ms == `created_bank_to_frozen` p90 460ms; `first_shred_to_created_bank` p90 14.8ms; `tx_pipeline` p90 16.1ms vs `deshred` 9.6ms | Slot-level numbers are turbine-arrival bound; `tx_pipeline` is the only metric still improvable | — |
+| 2026-10-16 | Added `agave_tx_pipeline_segment_duration_us{segment}`: per-transaction decomposition of `tx_pipeline` into 5 chained segments that sum to it; `docs/perf/compare-live-replay.sh`; baseline-queries.md section 15 | `solana-metrics` 17/17 tests pass incl. a telescoping test; `solana-rpc`/`solana-core` check clean. **Not yet deployed** | (uncommitted) |
 
 ## Phase 2 baseline results (2026-09-29, live `promtool` pull, `[1h]` range)
 
@@ -1387,3 +1395,208 @@ else trusts.
 
 **Action**: measurement complete. Revert `skip_verification` back to `false` in
 `core/src/replay_stage.rs::replay_blockstore_into_bank` now that this number is recorded.
+
+---
+
+## CURRENT STATE AND HANDOFF (2026-10-16)
+
+Read this first. It is the authoritative summary; earlier sections are history.
+
+### Objective (stated by the user, binding)
+
+`agave_end_to_end_duration_us{path="tx_pipeline"}` (first shred of a transaction's
+own data set fetched -> that transaction sent over Geyser `notify_transaction`) is
+THE final metric to improve. Every other graph must be a *part of that total*, not a
+parallel number. `executed_tx`, `created_bank_to_frozen` and similar slot-level
+metrics are NOT optimization targets: they are bound by shred arrival time (below).
+
+**Clarification (2026-10-16, user):** the goal is to reduce the ABSOLUTE time of both
+`tx_pipeline` (p90 ~16ms) and `deshred` (p90 ~9.6ms), not to close the gap between them.
+Both start at the same instant (a data set's first shred fetched), so anything in the shared
+prefix (rest of the data set's shreds arriving, sigverify, window insert) lowers both. Note
+both start AFTER the UDP receive/coalesce wait (`receive` p90 ~8ms, flag
+`--shred-fetch-coalesce-us`), which neither metric sees; true socket-to-notify latency is
+longer than either number, and a coalesce-window win is invisible to them.
+
+### Environment / operating rules (hard-won)
+
+- Branch `custom-metrics` (main branch `master`). Do not commit/push unless the
+  user asks. Commits: end message with `Co-Authored-By: Claude Sonnet 5.5
+  <noreply@anthropic.com>`; PR bodies end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+- **Verify builds only with `--target-dir /tmp/claude-sanity-target`.** The repo's
+  default `target/` returned false "Finished" results (even with a deliberate syntax
+  error). Long cargo runs (rpc/core) take minutes; run them in the background.
+- Query Prometheus the way the user does: `cd ~/prometheus && ./promtool query
+  instant http://localhost:9090 '<promql>'` (historical: `--time=<unix_ts>`; this
+  Prometheus lacks the PromQL `@` modifier). Scripts: `docs/perf/run-baseline-queries.sh`,
+  `docs/perf/compare-before-after.sh`, `docs/perf/compare-live-replay.sh <url>
+  <before_ts> <after_ts> [range]` (the last one covers everything in this section).
+  Query text lives in `docs/perf/baseline-queries.md`.
+- Histogram caveat: values like 9.0-9.5us are the lowest-bucket interpolation floor
+  ("<= 10us"), not real measurements. Percentiles of parts never sum to the percentile
+  of the whole; compare MEANS (`rate(_sum)/rate(_count)`) when checking decompositions.
+- Pre-existing, unrelated: 4 clippy `writeln!` warnings in `cli-output/src/cli_output.rs`.
+  A stale `stash@{1}` (Cargo.lock drift from a stray `v4.3-custom-index` checkout) still exists.
+
+### What the live-replay work did (committed: 7cb29bc96b, ba8deb5e3c, 0c0bd99f3c)
+
+The hypothesis-5 cache design never decoupled replay from the blockstore write (the
+write completed before `send_signals`), so it was replaced. Design now in the tree:
+
+- `ledger/src/live_replay_entries.rs`: `LiveReplayMessage` (`Entries{slot,indices,
+  component,slot_full}` | `ReplayFromBlockstore{slot}`), channel types, and
+  `LiveReplayEntries` (DashMap keyed `(slot,start_index)` + a replay-from-blockstore
+  set) with `push/absorb/drain_ready/prune_through/remove_slot/...`.
+- `ledger/src/blockstore.rs`: `before_write` hook (`BeforeWriteHook`) threaded through
+  `do_insert_shreds`/`do_insert_shreds_locked`/`insert_shreds_at_location_handle_duplicate`.
+  It runs after in-memory insertion and BEFORE the inline RocksDB write, with newly
+  completed data sets (`CompletedDataSetInfo` has `slot_full`, `location`) and all
+  accepted `BlockLocation::Original` shreds. The RocksDB write itself is still inline.
+- `core/src/window_service.rs`: `ShredPayloadCache` (64 slots) fed by the hook; the
+  hook decodes each completed data set and sends `LiveReplayMessage::Entries` (the
+  send is also the replay wake-up). On assemble failure it sends
+  `ReplayFromBlockstore{slot}` plus a `warn!` ("not assembled from memory; replay will
+  read this slot from the blockstore"); it must NOT mark the slot dead.
+- `core/src/tvu.rs` wires the channel; `core/src/replay_stage.rs` absorbs it every
+  loop iteration and in `select!`, `confirm_slot(..., live_entries: Option<&LiveReplayEntries>)`
+  (`ledger/src/blockstore_processor.rs`) reads ONLY from it (no RocksDB fallback) unless
+  the slot is flagged replay-from-blockstore. Purge/dump-and-repair paths clear entries.
+- Bugs found and fixed along the way: (1) stale queue entries after purge -> replay
+  panic; (2) "could not decode completed data set ... marking slot dead" -> now
+  falls back instead of killing the slot; (3) `InvalidLastTick` dead-slot loop and the
+  "tried to repair duplicate slot ... more than 10 times" panic: `slot_full` was
+  wrongly gated on `SlotMeta::is_full()`, so an out-of-order final data set was emitted
+  once with `slot_full=false`. Fix: `slot_full = last_index.is_some_and(|li| indices.end
+  == li + 1)`; regression test `test_slot_full_flag_when_final_data_set_completes_before_earlier_gap`.
+- Metric `agave_live_replay_entries_total{outcome=ready|not_ready}` replaces the
+  deleted `agave_decoded_entries_cache_total` (older sections still mention the old name;
+  that is history). `not_ready` = nothing new queued yet, not an error.
+
+Known gaps of that design (not done): (a) new-bank discovery
+(`generate_new_bank_forks`, `core/src/replay_stage.rs`) iterates frozen parents and
+reads `SlotMeta.next_slots` from RocksDB, so the first data set of a brand-new slot is
+still gated by the (now post-send) write; (b) alternate-block copies
+(`copy_shreds_locked`/`switch_block_from_alternate`, Alpenglow) pass hook `None` and
+emit no live entries (possible stall on that path); (c) `blockstore_store{total}` now
+includes decode+send under the insert lock.
+
+### Measured results after deploying live replay (2026-10-15, 30m window, p90 unless noted)
+
+| metric | now | earlier baseline | verdict |
+|---|---|---|---|
+| `replay_stage{read_blockstore}` | 9.3us | 147-152us | ~16x drop (intended) |
+| `slot_confirmation{created_bank_to_frozen}` | 460.0ms | 389ms (10-05), 448-456ms (10-12) | no change |
+| `shred_arrival_spread` | 460.3ms | - | == created_bank_to_frozen |
+| `slot_confirmation{first_shred_to_created_bank}` | 14.8ms | - | see below |
+| `end_to_end{deshred}` | 9.6ms | 9.2ms | no change |
+| `end_to_end{executed_tx}` | 417ms | 427ms | no change |
+| `end_to_end{tx_pipeline}` | 16.1ms | - | **the target** |
+| `blockstore_store{total}` p99 | 976us | 924us | +5% (decode+send in insert lock) |
+| `live_replay_entries` | ready 98/s, not_ready 162/s | - | normal |
+
+`collect_entries` phase p90s (us): process_entries 576, validate_and_hash_transactions
+452, spawn_poh_verification 189, spawn_signature_verification 180, tx_pipeline_mark 60,
+everything else <=10. Sum ~1.5ms/call: not a bottleneck. Earlier experiment (hypothesis
+6): replay-stage PoH+signature verification is 30-60% of `collect_entries` but must stay
+on (the temporary `skip_verification` was reverted; confirm with grep before trusting).
+
+### Findings (these are conclusions, not hypotheses)
+
+1. `created_bank_to_frozen` (460ms) == `shred_arrival_spread` (460ms): a slot finishes
+   replay as soon as its last shred arrives. Slot-level numbers (`created_bank_to_frozen`,
+   `executed_tx`) are turbine-arrival bound; replay/storage changes cannot move them.
+2. Replay work per call is small (~1.5ms) and `read_blockstore` is now ~free. Removing the
+   blockstore read did not change any end-to-end metric.
+3. `tx_pipeline` p90 (16.1ms) is ~6.5ms above `deshred` p90 (9.6ms). Both start at the
+   same shred-fetch instant, but `deshred` ends in `CompletedDataSetsService` while
+   `tx_pipeline` ends after replay + execution + commit + tx-status + Geyser notify. The
+   ~6.5ms is spent between data-set completion and the transaction notify.
+4. `first_shred_to_created_bank` p90 14.8ms includes waiting for the PARENT bank to
+   freeze (banks are only created for children of frozen banks) and for `next_slots`
+   in RocksDB. The split is not measured. It only affects the first data set of a slot.
+5. The older "unaccounted ~3.7x gap" hypothesis (unified-scheduler dispatch wait) is still
+   untested; the new segments below test it directly.
+
+### Caveats on `tx_pipeline` itself (check before trusting small deltas)
+
+- Suspected bias (since ruled out, see RESOLVED below): the start map is keyed `(slot, fec_set_index)` but replay
+  looks it up with the data set's starting shred index. They coincide when a data set
+  begins on an FEC-set boundary (the normal case for leader-produced merkle shreds), but
+  any data set that does not is silently untracked. The `agave_deshred_tracking_total`
+  result for the same keying (hypothesis 4) was never recorded. Measure with coverage A in
+  `baseline-queries.md` section 15 (tx_pipeline count / per-tx Geyser notify count) and the
+  deshred tracked fraction. Coverage B (segments / tx_pipeline) only says how many tracked
+  transactions have a full breakdown, NOT whether the tracked set is representative.
+  If coverage A is well below ~0.95, fix the keying before trusting small deltas.
+  **RESOLVED (2026-10-16, 30m live pull): bias ruled out.** Coverage A = 0.999999 (tx_pipeline
+  observations / per-tx Geyser notifies) and deshred tracked fraction = 1.0, so every
+  transaction is tracked and the keying mismatch does not occur in practice. Coverage B returned
+  no data because the running build predated the segment metric (not yet deployed). No keying
+  fix needed.
+- Start is the first shred of the data set, so shred-arrival time inside the data set (a
+  network property) is part of the first segment; it cannot be optimized away locally.
+
+### New instrumentation (2026-10-16, UNCOMMITTED, NOT YET DEPLOYED)
+
+`agave_tx_pipeline_segment_duration_us{segment}` splits each tracked transaction's
+`tx_pipeline` latency into five chained, non-overlapping segments from one start instant,
+so they sum to the total (up to per-segment microsecond truncation):
+
+| segment | from -> to | what it contains |
+|---|---|---|
+| `fetch_to_data_set_ready` | first shred fetched -> decoded data set sent to replay | remaining shreds of the data set arriving, sigverify, window insert up to the pre-write hook, decode |
+| `data_set_ready_to_replay_pickup` | send -> `confirm_slot` consumed it | replay wake-up, waiting for the bank/previous data set |
+| `replay_pickup_to_committed` | consumed -> batch enqueued to tx-status | scheduler dispatch, execution, commit |
+| `commit_to_status_dequeued` | enqueued -> TransactionStatusService dequeued | tx-status channel wait |
+| `status_dequeued_to_notified` | dequeued -> `notify_transaction` returned | work before this tx's Geyser notify |
+
+Files: `metrics/src/pipeline_metrics.rs` (histogram), `metrics/src/pipeline_latency.rs`
+(`TxPipelineLatencyTracker` now keeps per-signature checkpoints; `mark_data_set_ready`,
+`mark_tx_status_received`; test `test_tx_pipeline_segments_sum_to_total`),
+`core/src/window_service.rs` (calls `mark_data_set_ready` right after the live-replay send),
+`rpc/src/transaction_status_service.rs` (calls `mark_tx_status_received` per tx with the
+batch's `enqueued_at`). Only live-replay-path transactions with every checkpoint appear;
+`path="tx_pipeline"` still covers all tracked ones. Dashboard panels for the segments
+have NOT been added to `grafana-dashboard-shred-geyser.json` (currently version 14,
+panels up to 38).
+
+Verification at time of writing: `cargo test -p solana-metrics` -> 17 passed (target dir
+`/tmp/claude-sanity-target`); `cargo check -p solana-rpc -p solana-core` -> Finished,
+no errors (2026-10-16). `agave-validator` was not re-checked after this change.
+
+### Decision (2026-10-16, user): segment instrumentation not being deployed
+
+The user decided to skip the `agave_tx_pipeline_segment_duration_us` changes because they do not
+themselves improve performance (they only measure). The code is left uncommitted in the working
+tree (not reverted); deploy it only if the user later wants the breakdown. Without it, the
+`tx_pipeline` gap (16.1ms p90 vs 9.6ms `deshred` p90) is unattributed, so the next step must be
+chosen by the user: either deploy the segments, or pick an optimization directly.
+
+### Next steps for whoever continues (in order)
+
+1. (Optional) `cargo check --target-dir /tmp/claude-sanity-target -p agave-validator`
+   (background it); rpc/core already check clean.
+2. Deploy; let it run >= 30 min; run `docs/perf/baseline-queries.md` section 15 (mean per
+   segment, mean total, share of total, per-segment p90/p99, coverage B). Record the table
+   in this file. Coverage A is already ~1.0 (keying fine); coverage B should be near 1.0 on
+   the live-replay path.
+3. Attack the largest segment's share of the mean, one change at a time, with the same
+   queries before/after (keep a change only if the mean/p90 of `tx_pipeline` drops and
+   `blockstore_store`, drop/error counters and dead-slot logs do not regress):
+   - `replay_pickup_to_committed` large -> test the unified-scheduler dispatch-wait
+     hypothesis (old 3.7x gap) and execution/commit cost inside `execute_batch`; the
+     existing `agave_execute_phase_duration_us`/`agave_execute_detail_duration_us` apply.
+   - `data_set_ready_to_replay_pickup` large -> replay loop wake-up, bank discovery
+     (parent-freeze vs RocksDB `next_slots` split is unmeasured; creating banks from
+     channel messages is the fix if the RocksDB part dominates).
+   - `commit_to_status_dequeued` / `status_dequeued_to_notified` large -> TransactionStatusService
+     is a single thread doing RocksDB status writes before/while notifying; consider
+     notifying before the blockstore status write or a separate notifier thread.
+   - `fetch_to_data_set_ready` large -> mostly network-bound; check
+     `verified_recv_wait`, sigverify (`dedup`,`sign`), and `blockstore_store` phases before
+     assuming otherwise. Earlier coalesce-window tuning (hypothesis 1) gave no net gain.
+4. Add dashboard panels for the segments (and a stacked mean-share panel); bump the dashboard
+   version.
+5. Optional cleanups: handle alternate-block copies (hook `None`), consider moving the
+   RocksDB write fully off the insert thread (it is still inline after the send), and update
+   older sections' references to `agave_decoded_entries_cache_total`.

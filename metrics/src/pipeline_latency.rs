@@ -7,7 +7,7 @@
 //! crate doesn't need to depend on it.
 
 use {
-    crate::pipeline_metrics::END_TO_END_DURATION_US,
+    crate::pipeline_metrics::{END_TO_END_DURATION_US, TX_PIPELINE_SEGMENT_DURATION_US},
     dashmap::DashMap,
     std::{
         sync::{
@@ -293,17 +293,30 @@ pub static SLOT_CONFIRMATION_LATENCY: LazyLock<SlotConfirmationLatencyTracker> =
 /// replay path, a different, independent consumer of the same shreds).
 pub struct TxPipelineLatencyTracker {
     data_set_started: DashMap<(u64, u32), Instant>,
-    /// Signature bytes -> (slot, start instant). Slot is kept alongside the
-    /// instant purely for age-based pruning, since this map isn't keyed by
-    /// slot directly like the others in this file.
-    tx_started: DashMap<[u8; 64], (u64, Instant)>,
+    /// `(slot, data set start index)` -> instant the decoded data set was
+    /// sent to ReplayStage. Only populated on the live-replay path.
+    data_set_ready: DashMap<(u64, u32), Instant>,
+    /// Signature bytes -> checkpoints. Slot is kept alongside purely for
+    /// age-based pruning, since this map isn't keyed by slot directly like
+    /// the others in this file.
+    tx_started: DashMap<[u8; 64], TxCheckpoints>,
     max_slot_seen: AtomicU64,
+}
+
+struct TxCheckpoints {
+    slot: u64,
+    start: Instant,
+    ready: Option<Instant>,
+    picked_up: Instant,
+    enqueued: Option<Instant>,
+    dequeued: Option<Instant>,
 }
 
 impl TxPipelineLatencyTracker {
     fn new() -> Self {
         Self {
             data_set_started: DashMap::new(),
+            data_set_ready: DashMap::new(),
             tx_started: DashMap::new(),
             max_slot_seen: AtomicU64::new(0),
         }
@@ -318,6 +331,14 @@ impl TxPipelineLatencyTracker {
         self.maybe_prune(slot);
     }
 
+    /// Records that the data set starting at `start_index` was decoded and
+    /// handed to ReplayStage (end of the `fetch_to_data_set_ready` segment).
+    pub fn mark_data_set_ready(&self, slot: u64, start_index: u32) {
+        self.data_set_ready
+            .entry((slot, start_index))
+            .or_insert_with(Instant::now);
+    }
+
     /// Called once per transaction when replay processes the data set
     /// containing it (before scheduling execution), recording that
     /// transaction's true pipeline start time -- its own data set's first
@@ -326,19 +347,63 @@ impl TxPipelineLatencyTracker {
     /// fetch-stage timestamp).
     pub fn mark_tx_data_set(&self, signature: [u8; 64], slot: u64, fec_set_index: u32) {
         if let Some(start) = self.data_set_started.get(&(slot, fec_set_index)) {
-            self.tx_started.insert(signature, (slot, *start));
+            let ready = self
+                .data_set_ready
+                .get(&(slot, fec_set_index))
+                .map(|ready| *ready);
+            self.tx_started.insert(
+                signature,
+                TxCheckpoints {
+                    slot,
+                    start: *start,
+                    ready,
+                    picked_up: Instant::now(),
+                    enqueued: None,
+                    dequeued: None,
+                },
+            );
+        }
+    }
+
+    /// Called by the tx-status service when it dequeues the batch holding
+    /// this transaction. `enqueued_at` is when the batch was committed and
+    /// queued. A no-op for untracked signatures.
+    pub fn mark_tx_status_received(&self, signature: [u8; 64], enqueued_at: Instant) {
+        if let Some(mut checkpoints) = self.tx_started.get_mut(&signature) {
+            checkpoints.enqueued = Some(enqueued_at);
+            checkpoints.dequeued = Some(Instant::now());
         }
     }
 
     /// Observes `agave_end_to_end_duration_us{path="tx_pipeline"}` if a
-    /// start was recorded for this signature, and removes the entry. A
-    /// transaction that never reaches this (e.g. dropped before commit) is
+    /// start was recorded for this signature, plus the per-segment
+    /// breakdown when every checkpoint was recorded, and removes the entry.
+    /// A transaction that never reaches this (e.g. dropped before commit) is
     /// cleaned up later by age-based pruning instead, bounding memory.
     pub fn mark_tx_notified(&self, signature: [u8; 64]) {
-        if let Some((_, (_, start))) = self.tx_started.remove(&signature) {
-            END_TO_END_DURATION_US
-                .with_label_values(&["tx_pipeline"])
-                .observe(start.elapsed().as_micros() as f64);
+        let Some((_, checkpoints)) = self.tx_started.remove(&signature) else {
+            return;
+        };
+        let now = Instant::now();
+        END_TO_END_DURATION_US
+            .with_label_values(&["tx_pipeline"])
+            .observe(now.saturating_duration_since(checkpoints.start).as_micros() as f64);
+        let (Some(ready), Some(enqueued), Some(dequeued)) =
+            (checkpoints.ready, checkpoints.enqueued, checkpoints.dequeued)
+        else {
+            return;
+        };
+        let segments = [
+            ("fetch_to_data_set_ready", checkpoints.start, ready),
+            ("data_set_ready_to_replay_pickup", ready, checkpoints.picked_up),
+            ("replay_pickup_to_committed", checkpoints.picked_up, enqueued),
+            ("commit_to_status_dequeued", enqueued, dequeued),
+            ("status_dequeued_to_notified", dequeued, now),
+        ];
+        for (segment, from, to) in segments {
+            TX_PIPELINE_SEGMENT_DURATION_US
+                .with_label_values(&[segment])
+                .observe(to.saturating_duration_since(from).as_micros() as f64);
         }
     }
 
@@ -350,7 +415,10 @@ impl TxPipelineLatencyTracker {
         let cutoff = slot - MAX_TRACKED_SLOT_AGE;
         self.data_set_started
             .retain(|(entry_slot, _), _| *entry_slot >= cutoff);
-        self.tx_started.retain(|_, (entry_slot, _)| *entry_slot >= cutoff);
+        self.data_set_ready
+            .retain(|(entry_slot, _), _| *entry_slot >= cutoff);
+        self.tx_started
+            .retain(|_, checkpoints| checkpoints.slot >= cutoff);
     }
 }
 
@@ -483,6 +551,55 @@ mod test {
         tracker.mark_tx_notified([2u8; 64]);
         // Removed after notify.
         assert!(!tracker.tx_started.contains_key(&[2u8; 64]));
+    }
+
+    #[test]
+    fn test_tx_pipeline_segments_sum_to_total() {
+        use std::{thread::sleep, time::Duration};
+        let segment_names = [
+            "fetch_to_data_set_ready",
+            "data_set_ready_to_replay_pickup",
+            "replay_pickup_to_committed",
+            "commit_to_status_dequeued",
+            "status_dequeued_to_notified",
+        ];
+        let read = || -> Vec<(u64, f64)> {
+            segment_names
+                .iter()
+                .map(|name| {
+                    let h = TX_PIPELINE_SEGMENT_DURATION_US.with_label_values(&[name]);
+                    (h.get_sample_count(), h.get_sample_sum())
+                })
+                .collect()
+        };
+        let before = read();
+
+        let tracker = TxPipelineLatencyTracker::new();
+        let begin = Instant::now();
+        tracker.mark_data_set_started(9, 300);
+        sleep(Duration::from_millis(2));
+        tracker.mark_data_set_ready(9, 300);
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_data_set([7u8; 64], 9, 300);
+        sleep(Duration::from_millis(2));
+        let enqueued_at = Instant::now();
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_status_received([7u8; 64], enqueued_at);
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_notified([7u8; 64]);
+        let elapsed_us = begin.elapsed().as_micros() as f64;
+
+        let after = read();
+        let mut total = 0.0;
+        for ((count_before, sum_before), (count_after, sum_after)) in before.iter().zip(&after) {
+            assert_eq!(count_after - count_before, 1);
+            let delta = sum_after - sum_before;
+            assert!(delta >= 2_000.0, "each segment spans a 2ms sleep");
+            total += delta;
+        }
+        // The segments telescope: together they cover the whole span (minus
+        // per-segment microsecond truncation).
+        assert!(total >= 10_000.0 && total <= elapsed_us, "{total} vs {elapsed_us}");
     }
 
     #[test]

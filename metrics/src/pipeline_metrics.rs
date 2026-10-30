@@ -262,6 +262,39 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     )
 });
 
+/// Decomposes `agave_end_to_end_duration_us{path="tx_pipeline"}` into
+/// consecutive, non-overlapping segments, labeled by `segment`. They are
+/// observed per transaction from the SAME start instant and chained
+/// timestamps, so for any transaction the five segment values sum exactly to
+/// that transaction's `tx_pipeline` value (up to per-segment microsecond
+/// truncation). Because of that, compare MEANS, not percentiles, when
+/// checking that they add up: `rate(..._sum)/rate(..._count)` per segment
+/// should sum to the same expression on `path="tx_pipeline"` (percentiles
+/// of the parts do not sum to the percentile of the whole). Segments:
+/// - `fetch_to_data_set_ready`: data set's first shred fetched -> data set
+///   decoded and sent to ReplayStage (rest of the data set's shreds arriving,
+///   sigverify, window insert up to the pre-write hook).
+/// - `data_set_ready_to_replay_pickup`: sent -> `confirm_slot` consumed it
+///   (replay loop wake-up, waiting for the bank to exist and the previous
+///   data set to be processed).
+/// - `replay_pickup_to_committed`: consumed -> the transaction's batch was
+///   committed and queued for tx-status (scheduler dispatch, execution,
+///   commit).
+/// - `commit_to_status_dequeued`: tx-status channel wait.
+/// - `status_dequeued_to_notified`: tx-status service work before this
+///   transaction's Geyser notification returned.
+/// Only transactions for which every checkpoint was recorded are observed
+/// here (live-replay path, data set starting on a tracked FEC boundary);
+/// `path="tx_pipeline"` itself also covers the rest, so
+/// `_count` of the segments can be lower than the total's `_count`.
+pub static TX_PIPELINE_SEGMENT_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_tx_pipeline_segment_duration_us",
+        "Segments of the per-transaction tx_pipeline latency, in microseconds",
+        &["segment"],
+    )
+});
+
 /// Fine-grained breakdown of the `collect_entries` stage above (observed
 /// p90 ~1ms), labeled by `phase`. Unlike `EXECUTE_PHASE_DURATION_US`, these
 /// are NOT derived from a pre-existing cumulative counters struct --

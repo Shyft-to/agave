@@ -1126,6 +1126,7 @@ impl ReplayStage {
                             &bank_forks,
                             &mut progress,
                             &mut async_verification_freelist,
+                            &process_active_banks_context.live_replay_entries,
                         )
                         .expect("Blockstore operations must succeed");
                     }
@@ -2473,6 +2474,7 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        live_replay_entries: &LiveReplayEntries,
     ) -> Result<(), BlockstoreError> {
         let root = bank_forks.read().unwrap().root();
 
@@ -2577,6 +2579,7 @@ impl ReplayStage {
             bank_forks,
             progress,
             async_verification_freelist,
+            Some(live_replay_entries),
         );
 
         // Banks are clear, move shreds in blockstore
@@ -2605,11 +2608,22 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        live_replay_entries: Option<&LiveReplayEntries>,
     ) {
         let (slots_to_purge, banks_to_clear) =
             bank_forks.read().unwrap().slots_to_clear(slots_to_clear);
         if slots_to_purge.is_empty() {
             return;
+        }
+
+        // Anything queued belongs to the discarded version, and what was already consumed
+        // won't be re-sent over the live channel (switched-in shreds are copied without the
+        // pre-write hook), so these slots must re-replay from the blockstore.
+        if let Some(live_replay_entries) = live_replay_entries {
+            for slot in &slots_to_purge {
+                live_replay_entries.remove_slot(*slot);
+                live_replay_entries.mark_replay_from_blockstore(*slot);
+            }
         }
 
         // Wait for async verify to complete
@@ -5333,6 +5347,7 @@ impl ReplayStage {
                     &context.bank_forks,
                     progress,
                     async_verification_freelist,
+                    None,
                 );
                 response_sender.send(()).unwrap_or_else(|_| {
                     warn!("bank forks controller clear-bank response receiver dropped")
