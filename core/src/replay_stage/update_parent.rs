@@ -78,6 +78,17 @@ pub(super) fn child_bank_replay_start(
         return ChildBankReplayStart::Defer;
     }
 
+    // A replayed parent can be frozen before its block id reached the blockstore (see
+    // `ReplayStage::get_block_id_after_write`); fill it in now rather than deferring forever.
+    if parent_slot != 0 && parent_bank.block_id().is_none() && parent_bank.should_replay_from_blockstore() {
+        if let Some(block_id) = blockstore
+            .get_block_id(parent_slot, migration_status)
+            .expect("Blockstore should not fail")
+        {
+            parent_bank.set_block_id(Some(block_id));
+        }
+    }
+
     // Genesis doesn't have a block id.
     if parent_slot != 0 && Some(slot_meta.parent_block_id) != parent_bank.block_id() {
         // There were duplicate blocks in this slot and we have the wrong one

@@ -4099,10 +4099,18 @@ impl ReplayStage {
                 // For leader blocks, we might not have finished shredding (as it happens asynchronously)
                 // so this can return None. If that is the case, broadcast will set the block id once shredding
                 // finishes.
-                let block_id = process_active_banks_context
-                    .blockstore
-                    .get_block_id(bank.slot(), &process_active_banks_context.migration_status)
-                    .expect("Blockstore operations must succeed");
+                let block_id = if bank.should_replay_from_blockstore() {
+                    Self::get_block_id_after_write(
+                        &process_active_banks_context.blockstore,
+                        bank.slot(),
+                        &process_active_banks_context.migration_status,
+                    )
+                } else {
+                    process_active_banks_context
+                        .blockstore
+                        .get_block_id(bank.slot(), &process_active_banks_context.migration_status)
+                        .expect("Blockstore operations must succeed")
+                };
                 debug_assert!(block_id.is_some() || !bank.should_replay_from_blockstore());
                 if block_id.is_some() {
                     bank.set_block_id(block_id);
@@ -5353,6 +5361,37 @@ impl ReplayStage {
                     warn!("bank forks controller clear-bank response receiver dropped")
                 });
             }
+        }
+    }
+
+    /// Live replay can finish a slot before the insert call that completed its last data set
+    /// has written to RocksDB (`window_service` sends the entries before the write), but the
+    /// block id is read from RocksDB. Freezing with `None` makes every child `Defer` forever in
+    /// `child_bank_replay_start` (its `parent_block_id` never matches), halting replay. The write
+    /// follows the send by well under a millisecond, so wait briefly for it.
+    fn get_block_id_after_write(
+        blockstore: &Blockstore,
+        slot: Slot,
+        migration_status: &MigrationStatus,
+    ) -> Option<Hash> {
+        const POLL_INTERVAL: Duration = Duration::from_micros(200);
+        const MAX_WAIT: Duration = Duration::from_millis(50);
+        let start = Instant::now();
+        loop {
+            let block_id = blockstore
+                .get_block_id(slot, migration_status)
+                .expect("Blockstore operations must succeed");
+            if block_id.is_some() {
+                return block_id;
+            }
+            if start.elapsed() >= MAX_WAIT {
+                warn!(
+                    "block id for slot {slot} not in the blockstore {MAX_WAIT:?} after replay \
+                     completed; children will fill it in before chaining"
+                );
+                return None;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
