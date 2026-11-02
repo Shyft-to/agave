@@ -79,6 +79,12 @@ pub static DESHRED_LATENCY: LazyLock<DeshredLatencyTracker> =
 
 pub struct ExecutedTxLatencyTracker {
     started: DashMap<u64, Instant>,
+    /// When replay froze each slot's bank, taken on the replay thread (the
+    /// `Processed` slot status reaches the notifier later, through
+    /// `OptimisticallyConfirmedBankTracker`'s channel, so it can't be used to
+    /// split `first_shred_to_created_bank` against the replay-thread
+    /// `CreatedBank` timestamp).
+    replay_frozen: DashMap<u64, Instant>,
     max_slot_seen: AtomicU64,
 }
 
@@ -86,6 +92,7 @@ impl ExecutedTxLatencyTracker {
     fn new() -> Self {
         Self {
             started: DashMap::new(),
+            replay_frozen: DashMap::new(),
             max_slot_seen: AtomicU64::new(0),
         }
     }
@@ -107,12 +114,46 @@ impl ExecutedTxLatencyTracker {
     /// commit with no dependency on voting, the only place that gap could be
     /// hiding is between shred arrival and replay actually starting on this
     /// slot, which until now was never directly measured.
-    pub fn mark_bank_created(&self, slot: u64) {
-        if let Some(start) = self.started.get(&slot) {
-            crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
-                .with_label_values(&["first_shred_to_created_bank"])
-                .observe(start.elapsed().as_micros() as f64);
+    ///
+    /// When `parent`'s replay freeze was recorded (`mark_replay_frozen`), also
+    /// splits that span at the later of (first shred, parent frozen), since a
+    /// bank is only created once its parent is frozen:
+    /// - `first_shred_to_parent_frozen`: waiting for the parent to freeze (0 if
+    ///   it froze before this slot's first shred arrived);
+    /// - `parent_frozen_to_created_bank`: the rest -- replay loop wake-up and
+    ///   discovering the child through the blockstore (`next_slots`, `meta`).
+    ///
+    /// The two sum to `first_shred_to_created_bank` for the same slot.
+    pub fn mark_bank_created(&self, slot: u64, parent: Option<u64>) {
+        let now = Instant::now();
+        let Some(start) = self.started.get(&slot).map(|start| *start) else {
+            return;
+        };
+        let slot_confirmation_us = &crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US;
+        slot_confirmation_us
+            .with_label_values(&["first_shred_to_created_bank"])
+            .observe(now.saturating_duration_since(start).as_micros() as f64);
+        let parent_frozen = parent.and_then(|parent| {
+            self.replay_frozen
+                .get(&parent)
+                .map(|parent_frozen| *parent_frozen)
+        });
+        if let Some(parent_frozen) = parent_frozen {
+            let ready = start.max(parent_frozen);
+            slot_confirmation_us
+                .with_label_values(&["first_shred_to_parent_frozen"])
+                .observe(ready.saturating_duration_since(start).as_micros() as f64);
+            slot_confirmation_us
+                .with_label_values(&["parent_frozen_to_created_bank"])
+                .observe(now.saturating_duration_since(ready).as_micros() as f64);
         }
+    }
+
+    /// Records when replay froze `slot`'s bank. Called on the replay thread,
+    /// right after the freeze; see `replay_frozen`.
+    pub fn mark_replay_frozen(&self, slot: u64) {
+        self.replay_frozen.entry(slot).or_insert_with(Instant::now);
+        self.maybe_prune(slot);
     }
 
     /// Observes `first_shred_to_frozen` -- a DIRECT measurement of first
@@ -170,6 +211,7 @@ impl ExecutedTxLatencyTracker {
         }
         let cutoff = slot - MAX_TRACKED_SLOT_AGE;
         self.started.retain(|entry_slot, _| *entry_slot >= cutoff);
+        self.replay_frozen.retain(|entry_slot, _| *entry_slot >= cutoff);
     }
 }
 
@@ -452,7 +494,7 @@ mod test {
     fn test_executed_tx_tracker_bank_created_does_not_remove_start() {
         let tracker = ExecutedTxLatencyTracker::new();
         tracker.mark_slot_started(9);
-        tracker.mark_bank_created(9);
+        tracker.mark_bank_created(9, None);
         // mark_tx_notified must still find the start timestamp afterward.
         assert!(tracker.started.contains_key(&9));
         tracker.mark_tx_notified(9);
@@ -461,7 +503,54 @@ mod test {
     #[test]
     fn test_executed_tx_tracker_bank_created_with_no_start_does_not_panic() {
         let tracker = ExecutedTxLatencyTracker::new();
-        tracker.mark_bank_created(999_997);
+        tracker.mark_bank_created(999_997, Some(999_996));
+    }
+
+    #[test]
+    fn test_bank_created_split_sums_to_total() {
+        use std::{thread::sleep, time::Duration};
+        let read = |name: &str| {
+            let h = crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US.with_label_values(&[name]);
+            (h.get_sample_count(), h.get_sample_sum())
+        };
+        let split = ["first_shred_to_parent_frozen", "parent_frozen_to_created_bank"];
+        let before = split.map(read);
+
+        // Child's first shred arrives, then the parent freezes, then the child bank is created.
+        let tracker = ExecutedTxLatencyTracker::new();
+        let begin = Instant::now();
+        tracker.mark_slot_started(21);
+        sleep(Duration::from_millis(3));
+        tracker.mark_replay_frozen(20);
+        sleep(Duration::from_millis(2));
+        tracker.mark_bank_created(21, Some(20));
+        let elapsed_us = begin.elapsed().as_micros() as f64;
+
+        let after = split.map(read);
+        let deltas: Vec<f64> = before
+            .iter()
+            .zip(&after)
+            .map(|((count_before, sum_before), (count_after, sum_after))| {
+                assert_eq!(count_after - count_before, 1);
+                sum_after - sum_before
+            })
+            .collect();
+        assert!(deltas[0] >= 3_000.0, "waited 3ms for the parent: {}", deltas[0]);
+        assert!(deltas[1] >= 2_000.0, "2ms from parent freeze to bank: {}", deltas[1]);
+        assert!(deltas[0] + deltas[1] <= elapsed_us);
+    }
+
+    #[test]
+    fn test_bank_created_parent_frozen_first_has_zero_wait() {
+        let tracker = ExecutedTxLatencyTracker::new();
+        tracker.mark_replay_frozen(30);
+        tracker.mark_slot_started(31);
+        let wait = crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US
+            .with_label_values(&["first_shred_to_parent_frozen"]);
+        let sum_before = wait.get_sample_sum();
+        tracker.mark_bank_created(31, Some(30));
+        // Other tests observe this label concurrently, so only check this one added ~0.
+        assert!(wait.get_sample_sum() - sum_before < 1_000.0);
     }
 
     #[test]

@@ -204,8 +204,14 @@ pub static DESHRED_TRACKING_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLoc
 ///
 /// - `first_shred_to_created_bank`: "replay wake-up latency" -- how long
 ///   between this validator first fetching a shred for the slot and replay
-///   actually creating a bank for it. Measured small in practice (~19ms
-///   p90), ruling this out as a bottleneck.
+///   actually creating a bank for it. ~15ms p90 on 2026-10-15, ~42ms on
+///   2026-11-02. Split (summing to it, same slot) into:
+///   - `first_shred_to_parent_frozen`: waiting for the parent bank to freeze
+///     (0 when it froze before this slot's first shred);
+///   - `parent_frozen_to_created_bank`: replay loop wake-up plus discovering
+///     the child through the blockstore.
+///   Both are observed only when the parent's freeze was recorded on the
+///   replay thread, so their `_count` can be below this one's.
 /// - `created_bank_to_frozen`: replay's own execution time for the whole
 ///   slot, from bank creation to freeze (all transactions executed and
 ///   committed). The one stage that directly answers "is replay itself

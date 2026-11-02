@@ -4130,6 +4130,7 @@ impl ReplayStage {
                     bank.freeze();
                     Ok(())
                 };
+                solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_replay_frozen(bank_slot);
 
                 datapoint_info!(
                     "bank_frozen",

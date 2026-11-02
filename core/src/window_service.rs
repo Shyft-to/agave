@@ -363,6 +363,8 @@ where
                         component,
                         slot_full: info.slot_full,
                     });
+                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                        .mark_data_set_ready(info.slot, info.indices.start);
                 }
                 None => {
                     warn!(

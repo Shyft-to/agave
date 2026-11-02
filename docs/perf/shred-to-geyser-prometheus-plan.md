@@ -337,6 +337,7 @@ throughput, Geyser Notify duration + throughput. A `$percentile` dropdown
 | 2026-10-30 | Node lagged then got restarted by an external lag-watchdog script (not a crash). Two wrong fixes: live-entry cleanup in `clear_slots`, and a `blockstore_fallback` in `confirm_slot` | Neither helped; fallback never fired | 7141055bc3, 13c6f6b314 |
 | 2026-11-02 | Root cause: bank frozen with `block_id = None` (read from RocksDB before the write landed), so every child `Defer`s forever. Fix: bounded wait before freeze + fill parent block id in `child_bank_replay_start` | 1h+ at tip, no restarts, no latency regression. See "Lag regression" section | 6aa744a4af |
 | 2026-11-02 | Reverted `blockstore_fallback`; regression test `test_child_bank_replay_start_fills_parent_block_id_written_after_freeze` | See section | (uncommitted) |
+| 2026-11-02 | Split `first_shred_to_created_bank` into `first_shred_to_parent_frozen` + `parent_frozen_to_created_bank` (parent freeze instant taken on the replay thread); baseline-queries.md section 16. Also restored the two `tx_pipeline` segment call sites (`mark_data_set_ready` in `window_service`, `mark_tx_status_received` in `transaction_status_service`): the tracker was committed without them, so no build has ever recorded segments | `solana-metrics` 43/43 tests pass incl. a sum-to-total test; `solana-core`/`solana-geyser-plugin-manager` check clean. **Not yet deployed** | (uncommitted) |
 
 ## Phase 2 baseline results (2026-09-29, live `promtool` pull, `[1h]` range)
 

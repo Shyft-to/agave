@@ -171,6 +171,8 @@ impl TransactionStatusService {
                     costs,
                     transaction_indexes,
                 ) {
+                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                        .mark_tx_status_received((*transaction.signature()).into(), enqueued_at);
                     let Ok(committed_tx) = commit_result else {
                         continue;
                     };

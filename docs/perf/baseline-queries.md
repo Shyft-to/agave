@@ -322,7 +322,29 @@ Only transactions with every checkpoint recorded appear in the segments
 coverage query before trusting the breakdown. Segments need a binary built
 with this change; earlier data has no segment series.
 
-## 16. Host facts (not queries — note manually alongside the results above)
+## 16. first_shred_to_created_bank split (parent-freeze wait vs bank discovery)
+
+```promql
+# Mean of each part and of the total (means add up; percentiles don't)
+sum(rate(agave_slot_confirmation_duration_us_sum{stage=~"first_shred_to_created_bank|first_shred_to_parent_frozen|parent_frozen_to_created_bank"}[30m])) by (stage)
+  / sum(rate(agave_slot_confirmation_duration_us_count{stage=~"first_shred_to_created_bank|first_shred_to_parent_frozen|parent_frozen_to_created_bank"}[30m])) by (stage)
+
+# p50/p90/p99 of each
+histogram_quantile(0.90, sum(rate(agave_slot_confirmation_duration_us_bucket{stage=~"first_shred_to_created_bank|first_shred_to_parent_frozen|parent_frozen_to_created_bank"}[30m])) by (le, stage))
+
+# Coverage: fraction of created banks that have the split (should be near 1.0)
+sum(rate(agave_slot_confirmation_duration_us_count{stage="parent_frozen_to_created_bank"}[30m]))
+  / sum(rate(agave_slot_confirmation_duration_us_count{stage="first_shred_to_created_bank"}[30m]))
+```
+
+`first_shred_to_parent_frozen` is time spent waiting for the parent bank to freeze, which
+is set by when the parent's last shreds arrive (0 when the parent froze first).
+`parent_frozen_to_created_bank` is everything after that: replay loop wake-up plus
+`generate_new_bank_forks` finding the child through RocksDB (`next_slots`, `meta`). The
+parent's freeze instant is taken on the replay thread, not from the `Processed` notification.
+A large first part means network-bound; a large second part is the local, fixable one.
+
+## 17. Host facts (not queries — note manually alongside the results above)
 
 - `nproc`; `lscpu | head -20`
 - The validator command line, especially `--tvu-receive-threads`,
