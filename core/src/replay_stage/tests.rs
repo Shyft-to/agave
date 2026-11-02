@@ -3446,6 +3446,61 @@ fn test_update_parent_tower_gated() {
 }
 
 #[test]
+fn test_child_bank_replay_start_fills_parent_block_id_written_after_freeze() {
+    // Live replay can freeze a parent before its block id reaches the blockstore. The child
+    // must defer while the block id is missing and chain once it lands, not defer forever.
+    let ReplayBlockstoreComponents {
+        blockstore,
+        vote_simulator,
+        ..
+    } = replay_blockstore_components(Some(tr(0) / tr(2)), 1, None::<GenerateVotes>);
+    let migration_status = post_migration_status_for_tests();
+
+    // Slot 1 has nothing in the blockstore yet; re-point slot 2's meta at it.
+    let (parent_slot, child_slot) = (1, 2);
+    // A fresh replayed bank: `set_block_id` is write-once, so the forks' bank can't be reset.
+    let bank0 = vote_simulator.bank_forks.read().unwrap().get(0).unwrap();
+    let parent_bank = Bank::new_from_parent(bank0, SlotLeader::default(), parent_slot);
+    assert!(parent_bank.should_replay_from_blockstore());
+    assert_eq!(parent_bank.block_id(), None);
+
+    let parent_block_id = Hash::new_unique();
+    let mut meta = blockstore.meta(child_slot).unwrap().unwrap();
+    meta.parent_slot = Some(parent_slot);
+    meta.parent_block_id = parent_block_id;
+    blockstore.put_meta(child_slot, &meta).unwrap();
+
+    // Block id not written yet.
+    assert!(matches!(
+        child_bank_replay_start(
+            &blockstore,
+            &parent_bank,
+            parent_slot,
+            child_slot,
+            &migration_status,
+        ),
+        ChildBankReplayStart::Defer
+    ));
+    assert_eq!(parent_bank.block_id(), None);
+
+    // The write lands.
+    blockstore
+        .set_double_merkle_root(parent_slot, BlockLocation::Original, parent_block_id)
+        .unwrap();
+    assert!(matches!(
+        child_bank_replay_start(
+            &blockstore,
+            &parent_bank,
+            parent_slot,
+            child_slot,
+            &migration_status,
+        ),
+        ChildBankReplayStart::FromStart
+    ));
+    assert_eq!(parent_bank.block_id(), Some(parent_block_id));
+}
+
+#[test]
 fn test_update_parent_interrupt_ignores_non_first_leader_window_slot() {
     let ReplayBlockstoreComponents {
         blockstore,

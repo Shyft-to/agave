@@ -2,7 +2,8 @@
 
 > **How to resume:** read this whole doc, find the latest row in the Progress Log,
 > and continue from there. After each step, append a row (date / step / result /
-> commit). **Start with the final section, "CURRENT STATE AND HANDOFF (2026-10-16)"**:
+> commit). **Start with the final section, "CURRENT STATE AND HANDOFF (2026-10-16)"**,
+> then "Lag regression after live replay (2026-10-30 .. 11-02)" right after it:
 > it supersedes the older hypothesis 5/6 sections where they disagree (those record
 > history; the cache design they describe was deleted). The metric being optimized is
 > `agave_end_to_end_duration_us{path="tx_pipeline"}`; every other metric exists to
@@ -333,6 +334,9 @@ throughput, Geyser Notify duration + throughput. A `$percentile` dropdown
 | 2026-10-14/15 | Replaced the cache with a real live-replay channel (`ledger::live_replay_entries`, pre-write hook in `Blockstore`, window_service sends decoded data sets to ReplayStage). Fixed stale-queue panic and `InvalidLastTick` dead-slot loop (`slot_full` flag) | `read_blockstore` p90 147-152us -> 9.3us, but end-to-end metrics unchanged. See handoff section | 7cb29bc96b, ba8deb5e3c, 0c0bd99f3c |
 | 2026-10-15 | Post-deploy pull: arrival spread p90 460ms == `created_bank_to_frozen` p90 460ms; `first_shred_to_created_bank` p90 14.8ms; `tx_pipeline` p90 16.1ms vs `deshred` 9.6ms | Slot-level numbers are turbine-arrival bound; `tx_pipeline` is the only metric still improvable | — |
 | 2026-10-16 | Added `agave_tx_pipeline_segment_duration_us{segment}`: per-transaction decomposition of `tx_pipeline` into 5 chained segments that sum to it; `docs/perf/compare-live-replay.sh`; baseline-queries.md section 15 | `solana-metrics` 17/17 tests pass incl. a telescoping test; `solana-rpc`/`solana-core` check clean. **Not yet deployed** | (uncommitted) |
+| 2026-10-30 | Node lagged then got restarted by an external lag-watchdog script (not a crash). Two wrong fixes: live-entry cleanup in `clear_slots`, and a `blockstore_fallback` in `confirm_slot` | Neither helped; fallback never fired | 7141055bc3, 13c6f6b314 |
+| 2026-11-02 | Root cause: bank frozen with `block_id = None` (read from RocksDB before the write landed), so every child `Defer`s forever. Fix: bounded wait before freeze + fill parent block id in `child_bank_replay_start` | 1h+ at tip, no restarts, no latency regression. See "Lag regression" section | 6aa744a4af |
+| 2026-11-02 | Reverted `blockstore_fallback`; regression test `test_child_bank_replay_start_fills_parent_block_id_written_after_freeze` | See section | (uncommitted) |
 
 ## Phase 2 baseline results (2026-09-29, live `promtool` pull, `[1h]` range)
 
@@ -1426,6 +1430,11 @@ longer than either number, and a coalesce-window win is invisible to them.
 - **Verify builds only with `--target-dir /tmp/claude-sanity-target`.** The repo's
   default `target/` returned false "Finished" results (even with a deliberate syntax
   error). Long cargo runs (rpc/core) take minutes; run them in the background.
+  **Also pass `--features agave-unstable-api`** for lib crates (`solana-core`,
+  `solana-ledger`, `solana-local-cluster`, ...): they are `#![cfg(feature = "agave-unstable-api")]`,
+  so without it the crate compiles empty and "Finished" in under a second whatever the code
+  contains (likely the real cause of the false results above). Tests that use
+  `Blockstore::set_double_merkle_root` and similar also need `dev-context-only-utils`.
 - Query Prometheus the way the user does: `cd ~/prometheus && ./promtool query
   instant http://localhost:9090 '<promql>'` (historical: `--time=<unix_ts>`; this
   Prometheus lacks the PromQL `@` modifier). Scripts: `docs/perf/run-baseline-queries.sh`,
@@ -1600,3 +1609,81 @@ chosen by the user: either deploy the segments, or pick an optimization directly
 5. Optional cleanups: handle alternate-block copies (hook `None`), consider moving the
    RocksDB write fully off the insert thread (it is still inline after the send), and update
    older sections' references to `agave_decoded_entries_cache_total`.
+
+## Lag regression after live replay (2026-10-30 .. 11-02)
+
+### Symptom
+
+After the live-replay commits (7cb29bc96b onward) the node fell behind the tip and an
+**external watchdog script** restarted it once the lag passed a threshold. There was no
+panic, no error log and no OOM kill; `journalctl` showed nothing. Restart intervals shrank
+because each start replays the blockstore and catches up. Logs during the lag repeated
+`Ancestor in slot N found in bank forks, time to switch` followed by an empty
+`Clearing banks for switching: Chain { ... Iter([]) ... }`.
+
+### How it was found (the metrics that settled it)
+
+A 15s-step pull across the lag onset (`promtool query range`, 30s rate windows) showed replay
+stopping **abruptly and completely** while ingest carried on:
+- `agave_live_replay_entries_total` `ready` and `not_ready` both -> 0 (no `confirm_slot`
+  calls at all, so not a slot stuck polling the live queue);
+- `frozen_rate` (`rate(agave_slot_confirmation_duration_us_count{stage="created_bank_to_frozen"})`)
+  -> 0, and `first_shred_to_created_bank` -> NaN (no new banks created);
+- sigverify, `blockstore_store` busy (~5%) and `agave_verified_shreds_queue_length` (0)
+  unchanged: not a throughput problem.
+
+Lesson: a long window at a 5-minute step that mixes startup, catch-up, tip and lag looks flat
+and hides this. Pull just the transition at 15s.
+
+### Root cause
+
+Live replay can finish and freeze a slot before the insert call that completed its last data
+set has written to RocksDB (`window_service` sends the entries from the pre-write hook). At
+freeze, `replay_active_banks` reads the block id from RocksDB (`Blockstore::get_block_id`:
+double-merkle root for Alpenglow slots), got `None`, and the `debug_assert!` that would catch
+that is compiled out in release. `child_bank_replay_start`
+(`core/src/replay_stage/update_parent.rs`) then compares every child's `parent_block_id` with
+`parent_bank.block_id()` (`None`), returns `Defer` forever, and no further bank is ever
+created. Votor's switch request walks back to the last bank whose block id matches, finds every
+block in `BlockLocation::Original`, and clears nothing: hence the empty "Clearing banks" line.
+Before live replay, replay waited on the write, so the block id was always present at freeze.
+
+### Fix (6aa744a4af)
+
+- `ReplayStage::get_block_id_after_write` (`core/src/replay_stage.rs`): for replayed
+  (non-leader) banks, poll `get_block_id` every 200us for up to 50ms before freezing; logs
+  `block id for slot N not in the blockstore ... after replay completed` if it gives up.
+- `child_bank_replay_start`: if a replayed parent has no block id, read it from the blockstore
+  and `set_block_id` before comparing, so a parent frozen with `None` recovers on the next loop.
+- Regression test: `replay_stage::tests::test_child_bank_replay_start_fills_parent_block_id_written_after_freeze`.
+
+Not the cause, reverted or kept: `blockstore_fallback` in `confirm_slot` (13c6f6b314) never
+fired and was reverted on 2026-11-02 (the metric label no longer exists). Live-entry cleanup in
+`clear_slots` (7141055bc3) is kept: it is correct for switch/UpdateParent restarts, but the
+`ClearBank` command and `update_parent.rs`'s first restart path still pass `None`.
+
+### Result (2026-11-02, 1h at tip, p90)
+
+No restarts. `frozen_rate` steady 4.5-4.8/s (this counter runs ~1.9x the slot rate even at
+tip, so use it as "is replay alive", not as a slot rate); `ready` 37-57/s, never 0.
+
+| metric | after fix | 10-15 baseline | before fix (10-30) |
+|---|---|---|---|
+| `tx_pipeline` | 10-15ms (mostly 10-12) | 16.1ms | 11-18ms |
+| `deshred` | 6.9-8.0ms | 9.6ms | - |
+| `read_blockstore` | 9.4-9.6us | 9.3us | 9-14us |
+| `first_shred_to_created_bank` | 40-43ms | 14.8ms | ~42ms |
+| `created_bank_to_frozen` | 460ms | 460ms | 460ms |
+| `executed_tx` | ~420ms | 417ms | - |
+
+The freeze wait has no visible cost (`first_shred_to_created_bank` unchanged by the fix). The
+lower `tx_pipeline`/`deshred` than 10-15 is not attributed to code; network conditions differ.
+Not yet recorded: the count of `not in the blockstore` warnings (how often the race hit).
+
+### Next lead
+
+`first_shred_to_created_bank` p90 is ~42ms vs 14.8ms on 10-15, and the rise predates the fix.
+It is the first stage of `tx_pipeline` for every slot's opening data set. Split it into
+parent-freeze wait vs RocksDB `next_slots` / `meta` reads in `generate_new_bank_forks` (known
+gap (a) above) before changing anything; creating banks from the live channel is the candidate
+fix if the RocksDB part dominates.

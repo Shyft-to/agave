@@ -1390,29 +1390,7 @@ pub fn confirm_slot(
                     BlockstoreError::DeadSlot,
                 ))
             } else {
-                let ready = live_entries.drain_ready(slot, progress.num_shreds);
-                if ready.0.is_empty() {
-                    // Safety net: entries consumed from the live queue are never re-sent, so
-                    // a bank that was cleared/recreated mid-slot (ClearBank, UpdateParent,
-                    // dump-and-repair, ...) would otherwise poll `not_ready` forever and
-                    // stall every descendant. If the blockstore already holds completed
-                    // data sets past `progress.num_shreds`, replay them from there.
-                    let persisted = blockstore
-                        .get_slot_components_with_shred_info(
-                            slot,
-                            progress.num_shreds,
-                            allow_dead_slots,
-                        )
-                        .map_err(BlockstoreProcessorError::FailedToLoadEntries);
-                    if persisted.as_ref().is_ok_and(|(components, ..)| !components.is_empty()) {
-                        solana_metrics::pipeline_metrics::LIVE_REPLAY_ENTRIES_TOTAL
-                            .with_label_values(&["blockstore_fallback"])
-                            .inc();
-                    }
-                    persisted
-                } else {
-                    Ok(ready)
-                }
+                Ok(live_entries.drain_ready(slot, progress.num_shreds))
             }
         } else {
             blockstore
