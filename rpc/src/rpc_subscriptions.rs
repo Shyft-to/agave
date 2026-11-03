@@ -629,6 +629,7 @@ impl RpcSubscriptions {
                     let pool = rayon::ThreadPoolBuilder::new()
                         .num_threads(notification_threads.get())
                         .thread_name(|i| format!("solRpcNotify{i:02}"))
+                        .stack_size(32*1024*1024)
                         .build()
                         .unwrap();
                     pool.install(|| {
