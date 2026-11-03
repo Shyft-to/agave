@@ -338,6 +338,8 @@ throughput, Geyser Notify duration + throughput. A `$percentile` dropdown
 | 2026-11-02 | Root cause: bank frozen with `block_id = None` (read from RocksDB before the write landed), so every child `Defer`s forever. Fix: bounded wait before freeze + fill parent block id in `child_bank_replay_start` | 1h+ at tip, no restarts, no latency regression. See "Lag regression" section | 6aa744a4af |
 | 2026-11-02 | Reverted `blockstore_fallback`; regression test `test_child_bank_replay_start_fills_parent_block_id_written_after_freeze` | See section | (uncommitted) |
 | 2026-11-02 | Split `first_shred_to_created_bank` into `first_shred_to_parent_frozen` + `parent_frozen_to_created_bank` (parent freeze instant taken on the replay thread); baseline-queries.md section 16. Also restored the two `tx_pipeline` segment call sites (`mark_data_set_ready` in `window_service`, `mark_tx_status_received` in `transaction_status_service`): the tracker was committed without them, so no build has ever recorded segments | `solana-metrics` 43/43 tests pass incl. a sum-to-total test; `solana-core`/`solana-geyser-plugin-manager` check clean. **Not yet deployed** | (uncommitted) |
+| 2026-11-03 | Checked the live-replay bypass (works; only `write_batch` ~51us mean leaves the critical path, so ~0.1ms expected gain, below bench noise) and broke down `collect_entries` | Footer processing is ~75% of `collect_entries`: `on_marker` ~13ms per footer, `wait_for_completed_scheduler` p50 2.5ms. See "collect_entries breakdown and footer work" | — |
+| 2026-11-03 | Footer phase timers, parallel footer certificate verification, verification spawns moved after `process_entries` | See the same section. **Not yet deployed** | (uncommitted) |
 
 ## Phase 2 baseline results (2026-09-29, live `promtool` pull, `[1h]` range)
 
@@ -1665,8 +1667,10 @@ fired and was reverted on 2026-11-02 (the metric label no longer exists). Live-e
 
 ### Result (2026-11-02, 1h at tip, p90)
 
-No restarts. `frozen_rate` steady 4.5-4.8/s (this counter runs ~1.9x the slot rate even at
-tip, so use it as "is replay alive", not as a slot rate); `ready` 37-57/s, never 0.
+No restarts. `frozen_rate` steady 4.5-4.8/s; `ready` 37-57/s, never 0. (Correction,
+2026-11-03: this IS the slot rate. Two `health` calls 822s apart advanced 3,831 slots, i.e.
+4.66 slots/s, ~215ms slots, and `frozen_rate` was 4.66/s over the same window. The earlier
+"~1.9x the slot rate" note assumed 400ms slots.)
 
 | metric | after fix | 10-15 baseline | before fix (10-30) |
 |---|---|---|---|
@@ -1688,3 +1692,136 @@ It is the first stage of `tx_pipeline` for every slot's opening data set. Split 
 parent-freeze wait vs RocksDB `next_slots` / `meta` reads in `generate_new_bank_forks` (known
 gap (a) above) before changing anything; creating banks from the live channel is the candidate
 fix if the RocksDB part dominates.
+
+### Result (2026-11-02, deployed 664141fe45, ~1h at tip, `[30m]` windows, 60s step)
+
+**`first_shred_to_created_bank` split: bank discovery is NOT the problem.**
+
+| stage | mean | p90 |
+|---|---|---|
+| `first_shred_to_created_bank` | 14.5-15.5ms | 41-42.5ms |
+| `first_shred_to_parent_frozen` | 13.5-14.5ms (~94%) | 40.4-42.2ms |
+| `parent_frozen_to_created_bank` | 0.94-0.99ms (~6%) | 1.9ms |
+
+The child bank is created ~1ms after its parent freezes. The rest is waiting for the parent to
+finish, which is set by when the parent's last shreds arrive (the leader streams the child
+before the parent has propagated). Creating banks from the live channel would save at most ~1ms
+on the first data set of each slot: dropped. Still unmeasured: parent last-shred-received ->
+parent frozen (the local replay tail inside `first_shred_to_parent_frozen`); there is no stage
+for it yet.
+
+**`tx_pipeline` segments (first data recorded by any build). Coverage B = 0.9999.**
+
+| segment | mean | share of segment sum (~5.6-6.0ms) |
+|---|---|---|
+| `fetch_to_data_set_ready` | 2.68-2.92ms | ~48% |
+| `data_set_ready_to_replay_pickup` | 0.23-0.31ms | ~5% |
+| `replay_pickup_to_committed` | 2.54-2.85ms | ~46% |
+| `commit_to_status_dequeued` | ~30us | <1% |
+| `status_dequeued_to_notified` | ~10us | <1% |
+
+Two segments hold ~94% of the mean, about equally. TransactionStatusService and the live-replay
+handoff are negligible. `fetch_to_data_set_ready` and `replay_pickup_to_committed` both crept up
+~8% over the hour, alongside `first_shred_to_parent_frozen`, which points to load or network
+rather than a local regression. Next: split each of the two big segments before changing code
+(fetch -> sigverify out -> insert start -> pre-write hook; and pickup -> scheduler dispatch ->
+execute -> commit; `agave_execute_phase_duration_us` may already cover the second).
+
+## collect_entries breakdown and footer work (2026-11-03)
+
+### Is the live-replay path really bypassing the blockstore write?
+
+Yes, for replay. The `before_write` hook (`ledger/src/blockstore.rs`, `do_insert_shreds_locked`)
+runs after the in-memory insert and before `write_batch`, and replay reads only from the live
+queue. But the RocksDB write is still inline on `solWinInsert` under `insert_shreds_lock`, and
+`blockstore_store{total}` times the whole insert call (write and decode+send included), so that
+number cannot drop with this design. Only `write_batch` (mean 51us, p90 151us) left the critical
+path; `insert_shreds` (89us), `recovery` (27us), chaining etc. must still run before the send.
+Expected gain ~0.1ms mean (write + read savings minus decode), well inside bench noise (baseline
+per-run p50 0.73-1.14ms). Live check: `ready` ~24/s, no "not assembled from memory" or "not in
+the blockstore" warnings. The deshred path still waits for the write
+(`completed_data_sets_sender` sends after the insert returns, and CompletedDataSetsService
+re-reads RocksDB).
+
+### collect_entries phases (20m steady state, 2026-11-03)
+
+| phase | calls/s | mean | p90 | p99 | share of collect_entries time |
+|---|---|---|---|---|---|
+| `on_marker` | 9.3 (header + footer per slot) | 6.5ms (~13ms per footer) | 18ms | 19.8ms | ~59% |
+| `wait_for_completed_scheduler` | 4.7 (footer only) | 3.5ms | 8.8ms | 19.8ms | ~16% |
+| `process_entries` | 44 | 268us | 484us | 947us | 11% |
+| `validate_and_hash_transactions` | 44 | 139us | 295us | 484us | 6% |
+| `spawn_signature_verification` | 44 | 87us | 178us | 404us | 4% |
+| `spawn_poh_verification` | 44 | 80us | 152us | 199us | 3% |
+| `tx_pipeline_mark` | 44 | 24us | 47us | 84us | 1% |
+| rest | 44 | <=4us | floor | floor | ~0 |
+
+Phase sums match `collect_entries` (965us x 108 calls/s ~= 104ms/s). `on_marker` p50 is at the
+10us bucket floor: headers are free, footers carry the whole cost. The footer
+(`BlockComponentProcessor::on_footer`) verifies up to four BLS aggregate certificates (skip and
+notar reward certs; notarize+finalize or fast-finalize) and then pays vote rewards / updates
+vote states, all serially on the replay thread right before freeze. ~16.5ms of footer work per
+slot is close to `first_shred_to_parent_frozen` (mean ~14ms), so the parent-freeze wait is
+probably mostly footer processing rather than late parent shreds (inferred, not measured).
+Effect on per-tx latency is limited to the child slot's first data sets
+(`data_set_ready_to_replay_pickup` mean 0.28ms, p99 6.6ms). `wait_for_completed_scheduler` p50
+2.5ms means execution is ~2.5ms behind when a slot's last entries arrive, matching
+`replay_pickup_to_committed` (~2.9ms mean).
+
+Side notes: `agave_shred_arrival_spread_us` records ~9.1 observations/s, twice the slot rate
+(possibly two observations per slot; affects the "spread == created_bank_to_frozen" reading,
+not yet investigated).
+
+### Changes (uncommitted, not yet deployed)
+
+1. `agave_block_footer_phase_duration_us{phase}` (`metrics/src/pipeline_metrics.rs`), observed in
+   `runtime/src/block_component_processor.rs::on_footer` (replay path only; the leader's
+   `update_bank_with_footer_fields` call in `block_creation_loop` is not timed): `clock_bounds`,
+   `reward_cert_verify`, `final_cert_verify`, `verify_certs_wall`, `update_bank`, `total`.
+2. Parallel certificate verification: `on_footer` runs the reward-cert and finalization-cert
+   checks with `rayon::join` (when a finalization cert is present); `ValidatedBlockFinalizationCert::try_from_footer` runs the
+   notarize and finalize verifications of slow finalization with `rayon::join`. Results are
+   consumed in the original order, so the returned error is unchanged for every input (test
+   `test_slow_finalization_error_precedence_both_insufficient`). Pure verification, no state
+   change, no feature gate. `rayon::join` is used only when the footer carries a finalization
+   cert, and `reward_cert_verify` is only observed when reward certs are present. Precedence
+   tests: `test_slow_finalization_error_precedence_both_insufficient` (notarize before
+   finalize) and `test_on_footer_reward_cert_error_precedes_final_cert_error` (reward cert
+   before final cert). Caveats: on an invalid footer the concurrently running verifications
+   still finish (up to two wasted BLS verifies per bad block, e.g. an invalid reward cert with
+   slow finalization, or an invalid notarize cert whose finalize cert is still verified); with `--replay-forks-threads` > 1 and several
+   banks replaying, the join runs inside the fork pool and a waiting worker can pick up another
+   bank's replay job, delaying this footer. In the default serial mode the replay thread now
+   waits while both verifications (including the pairing checks that used to run on the
+   replay thread) run on the global rayon pool, so a busy `solRayonGlob` pool adds queueing.
+   `verify_certs_wall` shows any of these effects.
+3. `ledger/src/blockstore_processor.rs::confirm_slot_entries`: `spawn_poh_verification` and
+   `spawn_signature_verification` now run after `process_entries` (the PoH verification data is
+   still built before `validate_and_hash_transactions` consumes the entries). Freeze still waits
+   for all verification (`complete_replay_verification`). `spawn_poh_verification` now observes
+   prep + spawn (so the label means something slightly different across this deploy). Each data
+   set's verification now starts ~0.4ms later (after `validate_and_hash` + `process_entries`), so
+   the non-blocking `collect_available_verification_results` in the same call rarely sees that
+   data set's results: a bad PoH or signature tends to be caught one data set later, i.e. a bit
+   more execution on a block that is already dead. Bank state and dead-slot classification are
+   unchanged, and freeze still waits for every result. Test
+   `test_confirm_slot_entries_async_poh_verify_fail` (also passes on the old code: it shows the
+   failure is still enforced, not the ordering).
+
+Step 2 (config only, not in this change): raise `--unified-scheduler-handler-threads` from the
+default `cores/4` to `cores/2` in `download_start.sh` (24 on a 48-thread host, 32 on 64). The
+test validator's core count is not visible through the ops tools; confirm it first.
+
+### How to read the result after deploy
+
+```promql
+# footer phases, mean per call
+sum by (phase) (rate(agave_block_footer_phase_duration_us_sum[20m])) / sum by (phase) (rate(agave_block_footer_phase_duration_us_count[20m]))
+# collect_entries phases (spawn_* should no longer delay process_entries; on_marker should drop)
+sum by (phase) (rate(agave_collect_entries_phase_duration_us_sum[20m])) / sum by (phase) (rate(agave_collect_entries_phase_duration_us_count[20m]))
+```
+
+Compare `verify_certs_wall` with `reward_cert_verify` + `final_cert_verify` (the parallel
+saving), `update_bank` (vote reward/state cost, untouched by this change), then
+`first_shred_to_parent_frozen`, `data_set_ready_to_replay_pickup` and `replay_pickup_to_committed`
+against the 2026-11-02/03 numbers above.

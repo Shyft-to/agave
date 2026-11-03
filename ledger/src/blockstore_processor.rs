@@ -1683,27 +1683,18 @@ fn confirm_slot_entries(
     }
 
     let last_entry_hash = entries.last().map(|e| e.hash);
-    if !skip_verification {
-        let spawn_poh_verification_start = std::time::Instant::now();
-        let start_hash = progress.last_entry;
+    // The PoH verification data has to be built here, before
+    // `validate_and_hash_transactions` consumes `entries`. The verification
+    // jobs themselves are spawned after `process_entries` (see below).
+    let poh_verification = (!skip_verification).then(|| {
+        let prep_start = Instant::now();
         let verify_entries = entry::entries_to_verification_data(&entries);
         datapoint_debug!(
             "verify-batch-size",
             ("size", verify_entries.len() as i64, i64)
         );
-        let result = progress
-            .async_verification(replay_verification_worker_pool)
-            .spawn_poh_verification(
-                replay_verification_worker_pool,
-                verify_entries,
-                start_hash,
-                slot,
-            );
-        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
-            .with_label_values(&["spawn_poh_verification"])
-            .observe(spawn_poh_verification_start.elapsed().as_micros() as f64);
-        result?;
-    }
+        (progress.last_entry, verify_entries, prep_start.elapsed())
+    });
 
     let validate_and_hash_transaction = {
         let bank = bank.clone_with_scheduler();
@@ -1740,7 +1731,7 @@ fn confirm_slot_entries(
         }
     };
     let bank_id = bank.bank_id();
-    if skip_verification {
+    let signature_verification = if skip_verification {
         if let Some(replay_vote_sender) = replay_vote_sender {
             let message_hashes = unverified_signatures.vote_transaction_message_hashes();
             if !message_hashes.is_empty() {
@@ -1751,23 +1742,10 @@ fn confirm_slot_entries(
                 });
             }
         }
+        None
     } else {
-        let spawn_signature_verification_start = std::time::Instant::now();
-        let replay_vote_sender = replay_vote_sender.cloned();
-        let result = progress
-            .async_verification(replay_verification_worker_pool)
-            .spawn_signature_verification(
-                replay_verification_worker_pool,
-                unverified_signatures,
-                slot,
-                bank_id,
-                replay_vote_sender,
-            );
-        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
-            .with_label_values(&["spawn_signature_verification"])
-            .observe(spawn_signature_verification_start.elapsed().as_micros() as f64);
-        result?;
-    }
+        Some(unverified_signatures)
+    };
 
     let mut replay_timer = Measure::start("replay_elapsed");
     let is_vote_only_bank = bank.vote_only_bank();
@@ -1808,6 +1786,46 @@ fn confirm_slot_entries(
         .observe(replay_timer.as_us() as f64);
 
     process_result?;
+
+    // Spawn this data set's PoH and signature verification only after its
+    // transactions have been handed to the scheduler, so the job fan-out to
+    // the verification workers is not on the path to dispatch. Execution never
+    // waited on these results: they are collected without blocking below and
+    // enforced before freeze by `wait_for_all_verification_results`, so this
+    // only changes when verification starts.
+    if let Some((start_hash, verify_entries, prep_elapsed)) = poh_verification {
+        let spawn_start = Instant::now();
+        let result = progress
+            .async_verification(replay_verification_worker_pool)
+            .spawn_poh_verification(
+                replay_verification_worker_pool,
+                verify_entries,
+                start_hash,
+                slot,
+            );
+        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+            .with_label_values(&["spawn_poh_verification"])
+            .observe(prep_elapsed.saturating_add(spawn_start.elapsed()).as_micros() as f64);
+        result?;
+    }
+    if let Some(unverified_signatures) = signature_verification {
+        let spawn_signature_verification_start = Instant::now();
+        let replay_vote_sender = replay_vote_sender.cloned();
+        let result = progress
+            .async_verification(replay_verification_worker_pool)
+            .spawn_signature_verification(
+                replay_verification_worker_pool,
+                unverified_signatures,
+                slot,
+                bank_id,
+                replay_vote_sender,
+            );
+        solana_metrics::pipeline_metrics::COLLECT_ENTRIES_PHASE_DURATION_US
+            .with_label_values(&["spawn_signature_verification"])
+            .observe(spawn_signature_verification_start.elapsed().as_micros() as f64);
+        result?;
+    }
+
     let collect_verification_results_start = std::time::Instant::now();
     let verification_results = progress
         .collect_available_verification_results(poh_verify_elapsed, transaction_verify_elapsed);
@@ -5328,6 +5346,31 @@ pub mod tests {
             confirm_slot_entries_for_tests(&bank, vec![entry], false, genesis_hash),
             Err(BlockstoreProcessorError::InvalidTransaction(
                 TransactionError::SignatureFailure
+            ))
+        );
+    }
+
+    #[test]
+    fn test_confirm_slot_entries_async_poh_verify_fail() {
+        // PoH verification is spawned after the entries are dispatched for
+        // execution; a bad entry hash must still fail the data set.
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(100 * LAMPORTS_PER_SOL);
+        let genesis_hash = genesis_config.hash();
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+        let tx =
+            system_transaction::transfer(&mint_keypair, &Pubkey::new_unique(), 1, genesis_hash);
+        let mut entry = Entry::new(&genesis_hash, 1, vec![tx]);
+        entry.hash = Hash::new_unique();
+
+        assert_matches!(
+            confirm_slot_entries_for_tests(&bank, vec![entry], false, genesis_hash),
+            Err(BlockstoreProcessorError::InvalidBlock(
+                BlockError::InvalidEntryHash
             ))
         );
     }

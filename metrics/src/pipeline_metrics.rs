@@ -210,6 +210,7 @@ pub static DESHRED_TRACKING_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLoc
 ///     (0 when it froze before this slot's first shred);
 ///   - `parent_frozen_to_created_bank`: replay loop wake-up plus discovering
 ///     the child through the blockstore.
+///
 ///   Both are observed only when the parent's freeze was recorded on the
 ///   replay thread, so their `_count` can be below this one's.
 /// - `created_bank_to_frozen`: replay's own execution time for the whole
@@ -289,6 +290,7 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// - `commit_to_status_dequeued`: tx-status channel wait.
 /// - `status_dequeued_to_notified`: tx-status service work before this
 ///   transaction's Geyser notification returned.
+///
 /// Only transactions for which every checkpoint was recorded are observed
 /// here (live-replay path, data set starting on a tracked FEC boundary);
 /// `path="tx_pipeline"` itself also covers the rest, so
@@ -319,7 +321,12 @@ pub static TX_PIPELINE_SEGMENT_DURATION_US: LazyLock<HistogramVec> = LazyLock::n
 ///   dispatch overhead only, NOT the actual verification time (that runs
 ///   asynchronously on worker threads and is folded into
 ///   `ConfirmationTiming::{poh,transaction}_verify_elapsed`, still reported
-///   only through the legacy datapoint path as of this writing).
+///   only through the legacy datapoint path as of this writing). Since
+///   2026-11-03 both spawns run AFTER `process_entries`, so they are no longer
+///   on the path to dispatching the data set's transactions;
+///   `spawn_poh_verification` is the sum of the verification-data prep (still
+///   done before `validate_and_hash_transactions`, which consumes the
+///   entries) and the spawn itself.
 /// - `validate_and_hash_transactions`: synchronous message-hash validation
 ///   (`TransactionVerificationMode::HashOnly`) on the calling thread.
 /// - `process_entries`: handing entries to the bank/scheduler for
@@ -337,6 +344,34 @@ pub static COLLECT_ENTRIES_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock:
     register_histogram_vec(
         "agave_collect_entries_phase_duration_us",
         "Fine-grained breakdown of the collect_entries replay stage, in microseconds",
+        &["phase"],
+    )
+});
+
+/// Breakdown of `BlockComponentProcessor::on_footer` (the replayed block
+/// footer: the bulk of `COLLECT_ENTRIES_PHASE_DURATION_US{phase="on_marker"}`,
+/// ~13ms per slot on 2026-11-03), labeled by `phase`. Replay path only; the
+/// leader's own footer (`block_creation_loop`) is not observed here.
+///
+/// - `clock_bounds`: `enforce_nanosecond_clock_bounds`.
+/// - `reward_cert_verify`: `ValidatedRewardCert::try_new` (skip/notar reward
+///   certificate BLS verification), measured inside its own branch; only
+///   observed when the footer carries a reward cert.
+/// - `final_cert_verify`: `ValidatedBlockFinalizationCert::try_from_footer`
+///   (finalization certificate BLS verification), measured inside its own
+///   branch; only observed when the footer carries a finalization cert.
+/// - `verify_certs_wall`: wall time of the certificate-verification section.
+///   With a finalization cert the two checks above run concurrently
+///   (`rayon::join`); without one, only the reward-cert check runs, inline.
+///   Compare with the branch timings to see what the overlap saves, or
+///   whether pool queueing costs more.
+/// - `update_bank`: `update_bank_with_footer_fields` (clock update, vote
+///   reward calculation and vote state updates, expected bank hash).
+/// - `total`: the whole `on_footer` call, including early error returns.
+pub static BLOCK_FOOTER_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_block_footer_phase_duration_us",
+        "Breakdown of replayed block footer processing, in microseconds",
         &["phase"],
     )
 });
