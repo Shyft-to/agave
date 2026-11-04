@@ -328,6 +328,9 @@ where
     let before_recovery_us = metrics.shred_recovery_elapsed_us;
     let before_insert_lock_us = metrics.insert_lock_elapsed_us;
     let before_commit_working_sets_us = metrics.commit_working_sets_elapsed_us;
+    let before_index_meta_us = metrics.index_meta_time_us;
+    let before_num_shreds = metrics.num_shreds;
+    let before_num_inserted = metrics.num_inserted;
 
     // Runs inside `Blockstore`'s insertion call after the in-memory work and
     // *before* its RocksDB write: decode every data set this call completed
@@ -409,6 +412,16 @@ where
     blockstore_store_us
         .with_label_values(&["commit_working_sets"])
         .observe((metrics.commit_working_sets_elapsed_us - before_commit_working_sets_us) as f64);
+    blockstore_store_us
+        .with_label_values(&["index_meta"])
+        .observe((metrics.index_meta_time_us - before_index_meta_us) as f64);
+    let insert_shreds_total = &solana_metrics::pipeline_metrics::BLOCKSTORE_INSERT_SHREDS_TOTAL;
+    insert_shreds_total
+        .with_label_values(&["received"])
+        .inc_by((metrics.num_shreds - before_num_shreds) as u64);
+    insert_shreds_total
+        .with_label_values(&["inserted"])
+        .inc_by(metrics.num_inserted - before_num_inserted);
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;

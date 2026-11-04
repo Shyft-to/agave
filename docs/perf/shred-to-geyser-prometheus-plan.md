@@ -339,7 +339,9 @@ throughput, Geyser Notify duration + throughput. A `$percentile` dropdown
 | 2026-11-02 | Reverted `blockstore_fallback`; regression test `test_child_bank_replay_start_fills_parent_block_id_written_after_freeze` | See section | (uncommitted) |
 | 2026-11-02 | Split `first_shred_to_created_bank` into `first_shred_to_parent_frozen` + `parent_frozen_to_created_bank` (parent freeze instant taken on the replay thread); baseline-queries.md section 16. Also restored the two `tx_pipeline` segment call sites (`mark_data_set_ready` in `window_service`, `mark_tx_status_received` in `transaction_status_service`): the tracker was committed without them, so no build has ever recorded segments | `solana-metrics` 43/43 tests pass incl. a sum-to-total test; `solana-core`/`solana-geyser-plugin-manager` check clean. **Not yet deployed** | (uncommitted) |
 | 2026-11-03 | Checked the live-replay bypass (works; only `write_batch` ~51us mean leaves the critical path, so ~0.1ms expected gain, below bench noise) and broke down `collect_entries` | Footer processing is ~75% of `collect_entries`: `on_marker` ~13ms per footer, `wait_for_completed_scheduler` p50 2.5ms. See "collect_entries breakdown and footer work" | — |
-| 2026-11-03 | Footer phase timers, parallel footer certificate verification, verification spawns moved after `process_entries` | See the same section. **Not yet deployed** | (uncommitted) |
+| 2026-11-03 | Footer phase timers, parallel footer certificate verification, verification spawns moved after `process_entries` | See the same section | 662ef82a21 |
+| 2026-11-03 | Deployed 662ef82a, bench `20261103T155256Z-bench-1` | Parallel verification saves ~2.4ms/slot (footer 13.1 -> 11.45ms); `update_bank` is 8.52ms = 74% of the footer; `tx_pipeline` flat; bench medians p50 0.84 -> 0.70ms, first% 15.9 -> 21.35, p99 10.5 -> 11.7ms (two outlier runs). See "Results of 662ef82a" | — |
+| 2026-11-04 | `update_bank` sub-timers + vote-accounts counter; blockstore `or_insert_with` merkle-root fix + `index_meta` phase + insert-shreds counters | See "Next round: update_bank and insert_shreds". **Not yet deployed** | (uncommitted) |
 
 ## Phase 2 baseline results (2026-09-29, live `promtool` pull, `[1h]` range)
 
@@ -1825,3 +1827,132 @@ Compare `verify_certs_wall` with `reward_cert_verify` + `final_cert_verify` (the
 saving), `update_bank` (vote reward/state cost, untouched by this change), then
 `first_shred_to_parent_frozen`, `data_set_ready_to_replay_pickup` and `replay_pickup_to_committed`
 against the 2026-11-02/03 numbers above.
+
+### Results of 662ef82a (deployed 2026-11-03 15:14Z, bench `20261103T155256Z-bench-1`)
+
+Bench started ~29 min after the restart, with the freeze rate at 4.57-4.74/s (= slot rate) for
+the 15 minutes before it, so the window excludes catch-up. Validator-side numbers are 15m
+steady-state means after the deploy against a 30m window just before it.
+
+**Footer breakdown (first data from `agave_block_footer_phase_duration_us`):**
+
+| phase | mean per footer |
+|---|---|
+| `total` | 11.45ms (before: ~13.1ms, implied from `on_marker` 6.57ms x 2) |
+| `update_bank` | **8.52ms (74%)** |
+| `verify_certs_wall` | 2.91ms |
+| `reward_cert_verify` / `final_cert_verify` (branches) | 2.84 / 2.47ms (5.31ms if sequential) |
+| `clock_bounds` | 3us |
+
+Parallel verification saves ~2.4ms per slot. BLS verification turned out to be only ~25% of the
+footer; vote reward/state updates are the bulk.
+
+**Other metrics (before -> after):**
+
+| metric | before | after |
+|---|---|---|
+| `on_marker` | 6.57ms | 5.72ms |
+| `wait_for_completed_scheduler` | 4.40ms | 4.49ms |
+| `first_shred_to_parent_frozen` | 14.99ms | 14.04ms |
+| `process_entries` | 275us | 243us |
+| `spawn_poh` / `spawn_signature` | 84 / 93us | 88 / 95us (now after dispatch) |
+| `tx_pipeline` mean / p90 / p99 | 6.33 / 14.4 / 41.7ms | 6.50 / 15.1 / 44.2ms |
+| `fetch_to_data_set_ready` | 2.83ms | 3.07ms (network side, untouched) |
+| `replay_pickup_to_committed` | 3.15ms | 3.10ms |
+| `data_set_ready_to_replay_pickup` | 0.31ms | 0.30ms |
+
+**Bench (10 runs vs Brood):** medians p50 0.84 -> 0.70ms, first% 15.9 -> 21.35, p95 5.04 ->
+5.79ms, p99 10.50 -> 11.72ms. Averages (1.31 / 12.7 / 20.3ms) are skewed by runs 7 and 8 (run 8:
+p50 7.10ms, p99 65ms, first% 9.8); without run 8 the average p50 is 0.66ms. 15s segment means
+over the bench window peaked at ~5.3ms (normal ~3ms), which does not explain run 8; cause
+unverified. Better p50/first%, slightly worse p95/p99 at the median, all within the run-to-run
+spread: one bench cannot separate this change from noise.
+
+**Conclusion:** the footer saving is real but mostly moves slot freeze, not per-transaction
+notify time, so it barely shows in the bench. `update_bank` (8.5ms/slot) is the next footer
+target.
+
+## Next round: update_bank and insert_shreds (2026-11-04)
+
+### update_bank (8.5ms per footer): what it does
+
+`calc_vote_rewards_update_vote_states` (`runtime/src/block_component_processor/vote_reward.rs`)
+runs for ~every validator in the reward and/or finalization cert:
+1. Per validator, serially: bincode-deserialize the vote account into a `VoteStateHandler`,
+   update votes/root/credits, serialize into a newly allocated `AccountSharedData`.
+2. `bank.store_accounts(.., None)` for all of them: per account, `stakes_cache.check_and_store`
+   re-parses the vote account and takes the stakes write lock (the bank's first vote-account
+   upsert also copies the whole vote-accounts map via `Arc::make_mut`); then
+   `enqueue_off_chain_accounts_lt_hash_updates` loads every account's previous version one at
+   a time (no loading thread pool is passed) and spawns its lattice-hash job; then the
+   write-cache store.
+
+There was no timer inside it, so it is not known whether (1) or (2) dominates. This round
+measures only; the logic is unchanged.
+
+Candidates for the following round, depending on the split:
+- (1) dominates: run the per-validator loop with rayon. The result is provably identical: the
+  work is per account, and the leader-reward sum is a saturating add of non-negative values,
+  which is order-independent. Sequential iteration is over a `HashSet` (already
+  process-random), so error identity never mattered for consensus.
+- (2) dominates: pass a thread pool so the previous-version loads run in parallel, and/or batch
+  the stakes-cache updates under one lock.
+
+### insert_shreds (mean 89us, p90 313us per insert call)
+
+Runs on `solWinInsert` under `insert_shreds_lock`, before the live-replay send, so it is on the
+transaction path (`fetch_to_data_set_ready`). Findings:
+- **Redundant merkle-root computation (fixed this round).** `check_insert_data_shred` and
+  `check_insert_coding_shred` ended with
+  `merkle_root_metas.entry(..).or_insert(WorkingEntry::Dirty(MerkleRootMeta::from_shred(&shred)))`.
+  `or_insert` evaluates its argument eagerly, and `from_shred` calls `shred.merkle_root()`,
+  which is not cached (a SHA-256 leaf hash over ~1.1KB plus ~6 proof-node hashes). So every
+  inserted shred computed its merkle root here even when the entry already existed and the value
+  was discarded, on top of `check_merkle_root_consistency`'s own computation (untrusted inserts).
+  Now `or_insert_with`: identical map contents, and the computation is skipped for every shred
+  whose erasure set already has a merkle root meta, whether in the working set or loaded from
+  RocksDB at the start of the insert. That is every shred except the first ever seen per erasure
+  set. Saving size is unknown until measured.
+- **Per-call RocksDB meta reads (future candidate, not done).** `ShredInsertionTracker` is
+  rebuilt per insert call, so every call re-reads the slot meta, index, erasure meta and merkle
+  root meta of each slot/erasure set it touches, even though the previous call just wrote them.
+  Caching them across calls would need invalidation on every purge/clear path; decide after the
+  `index_meta` numbers below.
+
+### Changes (uncommitted, not yet deployed)
+
+1. `agave_block_footer_phase_duration_us` gains `update_bank_vote_states` (state setup + the
+   per-validator loop) and `update_bank_store` (`bank.store_accounts`), observed only when the
+   footer carries a cert and the step succeeds. They are also observed for the leader's own
+   footer (`block_creation_loop`), which has no `update_bank`/`total` sample; never the case on
+   this unstaked node. Per footer, `update_bank` minus the two is the clock update,
+   `set_expected_bank_hash`, and the cert-slot lookups and map allocation; but `update_bank` is
+   sampled on every replayed footer and the two sub-phases only on footers with a cert, so check
+   their sample counts match before subtracting means. New counter
+   `agave_block_footer_vote_accounts_updated_total`.
+2. `ledger/src/blockstore.rs`: `or_insert` -> `or_insert_with` at both merkle-root-meta sites.
+3. `core/src/window_service.rs`: new `index_meta` phase on `agave_blockstore_store_duration_us`
+   (index-meta lookup time, mostly RocksDB reads, from both insert and recovery paths,
+   overlapping `insert_shreds`/`recovery`; reads somewhat low because each lookup is truncated
+   to whole microseconds), and `agave_blockstore_insert_shreds_total{kind=received|inserted}`
+   (`received` = shreds passed to insertion after deserialization; `inserted` = accepted data and
+   coding shreds in Original and Alternate columns, not erasure-recovered ones). Neither is
+   updated when an insert call errors.
+
+### How to read the result after deploy
+
+```promql
+# footer phases, mean per call (update_bank_vote_states + update_bank_store vs update_bank)
+sum by (phase) (rate(agave_block_footer_phase_duration_us_sum[20m])) / sum by (phase) (rate(agave_block_footer_phase_duration_us_count[20m]))
+# vote accounts written per footer
+rate(agave_block_footer_vote_accounts_updated_total[20m]) / sum(rate(agave_block_footer_phase_duration_us_count{phase="update_bank_store"}[20m]))
+# blockstore phases, mean per call (insert_shreds should drop; index_meta = RocksDB index reads)
+sum by (phase) (rate(agave_blockstore_store_duration_us_sum[20m])) / sum by (phase) (rate(agave_blockstore_store_duration_us_count[20m]))
+# insert_shreds cost per received shred, and shreds per insert call
+sum(rate(agave_blockstore_store_duration_us_sum{phase="insert_shreds"}[20m])) / sum(rate(agave_blockstore_insert_shreds_total{kind="received"}[20m]))
+sum(rate(agave_blockstore_insert_shreds_total{kind="received"}[20m])) / sum(rate(agave_blockstore_store_duration_us_count{phase="total"}[20m]))
+```
+
+The pre-deploy `insert_shreds` mean was 89us per call (1h, 2026-11-03). The per-shred cost has
+no pre-deploy value (the counter is new), so compare per-call means, and keep the per-shred
+number as the baseline for later changes.

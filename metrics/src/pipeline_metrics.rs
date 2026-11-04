@@ -116,7 +116,12 @@ pub static TX_STATUS_QUEUE_LENGTH: LazyLock<prometheus::Gauge> = LazyLock::new(|
 
 /// Busy-duration of the blockstore shred-store operation, labeled by
 /// `phase`: `total`, `insert_shreds`, `write_batch`, `recovery`,
-/// `insert_lock`, `commit_working_sets`.
+/// `insert_lock`, `commit_working_sets`, `index_meta`. `index_meta` is the
+/// index-meta lookup time (`BlockstoreInsertionMetrics::index_meta_time_us`,
+/// `get_index_meta_entry`), from both the insert and the erasure-recovery
+/// paths; it overlaps `insert_shreds`/`recovery` rather than adding to them.
+/// It is mostly RocksDB reads, but working-set hits are timed too, and each
+/// lookup is truncated to whole microseconds, so it reads somewhat low.
 pub static BLOCKSTORE_STORE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_blockstore_store_duration_us",
@@ -124,6 +129,30 @@ pub static BLOCKSTORE_STORE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(
         &["phase"],
     )
 });
+
+/// Shreds handled by `window_service`'s blockstore insert calls, labeled by
+/// `kind`:
+/// - `received`: shreds passed to `attempt_shred_insertion`
+///   (`BlockstoreInsertionMetrics::num_shreds`), i.e. after `run_insert`'s
+///   deserialization dropped any that failed to parse.
+/// - `inserted`: shreds actually inserted (`num_inserted`: accepted data and
+///   coding shreds, in both the Original and Alternate columns; not
+///   erasure-recovered ones).
+///
+/// Not updated when the insert call returns an error (same as the
+/// `agave_blockstore_store_duration_us` phases), so both slightly undercount.
+///
+/// With `agave_blockstore_store_duration_us{phase="insert_shreds"}`, gives the
+/// per-shred insert cost (`insert_shreds` sum / `received`) and shreds per
+/// insert call (`received` / store count).
+pub static BLOCKSTORE_INSERT_SHREDS_TOTAL: LazyLock<prometheus::IntCounterVec> =
+    LazyLock::new(|| {
+        crate::prometheus_metrics::register_int_counter_vec(
+            "agave_blockstore_insert_shreds_total",
+            "Shreds received by / inserted into the blockstore in window_service insert calls",
+            &["kind"],
+        )
+    });
 
 /// Busy-duration of each replay-path operation, labeled by `stage`:
 /// `read_blockstore`, `collect_entries`, `execute`, `commit`.
@@ -350,8 +379,9 @@ pub static COLLECT_ENTRIES_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock:
 
 /// Breakdown of `BlockComponentProcessor::on_footer` (the replayed block
 /// footer: the bulk of `COLLECT_ENTRIES_PHASE_DURATION_US{phase="on_marker"}`,
-/// ~13ms per slot on 2026-11-03), labeled by `phase`. Replay path only; the
-/// leader's own footer (`block_creation_loop`) is not observed here.
+/// ~13ms per slot on 2026-11-03), labeled by `phase`. Replay path only, except
+/// `update_bank_vote_states`/`update_bank_store` (see below); the leader's own
+/// footer (`block_creation_loop`) is otherwise not observed here.
 ///
 /// - `clock_bounds`: `enforce_nanosecond_clock_bounds`.
 /// - `reward_cert_verify`: `ValidatedRewardCert::try_new` (skip/notar reward
@@ -367,12 +397,42 @@ pub static COLLECT_ENTRIES_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock:
 ///   whether pool queueing costs more.
 /// - `update_bank`: `update_bank_with_footer_fields` (clock update, vote
 ///   reward calculation and vote state updates, expected bank hash).
+/// - `update_bank_vote_states` and `update_bank_store`: the two parts of
+///   `calc_vote_rewards_update_vote_states` inside `update_bank`, observed
+///   only when the footer carries a reward or finalization cert and the step
+///   succeeds. `update_bank_vote_states` covers reward/final-cert state setup
+///   (`RewardState::try_new` reads the epoch-inflation account;
+///   `bank.vote_accounts()` clones an `Arc`) and the per-validator loop
+///   (bincode-deserialize each vote account, update votes/root/credits,
+///   serialize into a new account). `update_bank_store` is
+///   `bank.store_accounts` for those accounts (per-account stakes-cache
+///   update, previous-version loads for the accounts lattice hash, write
+///   cache). Per footer, `update_bank` minus these two is the clock update,
+///   setting the expected bank hash, and the cert-slot lookups and map
+///   allocation in `allocate_updated_accounts`. Their means are not directly
+///   subtractable from `update_bank`'s mean: `update_bank` is sampled on every
+///   replayed footer, these two only on footers with a cert (plus leader
+///   footers), so compare sample counts first. Unlike the other phases, these two are also
+///   observed for the leader's own footer (`block_creation_loop` calls
+///   `update_bank_with_footer_fields` directly), which has no `update_bank` or
+///   `total` sample; that never happens on an unstaked node.
 /// - `total`: the whole `on_footer` call, including early error returns.
 pub static BLOCK_FOOTER_PHASE_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_block_footer_phase_duration_us",
         "Breakdown of replayed block footer processing, in microseconds",
         &["phase"],
+    )
+});
+
+/// Vote accounts written by footer processing
+/// (`calc_vote_rewards_update_vote_states`), incremented by the number of
+/// accounts passed to `bank.store_accounts`. Divide its rate by the
+/// `update_bank_store` sample rate for accounts per footer.
+pub static BLOCK_FOOTER_VOTE_ACCOUNTS_UPDATED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter(
+        "agave_block_footer_vote_accounts_updated_total",
+        "Vote accounts updated by block footer processing",
     )
 });
 
