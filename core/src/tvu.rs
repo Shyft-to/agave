@@ -161,6 +161,10 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
+    /// Coalesce window for shred UDP receive, in microseconds (0 disables coalescing).
+    pub shred_fetch_coalesce_us: u64,
+    /// Maximum packet batches drained per shred sigverify iteration.
+    pub shred_sigverify_batch_size: usize,
 }
 
 impl Default for TvuConfig {
@@ -177,6 +181,8 @@ impl Default for TvuConfig {
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
+            shred_fetch_coalesce_us: 5_000,
+            shred_sigverify_batch_size: 1024,
         }
     }
 }
@@ -393,9 +399,13 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_mode,
             exit.clone(),
+            std::time::Duration::from_micros(tvu_config.shred_fetch_coalesce_us),
         );
 
         let (verified_sender, verified_receiver) = unbounded();
+        // window_service -> ReplayStage: decoded entries, sent before the
+        // blockstore write; the send also wakes replay.
+        let (live_replay_sender, live_replay_receiver) = unbounded();
 
         let (retransmit_sender, retransmit_receiver) =
             EvictingSender::new_bounded(CHANNEL_SIZE_RETRANSMIT_INGRESS);
@@ -417,6 +427,7 @@ impl Tvu {
                 }
             }),
             tvu_config.shred_sigverify_threads,
+            tvu_config.shred_sigverify_batch_size,
         );
 
         let retransmit_stage = RetransmitStage::new(
@@ -482,6 +493,7 @@ impl Tvu {
                 verified_receiver,
                 retransmit_sender,
                 completed_data_sets_sender,
+                live_replay_sender,
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
                 block_id_repair_channels,
@@ -585,6 +597,7 @@ impl Tvu {
 
         let replay_receivers = ReplayReceivers {
             ledger_signal_receiver,
+            live_replay_receiver,
             update_parent_receiver,
             optimistic_parent_receiver,
             duplicate_slots_receiver,

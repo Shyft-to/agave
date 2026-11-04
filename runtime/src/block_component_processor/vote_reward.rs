@@ -5,6 +5,9 @@ use {
     log::info,
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_clock::{Epoch, Slot},
+    solana_metrics::pipeline_metrics::{
+        BLOCK_FOOTER_PHASE_DURATION_US, BLOCK_FOOTER_VOTE_ACCOUNTS_UPDATED_TOTAL,
+    },
     solana_pubkey::Pubkey,
     solana_svm::rent_calculator::RENT_EXEMPT_RENT_EPOCH,
     solana_vote::vote_account::VoteAccount,
@@ -15,6 +18,7 @@ use {
     std::{
         collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
         num::NonZero,
+        time::Instant,
     },
     thiserror::Error,
 };
@@ -437,6 +441,10 @@ pub(super) fn calc_vote_rewards_update_vote_states(
     else {
         return Ok(());
     };
+    // Timed as `update_bank_vote_states`: reward/final-cert state setup, the
+    // per-validator deserialize/update/serialize loop. Observed only when it
+    // succeeds.
+    let vote_states_start = Instant::now();
     let reward_state = match &reward_cert {
         Some(c) => Some(RewardState::try_new(
             bank,
@@ -475,8 +483,16 @@ pub(super) fn calc_vote_rewards_update_vote_states(
             r_state.reward_validators.union(f_state.signers).cloned(),
         )?,
     };
+    BLOCK_FOOTER_PHASE_DURATION_US
+        .with_label_values(&["update_bank_vote_states"])
+        .observe(vote_states_start.elapsed().as_micros() as f64);
+    BLOCK_FOOTER_VOTE_ACCOUNTS_UPDATED_TOTAL.inc_by(updated_accounts.len() as u64);
 
+    let store_start = Instant::now();
     bank.store_accounts((bank.slot(), updated_accounts.as_slice()), None);
+    BLOCK_FOOTER_PHASE_DURATION_US
+        .with_label_values(&["update_bank_store"])
+        .observe(store_start.elapsed().as_micros() as f64);
     Ok(())
 }
 
@@ -785,6 +801,16 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
+        // The metrics are process-global and other tests also update them, so
+        // only check that they went up.
+        let phase_count = |phase: &str| {
+            BLOCK_FOOTER_PHASE_DURATION_US
+                .with_label_values(&[phase])
+                .get_sample_count()
+        };
+        let vote_states_before = phase_count("update_bank_vote_states");
+        let store_before = phase_count("update_bank_store");
+        let updated_before = BLOCK_FOOTER_VOTE_ACCOUNTS_UPDATED_TOTAL.get();
         calc_vote_rewards_update_vote_states(
             &bank,
             Some(ValidatedRewardCert::new_for_tests(
@@ -795,6 +821,12 @@ mod tests {
             block_producer_time_nanos,
         )
         .unwrap();
+        assert!(phase_count("update_bank_vote_states") > vote_states_before);
+        assert!(phase_count("update_bank_store") > store_before);
+        assert!(
+            BLOCK_FOOTER_VOTE_ACCOUNTS_UPDATED_TOTAL.get()
+                >= updated_before + num_validators_to_reward as u64
+        );
         let slot_timestamp = BlockTimestamp {
             slot: reward_slot,
             timestamp: calc_slot_timestamp(&bank, reward_slot, block_producer_time_nanos)

@@ -118,9 +118,16 @@ impl ValidatedBlockFinalizationCert {
                 shred_version,
             };
 
-            // Verify both certificates
-            let notar_signature = Self::verify_certificate(bank, unverified_notar_cert)?;
-            let finalize_signature = Self::verify_certificate(bank, unverified_finalize_cert)?;
+            // Verify both certificates. They are independent, pure BLS
+            // verifications, so run them concurrently; the results are checked
+            // in the original order (notarize first), so the returned error is
+            // the same as verifying them one after the other.
+            let (notar_signature, finalize_signature) = rayon::join(
+                || Self::verify_certificate(bank, unverified_notar_cert),
+                || Self::verify_certificate(bank, unverified_finalize_cert),
+            );
+            let notar_signature = notar_signature?;
+            let finalize_signature = finalize_signature?;
 
             let finalize_signers =
                 Self::extract_signers(bank, finalize_cert_type, &finalize_signature.bitmap)?;
@@ -789,5 +796,52 @@ mod tests {
                 "Slow finalize with insufficient finalize stake should fail verification"
             );
         }
+    }
+
+    #[test]
+    fn test_slow_finalization_error_precedence_both_insufficient() {
+        // Both certificates fail verification; the notarize error must be the
+        // one returned, as when the two were verified sequentially.
+        let num_validators = 10;
+        let stakes: Vec<u64> = (0..num_validators)
+            .map(|i| (1000u64).saturating_sub((i as u64).saturating_mul(100)))
+            .collect();
+        let (bank, validator_keypairs) = create_bank_with_bls_validators(num_validators, stakes);
+        let shred_version = rand::rng().random();
+        let block = Block {
+            slot: bank.slot(),
+            block_id: Hash::new_unique(),
+        };
+
+        // Top 3 validators = 1000+900+800 = 2700 (< 60% of 5500) for both certs.
+        let signing_ranks: Vec<usize> = (0..3).collect();
+        let notarize_cert_sig = build_cert_signature(
+            Vote::new_notarization_vote(block),
+            shred_version,
+            &signing_ranks,
+            &validator_keypairs,
+        );
+        let finalize_cert_sig = build_cert_signature(
+            Vote::new_finalization_vote(block.slot),
+            shred_version,
+            &signing_ranks,
+            &validator_keypairs,
+        );
+        let block_final_cert = BlockFinalizationCert {
+            slot: block.slot,
+            block_id: block.block_id,
+            final_aggregate: VotesAggregate::from_cert_signature(finalize_cert_sig),
+            notar_aggregate: Some(VotesAggregate::from_cert_signature(notarize_cert_sig)),
+        };
+
+        let err =
+            ValidatedBlockFinalizationCert::try_from_footer(block_final_cert, &bank, shred_version)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            BlockFinalizationCertError::CertificateVerificationFailed(CertificateType::Notarize(
+                block
+            ))
+        );
     }
 }

@@ -101,13 +101,35 @@ impl ShredFetchStage {
 
             // Filter out shreds that are way too far in the future to avoid the
             // overhead of having to hold onto them.
+            let filter_start = std::time::Instant::now();
             for mut packet in packet_batch.iter_mut().filter(|p| !p.meta().discard()) {
                 if shred_filter_ctx.should_discard_packet(packet.as_ref()) {
                     packet.meta_mut().set_discard(true);
                 } else {
                     packet.meta_mut().flags.insert(flags);
+                    if let Some(shred_bytes) = shred::wire::get_shred(packet.as_ref())
+                        && let Some(slot) = shred::wire::get_slot(shred_bytes)
+                    {
+                        solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY
+                            .mark_slot_started(slot);
+                        if let Some(fec_set_index) = shred::wire::get_fec_set_index(shred_bytes) {
+                            solana_metrics::pipeline_latency::DESHRED_LATENCY
+                                .mark_started(slot, fec_set_index);
+                            solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                                .mark_data_set_started(slot, fec_set_index);
+                        }
+                        if shred::wire::get_flags(shred_bytes)
+                            .is_ok_and(|f| f.contains(shred::ShredFlags::LAST_SHRED_IN_SLOT))
+                        {
+                            solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY
+                                .mark_last_shred(slot);
+                        }
+                    }
                 }
             }
+            solana_metrics::pipeline_metrics::SHRED_STAGE_DURATION_US
+                .with_label_values(&["filter"])
+                .observe(filter_start.elapsed().as_micros() as f64);
             if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
                 && let Some(stats) = recvr_stats.as_ref()
             {
@@ -117,6 +139,8 @@ impl ShredFetchStage {
                 match send_err {
                     crossbeam_channel::TrySendError::Full(v) => {
                         shred_filter_ctx.stats.overflow_shreds += v.len();
+                        solana_metrics::pipeline_metrics::SHRED_PACKETS_DROPPED_TOTAL
+                            .inc_by(v.len() as u64);
                     }
                     _ => unreachable!("EvictingSender holds on to both ends of the channel"),
                 }
@@ -139,6 +163,7 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_mode: TurbineMode,
+        coalesce: Duration,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let (packet_sender, packet_receiver) =
@@ -155,9 +180,9 @@ impl ShredFetchStage {
                     packet_sender.clone(),
                     recycler.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
-                    true,                           // use_pinned_memory
-                    false,                          // is_staked_service
+                    Some(coalesce),
+                    true,  // use_pinned_memory
+                    false, // is_staked_service
                 )
             })
             .collect();
@@ -191,6 +216,7 @@ impl ShredFetchStage {
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_mode: TurbineMode,
         exit: Arc<AtomicBool>,
+        coalesce: Duration,
     ) -> Self {
         let recycler = PacketBatchRecycler::new();
         let repair_context = RepairContext {
@@ -213,6 +239,7 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_mode.clone(),
+            coalesce,
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -229,6 +256,7 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_mode.clone(),
+            coalesce,
         );
 
         tvu_threads.extend(repair_receiver);

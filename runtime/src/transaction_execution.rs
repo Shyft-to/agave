@@ -40,6 +40,12 @@ pub struct TransactionStatusBatch {
     pub token_balances: TransactionTokenBalancesSet,
     pub costs: Vec<Option<u64>>,
     pub transaction_indexes: Vec<usize>,
+    /// When this batch was handed to the (unbounded) transaction-status channel.
+    /// Used to measure how long it sits queued before `TransactionStatusService`
+    /// dequeues and notifies it -- a delay this instrumentation would otherwise
+    /// miss entirely, since `execute`/`commit` are already fast and separately
+    /// measured.
+    pub enqueued_at: std::time::Instant,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -261,6 +267,7 @@ impl TransactionStatusSender {
                 token_balances,
                 costs,
                 transaction_indexes,
+                enqueued_at: std::time::Instant::now(),
             },
             work_sequence,
         ))) {

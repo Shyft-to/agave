@@ -23,13 +23,17 @@ agave-unstable-api = []
 
 [dependencies]
 crossbeam-channel = { workspace = true }
+dashmap = { workspace = true }
 gethostname = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1", "tcp", "runtime"] }
 log = { workspace = true }
+prometheus = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
 solana-cluster-type = { workspace = true }
 solana-sha256-hasher = { workspace = true }
 solana-time-utils = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 bencher = { workspace = true }

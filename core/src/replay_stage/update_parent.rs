@@ -78,6 +78,17 @@ pub(super) fn child_bank_replay_start(
         return ChildBankReplayStart::Defer;
     }
 
+    // A replayed parent can be frozen before its block id reached the blockstore (see
+    // `ReplayStage::get_block_id_after_write`); fill it in now rather than deferring forever.
+    if parent_slot != 0 && parent_bank.block_id().is_none() && parent_bank.should_replay_from_blockstore() {
+        if let Some(block_id) = blockstore
+            .get_block_id(parent_slot, migration_status)
+            .expect("Blockstore should not fail")
+        {
+            parent_bank.set_block_id(Some(block_id));
+        }
+    }
+
     // Genesis doesn't have a block id.
     if parent_slot != 0 && Some(slot_meta.parent_block_id) != parent_bank.block_id() {
         // There were duplicate blocks in this slot and we have the wrong one
@@ -192,7 +203,7 @@ fn try_restart_slot_from_update_parent(
         send_invalid_bank(&bank, replay_vote_sender);
         bank.bank_id()
     });
-    ReplayStage::clear_slots([slot], bank_forks, progress, async_verification_freelist);
+    ReplayStage::clear_slots([slot], bank_forks, progress, async_verification_freelist, None);
     if let Some(cleared_bank_id) = cleared_bank_id {
         let update_parent = UpdateParentInfo::from_slot_meta(slot, &slot_meta)
             .expect("UpdateParent metadata must include a parent slot");
@@ -411,6 +422,7 @@ pub(super) fn handle_abandoned_bank(
         bank_forks,
         progress,
         async_verification_freelist,
+        Some(&process_active_banks_context.live_replay_entries),
     );
     notify_entry_update_parent(
         process_active_banks_context
