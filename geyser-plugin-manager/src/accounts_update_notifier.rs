@@ -172,6 +172,7 @@ impl AccountsUpdateNotifierImpl {
         if plugin_manager.plugins.is_empty() {
             return;
         }
+        let notify_start = std::time::Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             if !plugin.account_data_notifications_enabled() {
                 continue;
@@ -200,6 +201,9 @@ impl AccountsUpdateNotifierImpl {
                 }
             }
         }
+        solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+            .with_label_values(&["account_update"])
+            .observe(notify_start.elapsed().as_micros() as f64);
     }
 }
 

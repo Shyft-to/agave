@@ -69,6 +69,7 @@ use {
         },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
+        live_replay_entries::{LiveReplayEntries, LiveReplayReceiver},
     },
     solana_measure::measure::Measure,
     solana_poh::{
@@ -266,6 +267,9 @@ struct ProcessActiveBanksContext {
     replay_mode: ForkReplayMode,
     replay_verification_worker_pool: ReplayVerificationWorkerPool,
     migration_status: Arc<MigrationStatus>,
+    /// Decoded entries fed directly by `window_service`; the sole source
+    /// `confirm_slot` reads for live replay. See `ledger::live_replay_entries`.
+    live_replay_entries: LiveReplayEntries,
 }
 
 struct ProcessBankForksContext {
@@ -471,6 +475,7 @@ pub struct ReplaySenders {
 
 pub struct ReplayReceivers {
     pub ledger_signal_receiver: Receiver<bool>,
+    pub live_replay_receiver: LiveReplayReceiver,
     pub update_parent_receiver: UpdateParentReceiver,
     pub optimistic_parent_receiver: Receiver<LeaderWindowInfo>,
     pub duplicate_slots_receiver: Receiver<u64>,
@@ -793,6 +798,7 @@ impl ReplayStage {
 
         let ReplayReceivers {
             ledger_signal_receiver,
+            live_replay_receiver,
             update_parent_receiver,
             optimistic_parent_receiver,
             duplicate_slots_receiver,
@@ -929,6 +935,7 @@ impl ReplayStage {
                 replay_mode,
                 replay_verification_worker_pool,
                 migration_status: migration_status.clone(),
+                live_replay_entries: LiveReplayEntries::default(),
             };
             let process_bank_forks_context = ProcessBankForksContext {
                 bank_forks: bank_forks.clone(),
@@ -1007,6 +1014,15 @@ impl ReplayStage {
                 let tpu_has_bank = poh_shared_leader_state.load().working_bank().is_some()
                     || poh_controller.has_pending_message();
 
+                // Entries for data sets window_service has completed; this
+                // is what replay reads, independent of the blockstore write.
+                process_active_banks_context
+                    .live_replay_entries
+                    .absorb(&live_replay_receiver);
+                process_active_banks_context
+                    .live_replay_entries
+                    .prune_through(bank_forks.read().unwrap().root());
+
                 let mut replay_active_banks_time = Measure::start("replay_active_banks_time");
                 let (mut ancestors, mut descendants) = {
                     let r_bank_forks = bank_forks.read().unwrap();
@@ -1053,6 +1069,7 @@ impl ReplayStage {
                         &mut progress,
                         &replay_highest_frozen,
                         &mut new_frozen_slots,
+                        &process_active_banks_context.live_replay_entries,
                     );
                 }
 
@@ -1117,6 +1134,7 @@ impl ReplayStage {
                             &bank_forks,
                             &mut progress,
                             &mut async_verification_freelist,
+                            &process_active_banks_context.live_replay_entries,
                         )
                         .expect("Blockstore operations must succeed");
                     }
@@ -1517,6 +1535,7 @@ impl ReplayStage {
                         &dumped_slots_sender,
                         &my_pubkey,
                         &leader_schedule_cache,
+                        &process_active_banks_context.live_replay_entries,
                     );
                     dump_then_repair_correct_slots_time.stop();
 
@@ -1595,6 +1614,12 @@ impl ReplayStage {
                         recv(ledger_signal_receiver) -> result => match result {
                             Err(_) => break,
                             Ok(_) => trace!("blockstore signal"),
+                        },
+                        recv(live_replay_receiver) -> result => match result {
+                            Err(_) => break,
+                            Ok(message) => process_active_banks_context
+                                .live_replay_entries
+                                .push(message),
                         },
                         recv(bank_forks_command_receiver) -> result => match result {
                             Err(_) => break,
@@ -1697,6 +1722,7 @@ impl ReplayStage {
         progress: &mut ProgressMap,
         replay_highest_frozen: &ReplayHighestFrozen,
         new_frozen_slots: &mut Vec<Slot>,
+        live_replay_entries: &LiveReplayEntries,
     ) {
         let root_bank = bank_forks.read().unwrap().root_bank();
 
@@ -1755,6 +1781,7 @@ impl ReplayStage {
                 root_bank.as_ref(),
                 bank_forks,
                 blockstore,
+                live_replay_entries,
             );
         }
 
@@ -2073,6 +2100,7 @@ impl ReplayStage {
         dumped_slots_sender: &DumpedSlotsSender,
         my_pubkey: &Pubkey,
         leader_schedule_cache: &LeaderScheduleCache,
+        live_replay_entries: &LiveReplayEntries,
     ) {
         if duplicate_slots_to_repair.is_empty() {
             return;
@@ -2181,6 +2209,7 @@ impl ReplayStage {
                         &root_bank,
                         bank_forks,
                         blockstore,
+                        live_replay_entries,
                     );
 
                     dumped.push((*duplicate_slot, *correct_hash));
@@ -2279,6 +2308,7 @@ impl ReplayStage {
         root_bank: &Bank,
         bank_forks: &RwLock<BankForks>,
         blockstore: &Blockstore,
+        live_replay_entries: &LiveReplayEntries,
     ) {
         warn!("purging slot {slot_to_purge}");
 
@@ -2288,6 +2318,7 @@ impl ReplayStage {
         if slot_descendants.is_none() {
             // Root has already moved past this slot, no need to purge it
             if root_bank.slot() <= slot_to_purge {
+                live_replay_entries.remove_slot(slot_to_purge);
                 blockstore.clear_unconfirmed_slot(slot_to_purge);
             }
 
@@ -2335,6 +2366,9 @@ impl ReplayStage {
         drop(removed_banks);
 
         for (slot, slot_id) in slots_to_purge {
+            // Whatever is queued for this slot belongs to the version being
+            // discarded; repaired shreds will re-send fresh entries.
+            live_replay_entries.remove_slot(slot);
             // Clear the slot signatures from status cache for this slot.
             // TODO: What about RPC queries that had already cloned the Bank for this slot
             // and are looking up the signature for this slot?
@@ -2372,6 +2406,10 @@ impl ReplayStage {
                 // Clear the "dead" flag allowing ReplayStage to start replaying
                 // this slot once the parent is repaired
                 blockstore.remove_dead_slot(slot).unwrap();
+                // Its shreds stay in the blockstore and won't be re-sent over
+                // the live channel (already consumed), so re-replay it from
+                // the persisted data.
+                live_replay_entries.mark_replay_from_blockstore(slot);
             }
 
             // Clear the progress map of these forks
@@ -2445,6 +2483,7 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        live_replay_entries: &LiveReplayEntries,
     ) -> Result<(), BlockstoreError> {
         let root = bank_forks.read().unwrap().root();
 
@@ -2549,6 +2588,7 @@ impl ReplayStage {
             bank_forks,
             progress,
             async_verification_freelist,
+            Some(live_replay_entries),
         );
 
         // Banks are clear, move shreds in blockstore
@@ -2577,11 +2617,22 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        live_replay_entries: Option<&LiveReplayEntries>,
     ) {
         let (slots_to_purge, banks_to_clear) =
             bank_forks.read().unwrap().slots_to_clear(slots_to_clear);
         if slots_to_purge.is_empty() {
             return;
+        }
+
+        // Anything queued belongs to the discarded version, and what was already consumed
+        // won't be re-sent over the live channel (switched-in shreds are copied without the
+        // pre-write hook), so these slots must re-replay from the blockstore.
+        if let Some(live_replay_entries) = live_replay_entries {
+            for slot in &slots_to_purge {
+                live_replay_entries.remove_slot(*slot);
+                live_replay_entries.mark_replay_from_blockstore(*slot);
+            }
         }
 
         // Wait for async verify to complete
@@ -3069,6 +3120,12 @@ impl ReplayStage {
             Some(finalization_cert_sender),
             false,
             process_active_banks_context.migration_status.as_ref(),
+            // A slot restarted by a purge replays from the blockstore (see
+            // `LiveReplayEntries::mark_replay_from_blockstore`).
+            (!process_active_banks_context
+                .live_replay_entries
+                .replays_from_blockstore(bank.slot()))
+            .then_some(&process_active_banks_context.live_replay_entries),
         )?;
         let tx_count_after = w_replay_progress.num_txs;
         let tx_count = tx_count_after - tx_count_before;
@@ -4052,10 +4109,18 @@ impl ReplayStage {
                 // For leader blocks, we might not have finished shredding (as it happens asynchronously)
                 // so this can return None. If that is the case, broadcast will set the block id once shredding
                 // finishes.
-                let block_id = process_active_banks_context
-                    .blockstore
-                    .get_block_id(bank.slot(), &process_active_banks_context.migration_status)
-                    .expect("Blockstore operations must succeed");
+                let block_id = if bank.should_replay_from_blockstore() {
+                    Self::get_block_id_after_write(
+                        &process_active_banks_context.blockstore,
+                        bank.slot(),
+                        &process_active_banks_context.migration_status,
+                    )
+                } else {
+                    process_active_banks_context
+                        .blockstore
+                        .get_block_id(bank.slot(), &process_active_banks_context.migration_status)
+                        .expect("Blockstore operations must succeed")
+                };
                 debug_assert!(block_id.is_some() || !bank.should_replay_from_blockstore());
                 if block_id.is_some() {
                     bank.set_block_id(block_id);
@@ -4075,6 +4140,7 @@ impl ReplayStage {
                     bank.freeze();
                     Ok(())
                 };
+                solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_replay_frozen(bank_slot);
 
                 datapoint_info!(
                     "bank_frozen",
@@ -5303,11 +5369,43 @@ impl ReplayStage {
                     &context.bank_forks,
                     progress,
                     async_verification_freelist,
+                    None,
                 );
                 response_sender.send(()).unwrap_or_else(|_| {
                     warn!("bank forks controller clear-bank response receiver dropped")
                 });
             }
+        }
+    }
+
+    /// Live replay can finish a slot before the insert call that completed its last data set
+    /// has written to RocksDB (`window_service` sends the entries before the write), but the
+    /// block id is read from RocksDB. Freezing with `None` makes every child `Defer` forever in
+    /// `child_bank_replay_start` (its `parent_block_id` never matches), halting replay. The write
+    /// follows the send by well under a millisecond, so wait briefly for it.
+    fn get_block_id_after_write(
+        blockstore: &Blockstore,
+        slot: Slot,
+        migration_status: &MigrationStatus,
+    ) -> Option<Hash> {
+        const POLL_INTERVAL: Duration = Duration::from_micros(200);
+        const MAX_WAIT: Duration = Duration::from_millis(50);
+        let start = Instant::now();
+        loop {
+            let block_id = blockstore
+                .get_block_id(slot, migration_status)
+                .expect("Blockstore operations must succeed");
+            if block_id.is_some() {
+                return block_id;
+            }
+            if start.elapsed() >= MAX_WAIT {
+                warn!(
+                    "block id for slot {slot} not in the blockstore {MAX_WAIT:?} after replay \
+                     completed; children will fill it in before chaining"
+                );
+                return None;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 

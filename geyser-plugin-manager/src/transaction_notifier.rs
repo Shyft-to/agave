@@ -163,6 +163,7 @@ impl TransactionNotifier for TransactionNotifierImpl {
             transaction_status_meta: &transaction_status_meta,
         };
 
+        let notify_start = std::time::Instant::now();
         for plugin in plugin_manager.plugins.iter() {
             if !plugin.transaction_notifications_enabled() {
                 continue;
@@ -187,6 +188,12 @@ impl TransactionNotifier for TransactionNotifierImpl {
                 }
             }
         }
+        solana_metrics::pipeline_metrics::GEYSER_NOTIFY_DURATION_US
+            .with_label_values(&["transaction"])
+            .observe(notify_start.elapsed().as_micros() as f64);
+        solana_metrics::pipeline_latency::EXECUTED_TX_LATENCY.mark_tx_notified(slot);
+        solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+            .mark_tx_notified((*signature).into());
     }
 }
 

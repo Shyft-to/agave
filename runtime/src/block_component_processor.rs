@@ -30,10 +30,13 @@ use {
         entry::EntryView,
     },
     solana_hash::Hash,
+    solana_metrics::pipeline_metrics::{
+        BLOCK_FOOTER_PHASE_DURATION_US, COLLECT_ENTRIES_PHASE_DURATION_US,
+    },
     solana_pubkey::Pubkey,
     solana_svm_timings::ExecuteTimings,
     solana_transaction_error::TransactionError,
-    std::{collections::HashSet, sync::Arc},
+    std::{collections::HashSet, sync::Arc, time::Instant},
     thiserror::Error,
 };
 
@@ -600,11 +603,43 @@ impl BlockComponentProcessor {
         finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
         execute_timings: &mut ExecuteTimings,
     ) -> Result<(), BlockComponentProcessorError> {
+        let total_start = Instant::now();
+        let result = self.process_footer(
+            my_pubkey,
+            bank,
+            parent_bank,
+            shred_version,
+            footer,
+            finalization_cert_sender,
+            execute_timings,
+        );
+        BLOCK_FOOTER_PHASE_DURATION_US
+            .with_label_values(&["total"])
+            .observe(total_start.elapsed().as_micros() as f64);
+        result
+    }
+
+    fn process_footer(
+        &mut self,
+        my_pubkey: &Pubkey,
+        bank: &BankWithScheduler,
+        parent_bank: Arc<Bank>,
+        shred_version: u16,
+        footer: VersionedBlockFooter,
+        finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
+        execute_timings: &mut ExecuteTimings,
+    ) -> Result<(), BlockComponentProcessorError> {
         self.stage.on_footer()?;
 
         let VersionedBlockFooter::V1(footer) = footer;
 
-        Self::enforce_nanosecond_clock_bounds(bank, &parent_bank, &footer)?;
+        let clock_bounds_start = Instant::now();
+        let clock_bounds_result =
+            Self::enforce_nanosecond_clock_bounds(bank, &parent_bank, &footer);
+        BLOCK_FOOTER_PHASE_DURATION_US
+            .with_label_values(&["clock_bounds"])
+            .observe(clock_bounds_start.elapsed().as_micros() as f64);
+        clock_bounds_result?;
 
         let BlockFooterV1 {
             bank_hash,
@@ -615,20 +650,60 @@ impl BlockComponentProcessor {
             notar_reward_cert,
         } = footer;
 
-        let reward_cert = ValidatedRewardCert::try_new(
-            bank,
-            shred_version,
-            &skip_reward_cert,
-            &notar_reward_cert,
-        )?;
+        // The reward and finalization certificate checks are independent, pure
+        // BLS verifications (they only read `bank`), so when the footer carries
+        // a finalization cert they run concurrently. Their results are then
+        // consumed in the original sequential order (reward cert, producer
+        // time, finalization cert), so the returned error for any footer is
+        // the same as verifying them one after the other. The only difference:
+        // when the reward cert is invalid, the finalization cert has also been
+        // verified, and that result is discarded.
+        let bank_ref: &Bank = bank;
+        let has_reward_certs = skip_reward_cert.is_some() || notar_reward_cert.is_some();
+        let verify_reward_cert = || {
+            let start = Instant::now();
+            let result = ValidatedRewardCert::try_new(
+                bank_ref,
+                shred_version,
+                &skip_reward_cert,
+                &notar_reward_cert,
+            );
+            if has_reward_certs {
+                BLOCK_FOOTER_PHASE_DURATION_US
+                    .with_label_values(&["reward_cert_verify"])
+                    .observe(start.elapsed().as_micros() as f64);
+            }
+            result
+        };
+        let verify_start = Instant::now();
+        let (reward_cert, final_cert) = match block_final_cert {
+            None => (verify_reward_cert(), None),
+            Some(final_cert) => {
+                let verify_final_cert = || {
+                    let start = Instant::now();
+                    let result = ValidatedBlockFinalizationCert::try_from_footer(
+                        final_cert,
+                        bank_ref,
+                        shred_version,
+                    );
+                    BLOCK_FOOTER_PHASE_DURATION_US
+                        .with_label_values(&["final_cert_verify"])
+                        .observe(start.elapsed().as_micros() as f64);
+                    Some(result)
+                };
+                rayon::join(verify_reward_cert, verify_final_cert)
+            }
+        };
+        BLOCK_FOOTER_PHASE_DURATION_US
+            .with_label_values(&["verify_certs_wall"])
+            .observe(verify_start.elapsed().as_micros() as f64);
+
+        let reward_cert = reward_cert?;
         let block_producer_time_nanos =
             Self::block_producer_time_nanos_as_i64(block_producer_time_nanos)?;
-        let final_cert = block_final_cert
-            .map(|final_cert| {
-                ValidatedBlockFinalizationCert::try_from_footer(final_cert, bank, shred_version)
-                    .map_err(BlockComponentProcessorError::InvalidFinalizationCertificate)
-            })
-            .transpose()?;
+        let final_cert = final_cert
+            .transpose()
+            .map_err(BlockComponentProcessorError::InvalidFinalizationCertificate)?;
 
         let (footer_input, pool_input) = match final_cert {
             None => (None, None),
@@ -643,12 +718,18 @@ impl BlockComponentProcessor {
         };
 
         // We need to wait for any in progress execution before modifying account state
-        if let Some((result, execute_time)) = bank.wait_for_completed_scheduler() {
+        let wait_for_completed_scheduler_start = Instant::now();
+        let completed = bank.wait_for_completed_scheduler();
+        COLLECT_ENTRIES_PHASE_DURATION_US
+            .with_label_values(&["wait_for_completed_scheduler"])
+            .observe(wait_for_completed_scheduler_start.elapsed().as_micros() as f64);
+        if let Some((result, execute_time)) = completed {
             execute_timings.accumulate(&execute_time);
             result?;
         }
 
-        Self::update_bank_with_footer_fields(
+        let update_bank_start = Instant::now();
+        let update_bank_result = Self::update_bank_with_footer_fields(
             bank,
             block_producer_time_nanos,
             Some(bank_hash),
@@ -656,7 +737,11 @@ impl BlockComponentProcessor {
             footer_input
                 .as_ref()
                 .map(|(validators, slot)| (validators, *slot)),
-        )?;
+        );
+        BLOCK_FOOTER_PHASE_DURATION_US
+            .with_label_values(&["update_bank"])
+            .observe(update_bank_start.elapsed().as_micros() as f64);
+        update_bank_result?;
 
         // Send finalization cert(s) to consensus pool
         if let Some((finalize_cert, notarize_cert)) = pool_input
@@ -1008,6 +1093,152 @@ mod tests {
 
         // Verify clock sysvar was updated with correct timestamp (nanos converted to seconds)
         assert_eq!(bank.clock().unix_timestamp, expected_time_secs);
+    }
+
+    #[test]
+    fn test_on_footer_observes_phase_timings() {
+        // The histogram is process-global and other tests also process
+        // footers in parallel, so only check that the counts went up.
+        let count = |phase: &str| {
+            BLOCK_FOOTER_PHASE_DURATION_US
+                .with_label_values(&[phase])
+                .get_sample_count()
+        };
+        // No reward or finalization certs in this footer, so
+        // `reward_cert_verify` / `final_cert_verify` are not observed.
+        let phases = ["total", "clock_bounds", "verify_certs_wall", "update_bank"];
+        let before: Vec<u64> = phases.iter().map(|phase| count(phase)).collect();
+
+        let mut processor = processor_after_header();
+        let (parent, bank_forks) = create_test_bank();
+        let bank = create_child_bank(&bank_forks, &parent, 1);
+        let parent_time_nanos = parent.clock().unix_timestamp.saturating_mul(1_000_000_000);
+        let footer = VersionedBlockFooter::V1(BlockFooterV1 {
+            bank_hash: Hash::new_unique(),
+            block_producer_time_nanos: (parent_time_nanos + 300_000_000) as u64,
+            block_user_agent: vec![],
+            block_final_cert: None,
+            skip_reward_cert: None,
+            notar_reward_cert: None,
+        });
+        let bank_with_scheduler = BankWithScheduler::new_without_scheduler(bank);
+        processor
+            .on_footer(
+                &Pubkey::new_unique(),
+                &bank_with_scheduler,
+                parent,
+                rand::rng().random(),
+                footer,
+                None,
+                &mut ExecuteTimings::default(),
+            )
+            .unwrap();
+
+        for (phase, before) in phases.iter().zip(before) {
+            assert!(count(phase) > before, "phase {phase} was not observed");
+        }
+    }
+
+    #[test]
+    fn test_on_footer_reward_cert_error_precedes_final_cert_error() {
+        // Both certificates are invalid. They are verified concurrently, but the
+        // reward cert error must be returned, as when they were verified in
+        // sequence.
+        let my_pubkey = Pubkey::new_unique();
+        // Certificate verification needs BLS-staked validators in the bank.
+        let validator_keypairs: Vec<_> = (0..4)
+            .map(|_| crate::genesis_utils::ValidatorVoteKeypairs::new_rand())
+            .collect();
+        let genesis_config_info =
+            crate::genesis_utils::create_genesis_config_with_alpenglow_vote_accounts(
+                10_000_000,
+                &validator_keypairs,
+                vec![1_000; validator_keypairs.len()],
+            );
+        let (parent, bank_forks) =
+            Bank::new_with_bank_forks_for_tests(&genesis_config_info.genesis_config);
+        let bank = create_child_bank(&bank_forks, &parent, 1);
+        let bank_with_scheduler = BankWithScheduler::new_without_scheduler(bank);
+        let parent_time_nanos = parent.clock().unix_timestamp.saturating_mul(1_000_000_000);
+
+        // Reward slot 100 is not `bank.slot() - NUM_SLOTS_FOR_REWARD`.
+        let skip_reward_cert =
+            agave_votor_messages::reward_certificate::SkipRewardCertificate::try_new(
+                100,
+                solana_bls_signatures::SignatureCompressed(
+                    [0; solana_bls_signatures::BLS_SIGNATURE_COMPRESSED_SIZE],
+                ),
+                vec![],
+            )
+            .unwrap();
+        // A well-formed signature over an unrelated payload, with an empty
+        // bitmap: decodes, but cannot verify.
+        let failing_final_cert = || {
+            let signature: BLSSignature = crate::genesis_utils::ValidatorVoteKeypairs::new_rand()
+                .bls_keypair
+                .sign(b"not a finalization vote")
+                .into();
+            solana_entry::block_component::BlockFinalizationCert {
+                slot: parent.slot(),
+                block_id: Hash::new_unique(),
+                final_aggregate:
+                    solana_entry::block_component::VotesAggregate::from_cert_signature(
+                        CertSignature {
+                            signature,
+                            bitmap: vec![],
+                        },
+                    ),
+                notar_aggregate: None,
+            }
+        };
+        let footer = |skip_reward_cert| {
+            VersionedBlockFooter::V1(BlockFooterV1 {
+                bank_hash: Hash::new_unique(),
+                block_producer_time_nanos: (parent_time_nanos + 300_000_000) as u64,
+                block_user_agent: vec![],
+                block_final_cert: Some(failing_final_cert()),
+                skip_reward_cert,
+                notar_reward_cert: None,
+            })
+        };
+
+        // The finalization cert alone does fail, so the precedence check below
+        // is meaningful.
+        let result = processor_after_header().on_footer(
+            &my_pubkey,
+            &bank_with_scheduler,
+            parent.clone(),
+            rand::rng().random(),
+            footer(None),
+            None,
+            &mut ExecuteTimings::default(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(BlockComponentProcessorError::InvalidFinalizationCertificate(_))
+            ),
+            "{result:?}"
+        );
+
+        let result = processor_after_header().on_footer(
+            &my_pubkey,
+            &bank_with_scheduler,
+            parent.clone(),
+            rand::rng().random(),
+            footer(Some(skip_reward_cert)),
+            None,
+            &mut ExecuteTimings::default(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(BlockComponentProcessorError::InvalidRewardCerts(
+                    ValidatedRewardCertError::InvalidSlotNumbers { .. }
+                ))
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
