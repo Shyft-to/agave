@@ -332,6 +332,62 @@ pub static TX_PIPELINE_SEGMENT_DURATION_US: LazyLock<HistogramVec> = LazyLock::n
     )
 });
 
+/// Splits the `fetch_to_data_set_ready` span per DATA SET (one observation
+/// per data set handed to replay, not per transaction), labeled by `phase`
+/// and `origin`. For a data set the two phases sum to its
+/// `fetch_to_data_set_ready` span (up to microsecond truncation).
+///
+/// Phases:
+/// - `first_fetch_to_completing_recv`: the first packet fetched for the data
+///   set's first FEC set (data OR coding, recorded in the fetch stage after
+///   the repair-nonce check and the shred filter but before sigverify, so
+///   possibly a packet later dropped by sigverify or the blockstore) ->
+///   `window_service` dequeued the shred batch whose insert completed the
+///   data set. Mostly the rest of the data set's shreds (or enough coding
+///   shreds) arriving, plus that last batch's sigverify transit; the dequeue
+///   instant is taken when the first message of the batch arrives, so shreds
+///   drained with it in the same call are slightly later.
+/// - `completing_recv_to_ready`: that dequeue -> the decoded data set was
+///   sent to ReplayStage: draining the rest of the verified-shreds queue,
+///   deserialization, the blockstore insert (insert-lock wait, insertion,
+///   erasure recovery) up to the pre-write hook, and the decode and send of
+///   this and any data set the same call completed before it.
+///
+/// If the same data set completes twice within the trackers' 64-slot window
+/// (e.g. a duplicate slot dumped and repaired), it is counted and observed
+/// again against its first start, so that sample does not match
+/// `fetch_to_data_set_ready` (which keeps its first ready instant).
+///
+/// Origin of the data set's data shreds (the "worst" one wins):
+/// - `turbine`: every data shred was received through turbine;
+/// - `repair`: at least one was received through repair, none recovered;
+/// - `recovered`: at least one was rebuilt by erasure recovery.
+///
+/// A received data shred that blockstore rejected and erasure recovery then
+/// rebuilt in the same insert call is labeled as received; this is rare.
+pub static DATA_SET_COMPLETION_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_data_set_completion_duration_us",
+        "Per data set split of fetch_to_data_set_ready by phase and shred origin, in \
+         microseconds",
+        &["phase", "origin"],
+    )
+});
+
+/// Data sets decoded and handed to ReplayStage on the live-replay path,
+/// labeled by `origin` (see `DATA_SET_COMPLETION_DURATION_US`). Counted even
+/// when no fetch-stage start was recorded for the data set, so its rate can
+/// be above the histogram's. Data sets that could not be assembled from
+/// memory (the `ReplayFromBlockstore` fallback, which logs a warning) are not
+/// counted.
+pub static DATA_SET_COMPLETIONS_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_data_set_completions_total",
+        "Live-replay data sets handed to replay, by origin of their data shreds",
+        &["origin"],
+    )
+});
+
 /// Fine-grained breakdown of the `collect_entries` stage above (observed
 /// p90 ~1ms), labeled by `phase`. Unlike `EXECUTE_PHASE_DURATION_US`, these
 /// are NOT derived from a pre-existing cumulative counters struct --

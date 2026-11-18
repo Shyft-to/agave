@@ -381,6 +381,49 @@ impl TxPipelineLatencyTracker {
             .or_insert_with(Instant::now);
     }
 
+    /// Splits the data set's `fetch_to_data_set_ready` span at
+    /// `completing_batch_received` (when `window_service` dequeued the shred
+    /// batch whose insert completed it) and records how its data shreds
+    /// arrived (`origin`: `turbine`, `repair` or `recovered`); see
+    /// `DATA_SET_COMPLETION_DURATION_US`. Call right after
+    /// `mark_data_set_ready` for the same data set: the end of the span is
+    /// taken here, a few nanoseconds after that mark. The completion is
+    /// counted even when no start was recorded for the data set.
+    pub fn mark_data_set_completed(
+        &self,
+        slot: u64,
+        start_index: u32,
+        completing_batch_received: Instant,
+        origin: &str,
+    ) {
+        let ready = Instant::now();
+        crate::pipeline_metrics::DATA_SET_COMPLETIONS_TOTAL
+            .with_label_values(&[origin])
+            .inc();
+        let Some(start) = self
+            .data_set_started
+            .get(&(slot, start_index))
+            .map(|start| *start)
+        else {
+            return;
+        };
+        let durations = &crate::pipeline_metrics::DATA_SET_COMPLETION_DURATION_US;
+        durations
+            .with_label_values(&["first_fetch_to_completing_recv", origin])
+            .observe(
+                completing_batch_received
+                    .saturating_duration_since(start)
+                    .as_micros() as f64,
+            );
+        durations
+            .with_label_values(&["completing_recv_to_ready", origin])
+            .observe(
+                ready
+                    .saturating_duration_since(completing_batch_received)
+                    .as_micros() as f64,
+            );
+    }
+
     /// Called once per transaction when replay processes the data set
     /// containing it (before scheduling execution), recording that
     /// transaction's true pipeline start time -- its own data set's first
@@ -469,7 +512,12 @@ pub static TX_PIPELINE_LATENCY: LazyLock<TxPipelineLatencyTracker> =
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {super::*, std::sync::Mutex};
+
+    /// Serializes the tests that observe the global
+    /// `first_shred_to_parent_frozen` / `parent_frozen_to_created_bank`
+    /// histograms, since one of them counts the samples it added.
+    static PARENT_FROZEN_SPLIT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_deshred_tracker_observes_only_after_start() {
@@ -509,6 +557,7 @@ mod test {
     #[test]
     fn test_bank_created_split_sums_to_total() {
         use std::{thread::sleep, time::Duration};
+        let _lock = PARENT_FROZEN_SPLIT_LOCK.lock().unwrap();
         let read = |name: &str| {
             let h = crate::pipeline_metrics::SLOT_CONFIRMATION_DURATION_US.with_label_values(&[name]);
             (h.get_sample_count(), h.get_sample_sum())
@@ -542,6 +591,7 @@ mod test {
 
     #[test]
     fn test_bank_created_parent_frozen_first_has_zero_wait() {
+        let _lock = PARENT_FROZEN_SPLIT_LOCK.lock().unwrap();
         let tracker = ExecutedTxLatencyTracker::new();
         tracker.mark_replay_frozen(30);
         tracker.mark_slot_started(31);
@@ -549,7 +599,7 @@ mod test {
             .with_label_values(&["first_shred_to_parent_frozen"]);
         let sum_before = wait.get_sample_sum();
         tracker.mark_bank_created(31, Some(30));
-        // Other tests observe this label concurrently, so only check this one added ~0.
+        // Only check that this call added ~0 (the sum also holds earlier samples).
         assert!(wait.get_sample_sum() - sum_before < 1_000.0);
     }
 
@@ -689,6 +739,64 @@ mod test {
         // The segments telescope: together they cover the whole span (minus
         // per-segment microsecond truncation).
         assert!(total >= 10_000.0 && total <= elapsed_us, "{total} vs {elapsed_us}");
+    }
+
+    #[test]
+    fn test_data_set_completion_phases_sum_to_span() {
+        use std::{thread::sleep, time::Duration};
+        let durations = &crate::pipeline_metrics::DATA_SET_COMPLETION_DURATION_US;
+        let completions = &crate::pipeline_metrics::DATA_SET_COMPLETIONS_TOTAL;
+        let read = |phase: &str| {
+            let h = durations.with_label_values(&[phase, "recovered"]);
+            (h.get_sample_count(), h.get_sample_sum())
+        };
+        let phases = ["first_fetch_to_completing_recv", "completing_recv_to_ready"];
+        let before = phases.map(read);
+        let completions_before = completions.with_label_values(&["recovered"]).get();
+
+        let tracker = TxPipelineLatencyTracker::new();
+        let begin = Instant::now();
+        tracker.mark_data_set_started(12, 64);
+        sleep(Duration::from_millis(3));
+        let completing_batch_received = Instant::now();
+        sleep(Duration::from_millis(2));
+        tracker.mark_data_set_ready(12, 64);
+        tracker.mark_data_set_completed(12, 64, completing_batch_received, "recovered");
+        let elapsed_us = begin.elapsed().as_micros() as f64;
+
+        let after = phases.map(read);
+        let deltas: Vec<f64> = before
+            .iter()
+            .zip(&after)
+            .map(|((count_before, sum_before), (count_after, sum_after))| {
+                assert_eq!(count_after - count_before, 1);
+                sum_after - sum_before
+            })
+            .collect();
+        assert!(deltas[0] >= 3_000.0, "3ms until the batch: {}", deltas[0]);
+        assert!(deltas[1] >= 2_000.0, "2ms until ready: {}", deltas[1]);
+        assert!(deltas[0] + deltas[1] <= elapsed_us);
+        assert_eq!(
+            completions.with_label_values(&["recovered"]).get() - completions_before,
+            1
+        );
+
+        // No recorded start: only the completion is counted.
+        let turbine_before = completions.with_label_values(&["turbine"]).get();
+        let turbine_count_before = durations
+            .with_label_values(&["completing_recv_to_ready", "turbine"])
+            .get_sample_count();
+        tracker.mark_data_set_completed(999_990, 0, Instant::now(), "turbine");
+        assert_eq!(
+            completions.with_label_values(&["turbine"]).get() - turbine_before,
+            1
+        );
+        assert_eq!(
+            durations
+                .with_label_values(&["completing_recv_to_ready", "turbine"])
+                .get_sample_count(),
+            turbine_count_before
+        );
     }
 
     #[test]

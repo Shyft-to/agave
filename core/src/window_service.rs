@@ -175,6 +175,27 @@ fn run_check_duplicate(
         .try_for_each(check_duplicate)
 }
 
+/// How an accepted data shred reached this node, for
+/// `agave_data_set_completion_duration_us`/`agave_data_set_completions_total`.
+/// Ordered so that a data set's label is the maximum over its data shreds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ShredOrigin {
+    Turbine,
+    Repair,
+    /// Rebuilt by erasure recovery from this node's other shreds.
+    Recovered,
+}
+
+impl ShredOrigin {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Turbine => "turbine",
+            Self::Repair => "repair",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
 /// A small, bounded, in-memory cache of recently-accepted data shred payloads,
 /// keyed by `(slot, index)`. A data set's shreds usually arrive across several
 /// `run_insert` calls, so this lets the call that completes a data set decode
@@ -189,7 +210,7 @@ struct ShredPayloadCache {
     /// per-slot shred counts.
     slots: VecDeque<Slot>,
     max_slots: usize,
-    payloads: HashMap<Slot, HashMap<u32, shred::Payload>>,
+    payloads: HashMap<Slot, HashMap<u32, (shred::Payload, ShredOrigin)>>,
 }
 
 impl ShredPayloadCache {
@@ -201,7 +222,7 @@ impl ShredPayloadCache {
         }
     }
 
-    fn insert(&mut self, slot: Slot, index: u32, payload: shred::Payload) {
+    fn insert(&mut self, slot: Slot, index: u32, payload: shred::Payload, origin: ShredOrigin) {
         if !self.payloads.contains_key(&slot) {
             self.slots.push_back(slot);
             self.payloads.insert(slot, HashMap::new());
@@ -211,18 +232,32 @@ impl ShredPayloadCache {
                 }
             }
         }
-        self.payloads.get_mut(&slot).unwrap().insert(index, payload);
+        self.payloads
+            .get_mut(&slot)
+            .unwrap()
+            .insert(index, (payload, origin));
     }
 
     /// Returns the raw wire bytes for `indices.start..indices.end`, in index
-    /// order, only if every one of them is present in the cache for `slot`.
+    /// order, only if every one of them is present in the cache for `slot`,
+    /// together with the data set's origin (the maximum over its shreds).
     /// `Payload`'s inner `Bytes` makes this a refcount bump per shred.
-    fn get_contiguous(&self, slot: Slot, indices: &Range<u32>) -> Option<Vec<shred::Payload>> {
+    fn get_contiguous(
+        &self,
+        slot: Slot,
+        indices: &Range<u32>,
+    ) -> Option<(Vec<shred::Payload>, ShredOrigin)> {
         let slot_payloads = self.payloads.get(&slot)?;
-        indices
+        let mut origin = ShredOrigin::Turbine;
+        let payloads = indices
             .clone()
-            .map(|index| slot_payloads.get(&index).cloned())
-            .collect()
+            .map(|index| {
+                let (payload, shred_origin) = slot_payloads.get(&index)?;
+                origin = origin.max(*shred_origin);
+                Some(payload.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((payloads, origin))
     }
 }
 
@@ -247,6 +282,9 @@ where
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
+    // When this batch reached window_service; a data set this call completes
+    // has its `fetch_to_data_set_ready` span split here.
+    let batch_received = Instant::now();
     solana_metrics::pipeline_metrics::VERIFIED_SHREDS_QUEUE_LENGTH
         .set(verified_receiver.len() as f64);
     shreds.extend(verified_receiver.try_iter().flatten());
@@ -277,6 +315,21 @@ where
         .with_label_values(&["deserialize"])
         .observe(now.elapsed().as_micros() as f64);
 
+    // This call's received Original data shreds, and whether each came
+    // through repair. A data shred the blockstore accepts below that is not in
+    // here was rebuilt by erasure recovery. If a batch holds the same shred
+    // twice, the first copy wins, as in the blockstore, which inserts the
+    // first copy it processes and rejects the second as already present.
+    let mut received_data_shreds: HashMap<(Slot, u32), /*is_repaired:*/ bool> =
+        HashMap::with_capacity(shreds.len());
+    for (shred, repair, block_location) in &shreds {
+        if *block_location == BlockLocation::Original && shred.is_data() {
+            received_data_shreds
+                .entry((shred.slot(), shred.index()))
+                .or_insert(*repair);
+        }
+    }
+
     let store_start = Instant::now();
     let before_insert_shreds_us = metrics.insert_shreds_elapsed_us;
     let before_write_batch_us = metrics.write_batch_elapsed_us;
@@ -304,7 +357,12 @@ where
     let mut before_write = |completed: &[CompletedDataSetInfo],
                             accepted: &[(Slot, u32, shred::Payload)]| {
         for (slot, index, payload) in accepted {
-            shred_payload_cache.insert(*slot, *index, payload.clone());
+            let origin = match received_data_shreds.get(&(*slot, *index)) {
+                Some(false) => ShredOrigin::Turbine,
+                Some(true) => ShredOrigin::Repair,
+                None => ShredOrigin::Recovered,
+            };
+            shred_payload_cache.insert(*slot, *index, payload.clone(), origin);
         }
         for info in completed {
             if info.location != BlockLocation::Original {
@@ -312,17 +370,26 @@ where
             }
             let decoded = shred_payload_cache
                 .get_contiguous(info.slot, &info.indices)
-                .and_then(Blockstore::decode_completed_data_set_from_payloads);
+                .and_then(|(payloads, origin)| {
+                    Blockstore::decode_completed_data_set_from_payloads(payloads)
+                        .map(|component| (component, origin))
+                });
             match decoded {
-                Some(component) => {
+                Some((component, origin)) => {
                     let _ = live_replay_sender.send(LiveReplayMessage::Entries {
                         slot: info.slot,
                         indices: info.indices.clone(),
                         component,
                         slot_full: info.slot_full,
                     });
-                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
-                        .mark_data_set_ready(info.slot, info.indices.start);
+                    let tracker = &solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY;
+                    tracker.mark_data_set_ready(info.slot, info.indices.start);
+                    tracker.mark_data_set_completed(
+                        info.slot,
+                        info.indices.start,
+                        batch_received,
+                        origin.as_label(),
+                    );
                 }
                 None => {
                     warn!(
@@ -695,6 +762,112 @@ mod test {
             .expect("Expect successful processing of shred");
 
         assert_eq!(blockstore.get_slot_entries(0, 0).unwrap(), original_entries);
+    }
+
+    #[test]
+    fn test_shred_payload_cache_data_set_origin() {
+        let mut cache = ShredPayloadCache::new(2);
+        let payload = |byte: u8| shred::Payload::from(vec![byte]);
+        cache.insert(5, 0, payload(0), ShredOrigin::Turbine);
+        cache.insert(5, 1, payload(1), ShredOrigin::Repair);
+        cache.insert(5, 2, payload(2), ShredOrigin::Turbine);
+
+        let (payloads, origin) = cache.get_contiguous(5, &(0..3)).unwrap();
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(origin, ShredOrigin::Repair);
+        assert_eq!(
+            cache.get_contiguous(5, &(0..1)).unwrap().1,
+            ShredOrigin::Turbine
+        );
+
+        cache.insert(5, 3, payload(3), ShredOrigin::Recovered);
+        assert_eq!(
+            cache.get_contiguous(5, &(1..4)).unwrap().1,
+            ShredOrigin::Recovered
+        );
+        // A missing index means the data set can't be assembled.
+        assert!(cache.get_contiguous(5, &(3..5)).is_none());
+    }
+
+    #[test]
+    fn test_run_insert_tags_shred_origins() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let keypair = Keypair::new();
+        let (slot, parent) = (1, 0);
+        let shredder = Shredder::new(slot, parent, 0, 0).unwrap();
+        let entries = create_ticks(10, 0, Hash::default());
+        let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
+            &keypair,
+            &entries,
+            true, // is_last_in_slot
+            Hash::new_from_array(rand::rng().random()),
+            0, // next_shred_index
+            0, // next_code_index
+            &ReedSolomonCache::default(),
+            &mut ProcessShredsStats::default(),
+        );
+        assert!(data_shreds.len() >= 3);
+        assert!(coding_shreds.len() >= data_shreds.len());
+
+        // Data shred 0 never arrives, so erasure recovery rebuilds it; data
+        // shred 1 arrives through repair; everything else through turbine.
+        let missing = data_shreds[0].index();
+        let repaired = data_shreds[1].index();
+        let batch: Vec<_> = data_shreds[1..]
+            .iter()
+            .map(|shred| (shred.payload().clone(), shred.index() == repaired))
+            .chain(
+                coding_shreds
+                    .iter()
+                    .map(|shred| (shred.payload().clone(), false)),
+            )
+            .map(|(payload, repair)| (payload, repair, BlockLocation::Original))
+            .collect();
+        let (verified_sender, verified_receiver) = unbounded();
+        verified_sender.send(batch).unwrap();
+
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let (retransmit_sender, _retransmit_receiver) = EvictingSender::new_bounded(1024);
+        let mut shred_recovery_context = ShredRecoveryContext::new(
+            ReedSolomonCache::default(),
+            retransmit_sender,
+            bank_forks.read().unwrap().root_bank(),
+            0, // shred_version
+        );
+        let mut pinnable_slice = blockstore.new_pinnable_slice();
+        let mut write_batch = blockstore.get_write_batch();
+        let (live_replay_sender, live_replay_receiver) = unbounded();
+        let mut shred_payload_cache = ShredPayloadCache::new(4);
+        run_insert(
+            &thread_pool,
+            &verified_receiver,
+            &blockstore,
+            &mut shred_recovery_context,
+            &mut pinnable_slice,
+            &mut write_batch,
+            |_| {},
+            &mut BlockstoreInsertionMetrics::default(),
+            &mut WindowServiceMetrics::default(),
+            None,
+            &live_replay_sender,
+            &mut shred_payload_cache,
+        )
+        .unwrap();
+
+        let origins = &shred_payload_cache.payloads[&slot];
+        assert_eq!(origins[&missing].1, ShredOrigin::Recovered);
+        assert_eq!(origins[&repaired].1, ShredOrigin::Repair);
+        for shred in &data_shreds[2..] {
+            assert_eq!(origins[&shred.index()].1, ShredOrigin::Turbine);
+        }
+        // The slot's data set completed in this call and went to replay.
+        assert!(live_replay_receiver.try_iter().count() > 0);
     }
 
     #[test]
