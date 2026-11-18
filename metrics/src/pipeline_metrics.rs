@@ -508,3 +508,58 @@ pub static LIVE_REPLAY_ENTRIES_TOTAL: LazyLock<prometheus::IntCounterVec> = Lazy
         &["outcome"],
     )
 });
+
+/// Partial data-set replay (`AGAVE_PARTIAL_DATA_SET_REPLAY=1`): entries of a
+/// data set replayed before all its shreds arrived. Labeled by `event`:
+/// - window_service: `chunk_sent` / `entries_sent` (partial chunks and the
+///   entries in them sent to replay), `decoder_stopped` (a data set's decoder
+///   will send nothing more: it reached the data set's last entry or a tick
+///   (normal), or hit a block marker, a shred that doesn't chain, invalid
+///   data, or too much unparsed data; the rest of the data set replays with
+///   the completed data set), and
+///   `slot_disabled_after_purge` (a slot was cleared and re-received, so
+///   partial replay is off for it).
+/// - live replay queue: `chunk_stale` (a chunk that does not continue the
+///   queued one, or belongs to an older version of the slot; ignored).
+/// - replay: `entries_replayed` / `txs_replayed` (entries and transactions
+///   executed early), `entries_skipped` (entries of a completed data set not
+///   executed again because they ran early), `completion_mismatch` (the
+///   completed data set did not start with exactly the entries that ran
+///   early; the slot is marked dead -- must stay 0), and `tick_deferred` (a
+///   chunk held a tick; the rest of that data set replays whole).
+pub static PARTIAL_DATA_SET_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_partial_data_set_total",
+        "Partial data-set replay events",
+        &["event"],
+    )
+});
+
+/// Per data set that had entries sent early: time from its first partial
+/// chunk being sent to the completed data set being sent to replay, i.e. how
+/// much earlier replay could start on it.
+pub static PARTIAL_DATA_SET_LEAD_US: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram(
+        "agave_partial_data_set_lead_us",
+        "Time from a data set's first partial chunk to its completion, in microseconds",
+    )
+});
+
+/// 1 when `AGAVE_PARTIAL_DATA_SET_REPLAY=1` was set at startup, else 0.
+pub static PARTIAL_DATA_SET_REPLAY_ENABLED: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_gauge(
+        "agave_partial_data_set_replay_enabled",
+        "Whether partial data-set replay is enabled on this node",
+    )
+});
+
+/// Times replay had to wait for verification results before it could queue
+/// more PoH/signature verification jobs (the result channel was full). Partial
+/// data-set replay makes more, smaller verification batches per slot; watch
+/// this for added replay-thread stalls.
+pub static REPLAY_VERIFICATION_QUEUE_FULL_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter(
+        "agave_replay_verification_queue_full_total",
+        "Replay waits for verification results because the result channel was full",
+    )
+});

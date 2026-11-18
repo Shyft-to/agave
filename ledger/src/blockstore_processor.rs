@@ -7,7 +7,7 @@ use {
         blockstore_meta::SlotMeta,
         entry_notifier_service::{EntryNotification, EntryNotifierSender, send_entry_notification},
         leader_schedule_cache::LeaderScheduleCache,
-        live_replay_entries::LiveReplayEntries,
+        live_replay_entries::{LiveReplayEntries, ReadyEntries},
         shred::MAX_FEC_SETS_PER_SLOT,
         thread_pool::{WorkerJob, WorkerPool},
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
@@ -938,7 +938,64 @@ pub struct ConfirmationProgress {
     pub num_shreds: u64,
     pub num_entries: usize,
     pub num_txs: usize,
+    /// Partial data-set replay: how many leading entries of the data set
+    /// starting at shred `num_shreds` were already replayed before that data
+    /// set completed, and the digest of exactly those entries
+    /// (`fold_entry_digest`). `confirm_slot` checks the completed data set
+    /// against both and replays only its remaining entries.
+    pub partial_data_set_entries: usize,
+    pub partial_data_set_digest: Hash,
     async_verification: Option<AsyncVerificationProgress>,
+}
+
+/// Folds `entry` into `digest`: its `num_hashes`, `hash`, transaction count
+/// and every transaction's length and raw bytes. Two entry sequences folded
+/// from the same starting digest only give the same result if they are byte
+/// for byte identical.
+fn fold_entry_digest(digest: Hash, entry: &EntryView<Bytes>) -> Hash {
+    let mut hasher = solana_sha256_hasher::Hasher::default();
+    hasher.hash(digest.as_ref());
+    hasher.hash(&entry.num_hashes.to_le_bytes());
+    hasher.hash(entry.hash.as_ref());
+    hasher.hash(&(entry.transactions.len() as u64).to_le_bytes());
+    for transaction in &entry.transactions {
+        let data = transaction.data();
+        hasher.hash(&(data.len() as u64).to_le_bytes());
+        hasher.hash(data);
+    }
+    hasher.result()
+}
+
+/// Checks that a completed data set starts with exactly the
+/// `replayed_early` entries replayed before it completed (folded into
+/// `digest`), and has entries left to replay. A mismatch means the replayed
+/// entries are not this block's: fail the slot rather than continue on
+/// divergent state.
+fn check_entries_replayed_early(
+    slot: Slot,
+    entries: &[EntryView<Bytes>],
+    replayed_early: usize,
+    digest: Hash,
+) -> result::Result<(), BlockstoreProcessorError> {
+    let matches = entries.len() > replayed_early
+        && entries[..replayed_early]
+            .iter()
+            .fold(Hash::default(), fold_entry_digest)
+            == digest;
+    if !matches {
+        solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_TOTAL
+            .with_label_values(&["completion_mismatch"])
+            .inc();
+        warn!(
+            "slot {slot}: completed data set does not start with the {replayed_early} entries \
+             replayed before it completed ({} entries)",
+            entries.len()
+        );
+        return Err(BlockstoreProcessorError::InvalidBlock(
+            BlockError::InvalidEntryHash,
+        ));
+    }
+    Ok(())
 }
 
 impl ConfirmationProgress {
@@ -1298,6 +1355,7 @@ impl AsyncVerificationProgress {
             // The workers can be shared across banks. We never want them to stall because they've
             // done their job but can't post the result.
             if self.pending_jobs == result_capacity {
+                solana_metrics::pipeline_metrics::REPLAY_VERIFICATION_QUEUE_FULL_TOTAL.inc();
                 let result = self.receiver.recv().map_err(|_| {
                     BlockstoreProcessorError::InvalidBlock(BlockError::InvalidEntryHash)
                 })?;
@@ -1414,7 +1472,12 @@ pub fn confirm_slot(
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
 
-    let (slot_components, completed_ranges, slot_full) = {
+    let ReadyEntries {
+        components: slot_components,
+        ranges: completed_ranges,
+        slot_full,
+        partial_entries,
+    } = {
         let mut load_elapsed = Measure::start("load_elapsed");
         let load_result = if let Some(live_entries) = live_entries {
             if blockstore.is_dead(slot) && !allow_dead_slots {
@@ -1422,7 +1485,24 @@ pub fn confirm_slot(
                     BlockstoreError::DeadSlot,
                 ))
             } else {
-                Ok(live_entries.drain_ready(slot, progress.num_shreds))
+                // Leading entries of the next data set are only taken if they
+                // were decoded from the slot's current version (window_service
+                // tags them with the same `first_shred_timestamp`, which
+                // changes when the slot is cleared and received again).
+                Ok(live_entries.drain_ready(
+                    slot,
+                    progress.num_shreds,
+                    progress.partial_data_set_entries,
+                    || {
+                        // 0: the slot holds no shreds (e.g. just cleared).
+                        blockstore
+                            .meta(slot)
+                            .ok()
+                            .flatten()
+                            .map(|meta| meta.first_shred_timestamp)
+                            .filter(|timestamp| *timestamp != 0)
+                    },
+                ))
             }
         } else {
             blockstore
@@ -1431,6 +1511,12 @@ pub fn confirm_slot(
                     progress.num_shreds,
                     allow_dead_slots,
                 )
+                .map(|(components, ranges, slot_full)| ReadyEntries {
+                    components,
+                    ranges,
+                    slot_full,
+                    partial_entries: Vec::new(),
+                })
                 .map_err(BlockstoreProcessorError::FailedToLoadEntries)
         };
         load_elapsed.stop();
@@ -1485,9 +1571,35 @@ pub fn confirm_slot(
     {
         let num_shreds = completed_range.end - completed_range.start;
         let is_final = slot_full && ix == completed_ranges.len() - 1;
+        // Leading entries of this data set replayed before it completed. Only
+        // the first drained data set can have any: it starts at
+        // `progress.num_shreds`.
+        let (replayed_early, replayed_early_digest) = if ix == 0 {
+            (
+                mem::take(&mut progress.partial_data_set_entries),
+                mem::take(&mut progress.partial_data_set_digest),
+            )
+        } else {
+            (0, Hash::default())
+        };
 
         match component {
-            ParsedBlockComponent::EntryBatch(entries) => {
+            ParsedBlockComponent::EntryBatch(mut entries) => {
+                if replayed_early > 0 {
+                    check_entries_replayed_early(
+                        slot,
+                        &entries,
+                        replayed_early,
+                        replayed_early_digest,
+                    )?;
+                    // Already executed and verified, byte for byte: replay
+                    // only the rest. The rest's PoH is verified from
+                    // `progress.last_entry`, the last of these entries' hash.
+                    entries.drain(..replayed_early);
+                    solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_TOTAL
+                        .with_label_values(&["entries_skipped"])
+                        .inc_by(replayed_early as u64);
+                }
                 let slot_full = slot_full && ix == last_entry_batch_index.unwrap();
 
                 // Records each transaction's TRUE pipeline start time (its own
@@ -1518,7 +1630,15 @@ pub fn confirm_slot(
                 // since it won't have the required block markers.
                 let on_entry_batch_start = std::time::Instant::now();
                 let on_entry_batch_result = if slot != 0 {
-                    processor.on_entry_batch(migration_status, slot, &entries, is_final)
+                    // With entries replayed early, the whole data set has at
+                    // least two entries, so it is not the final alpentick, and
+                    // neither is its remainder.
+                    processor.on_entry_batch(
+                        migration_status,
+                        slot,
+                        &entries,
+                        is_final && replayed_early == 0,
+                    )
                 } else {
                     Ok(())
                 };
@@ -1545,6 +1665,11 @@ pub fn confirm_slot(
                 )?;
             }
             ParsedBlockComponent::BlockMarker(marker) => {
+                if replayed_early > 0 {
+                    // Entries were replayed early from a data set that turned
+                    // out to be a block marker.
+                    check_entries_replayed_early(slot, &[], replayed_early, replayed_early_digest)?;
+                }
                 let block_footer = match &marker {
                     VersionedBlockMarker::V1(marker) => marker.as_block_footer().cloned(),
                 };
@@ -1603,6 +1728,69 @@ pub fn confirm_slot(
         if is_final && slot != 0 {
             processor.on_final(migration_status, slot, bank.parent_slot())?;
         }
+    }
+
+    // Leading entries of the data set starting at `progress.num_shreds`, which
+    // hasn't completed yet (partial data-set replay; never after the slot's
+    // last data set). Replayed like any other batch of entries, minus
+    // `num_shreds` and `slot_full`, which come with the completed data set.
+    let mut partial_entries = partial_entries;
+    if let Some(first_tick) = partial_entries.iter().position(|entry| entry.is_tick()) {
+        // window_service never sends ticks early. Should one get here, it and
+        // the rest of this data set replay with the completed data set, so a
+        // tick is never processed without the data set's `slot_full`.
+        partial_entries.truncate(first_tick);
+        solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_TOTAL
+            .with_label_values(&["tick_deferred"])
+            .inc();
+    }
+    if slot != 0 && !slot_full && !partial_entries.is_empty() {
+        let data_set_start = progress.num_shreds as u32;
+        let mut digest = progress.partial_data_set_digest;
+        let mut num_txs = 0;
+        for entry in &partial_entries {
+            digest = fold_entry_digest(digest, entry);
+            num_txs += entry.transactions.len();
+            for tx in &entry.transactions {
+                if let Some(signature) = tx.signatures().first() {
+                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY.mark_tx_data_set(
+                        (*signature).into(),
+                        slot,
+                        data_set_start,
+                    );
+                }
+            }
+        }
+        // Tick-free and not final, so this is the transition the whole data
+        // set would make (see `BlockComponentProcessor::on_entry_batch`).
+        processor
+            .on_entry_batch(migration_status, slot, &partial_entries, false)
+            .inspect_err(|err| {
+                warn!(
+                    "BlockComponentProcessor::on_entry_batch() for slot {slot} failed with {err}"
+                );
+            })?;
+        let num_entries = partial_entries.len();
+        confirm_slot_entries(
+            bank,
+            replay_verification_worker_pool,
+            (partial_entries, 0, false),
+            timing,
+            progress,
+            skip_verification,
+            entry_notification_sender,
+            replay_vote_sender,
+            migration_status,
+        )?;
+        progress.partial_data_set_entries += num_entries;
+        progress.partial_data_set_digest = digest;
+        let partial_metrics = &solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_TOTAL;
+        partial_metrics
+            .with_label_values(&["entries_replayed"])
+            .inc_by(num_entries as u64);
+        partial_metrics
+            .with_label_values(&["txs_replayed"])
+            .inc_by(num_txs as u64);
     }
     solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
         .with_label_values(&["collect_entries"])
@@ -6560,5 +6748,452 @@ pub mod tests {
             validate_entry_transactions(&txs, 10),
             Err(TransactionError::AccountLoadedTwice)
         );
+    }
+
+    /// Slot 1 for the partial data-set replay tests, inserted into
+    /// `blockstore` as three data sets: transfers (four funded payers reused
+    /// in every entry, so execution order matters), transfers with a tick in
+    /// the middle, and a transfer entry followed by the slot's remaining
+    /// ticks. Returns each data set's entries and data shred payloads.
+    fn build_partial_replay_slot(
+        blockstore: &Blockstore,
+    ) -> (
+        GenesisConfig,
+        Vec<Vec<Entry>>,
+        Vec<Vec<crate::shred::Payload>>,
+    ) {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(100 * LAMPORTS_PER_SOL);
+        genesis_config.poh_config.hashes_per_tick = None;
+        let payers: Vec<Keypair> = (0..4).map(|_| Keypair::new()).collect();
+        for payer in &payers {
+            genesis_config.add_account(
+                payer.pubkey(),
+                AccountSharedData::new(
+                    10 * LAMPORTS_PER_SOL,
+                    0,
+                    &solana_system_interface::program::id(),
+                ),
+            );
+        }
+        let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let blockhash = bank0.last_blockhash();
+        let amount = genesis_config.rent.minimum_balance(0);
+        let num_ticks = {
+            let bank1 = Bank::new_from_parent(bank0.clone(), SlotLeader::default(), 1);
+            bank1.max_tick_height() - bank1.tick_height()
+        };
+        let transfers = |hash: &mut Hash| {
+            let transactions = payers
+                .iter()
+                .map(|payer| {
+                    system_transaction::transfer(payer, &Pubkey::new_unique(), amount, blockhash)
+                })
+                .collect();
+            next_entry_mut(hash, 1, transactions)
+        };
+        let tick = |hash: &mut Hash| next_entry_mut(hash, 1, vec![]);
+
+        let mut hash = blockhash;
+        let first: Vec<Entry> = (0..5).map(|_| transfers(&mut hash)).collect();
+        let second = vec![
+            transfers(&mut hash),
+            transfers(&mut hash),
+            tick(&mut hash),
+            transfers(&mut hash),
+            transfers(&mut hash),
+        ];
+        let mut last = vec![transfers(&mut hash)];
+        last.extend((1..num_ticks).map(|_| tick(&mut hash)));
+        let data_set_entries = vec![first, second, last];
+
+        let keypair = Keypair::new();
+        let shredder = Shredder::new(1, 0, 0, 0).unwrap();
+        let mut next_index = 0;
+        let mut all_shreds = vec![];
+        let mut data_sets = vec![];
+        for (i, entries) in data_set_entries.iter().enumerate() {
+            let shreds: Vec<Shred> = shredder
+                .make_merkle_shreds_from_entries(
+                    &keypair,
+                    entries,
+                    i == data_set_entries.len() - 1,
+                    Hash::default(),
+                    next_index,
+                    next_index,
+                    &ReedSolomonCache::default(),
+                    &mut ProcessShredsStats::default(),
+                )
+                .into_iter()
+                .filter(Shred::is_data)
+                .collect();
+            assert!(shreds.len() > 2);
+            next_index = shreds.last().unwrap().index() + 1;
+            data_sets.push(shreds.iter().map(|shred| shred.payload().clone()).collect());
+            all_shreds.extend(shreds);
+        }
+        blockstore.insert_shreds(all_shreds, true).unwrap();
+        (genesis_config, data_set_entries, data_sets)
+    }
+
+    /// A slot 1 bank with a scheduler, and its parent's last entry hash.
+    fn new_partial_replay_bank(
+        genesis_config: &GenesisConfig,
+    ) -> (BankWithScheduler, Hash, Arc<DefaultSchedulerPool>) {
+        let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(genesis_config);
+        let pool = DefaultSchedulerPool::new_for_verification(None, None, None, None, None);
+        let bank1 = Arc::new(Bank::new_from_parent(
+            bank0.clone(),
+            SlotLeader::default(),
+            1,
+        ));
+        (
+            take_bank_with_scheduler_for_tests(&pool, bank1),
+            bank0.last_blockhash(),
+            pool,
+        )
+    }
+
+    fn confirm_slot_for_partial_tests(
+        blockstore: &Blockstore,
+        bank: &BankWithScheduler,
+        progress: &mut ConfirmationProgress,
+        live: Option<&LiveReplayEntries>,
+        worker_pool: &ReplayVerificationWorkerPool,
+    ) -> result::Result<(), BlockstoreProcessorError> {
+        confirm_slot(
+            blockstore,
+            bank,
+            0,
+            worker_pool,
+            &mut ConfirmationTiming::default(),
+            progress,
+            false,
+            None,
+            None,
+            None,
+            false,
+            &MigrationStatus::default(),
+            live,
+        )
+    }
+
+    /// Waits for execution and verification, freezes the bank, and returns
+    /// its hash, transaction count and entry count.
+    fn finish_partial_replay_bank(
+        bank: &BankWithScheduler,
+        progress: &mut ConfirmationProgress,
+    ) -> (Hash, usize, usize) {
+        assert!(bank.is_complete());
+        let (result, _timings) = bank.wait_for_completed_scheduler().unwrap();
+        result.unwrap();
+        progress
+            .wait_for_all_verification_results(&mut 0, &mut 0)
+            .unwrap();
+        bank.freeze();
+        (bank.hash(), progress.num_txs, progress.num_entries)
+    }
+
+    /// The slot replayed from the blockstore, whole data sets only.
+    fn replay_whole_for_partial_tests(
+        genesis_config: &GenesisConfig,
+        blockstore: &Blockstore,
+        worker_pool: &ReplayVerificationWorkerPool,
+    ) -> (Hash, usize, usize) {
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        confirm_slot_for_partial_tests(blockstore, &bank, &mut progress, None, worker_pool)
+            .unwrap();
+        finish_partial_replay_bank(&bank, &mut progress)
+    }
+
+    /// Pushes the leading entries of the data set starting at `start` as
+    /// window_service would, one chunk per newly decodable run of shreds.
+    /// `after_push` runs after every push.
+    fn feed_partial_entries(
+        live: &LiveReplayEntries,
+        generation: u64,
+        start: u32,
+        payloads: &[crate::shred::Payload],
+        after_push: &mut impl FnMut(),
+    ) {
+        let mut decoder = crate::live_replay_entries::PartialDataSetDecoder::new(start);
+        for payload in &payloads[..payloads.len() - 1] {
+            decoder.append(payload);
+            if let Some((first_entry, entries)) = decoder.take_new_entries() {
+                live.push(
+                    crate::live_replay_entries::LiveReplayMessage::PartialEntries {
+                        slot: 1,
+                        start,
+                        generation,
+                        first_entry,
+                        entries,
+                    },
+                );
+                after_push();
+            }
+        }
+    }
+
+    fn push_completed_data_set(
+        live: &LiveReplayEntries,
+        start: u32,
+        payloads: &[crate::shred::Payload],
+        slot_full: bool,
+    ) {
+        live.push(crate::live_replay_entries::LiveReplayMessage::Entries {
+            slot: 1,
+            indices: start..start + payloads.len() as u32,
+            component: Blockstore::decode_completed_data_set_from_payloads(payloads.to_vec())
+                .unwrap(),
+            slot_full,
+        });
+    }
+
+    fn data_set_starts(data_sets: &[Vec<crate::shred::Payload>]) -> Vec<u32> {
+        data_sets
+            .iter()
+            .scan(0u32, |start, payloads| {
+                let this_start = *start;
+                *start += payloads.len() as u32;
+                Some(this_start)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_partial_data_set_replay_matches_whole_data_set_replay() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let (genesis_config, _entries, data_sets) = build_partial_replay_slot(&blockstore);
+        let worker_pool = ReplayVerificationWorkerPool::new(1);
+        let expected = replay_whole_for_partial_tests(&genesis_config, &blockstore, &worker_pool);
+
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let live = LiveReplayEntries::default();
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        let mut most_replayed_early = 0;
+        let starts = data_set_starts(&data_sets);
+        for (i, (payloads, start)) in data_sets.iter().zip(starts).enumerate() {
+            // Replay polls after every chunk and after the completed data set,
+            // interleaving drains with pushes.
+            let mut poll = || {
+                confirm_slot_for_partial_tests(
+                    &blockstore,
+                    &bank,
+                    &mut progress,
+                    Some(&live),
+                    &worker_pool,
+                )
+                .unwrap();
+                most_replayed_early = most_replayed_early.max(progress.partial_data_set_entries);
+            };
+            feed_partial_entries(&live, generation, start, payloads, &mut poll);
+            push_completed_data_set(&live, start, payloads, i == data_sets.len() - 1);
+            poll();
+        }
+        // Some entries really were replayed before their data set completed.
+        assert!(most_replayed_early > 0);
+        assert_eq!(progress.partial_data_set_entries, 0);
+        assert_eq!(finish_partial_replay_bank(&bank, &mut progress), expected);
+    }
+
+    #[test]
+    fn test_partial_data_set_replay_completed_and_next_data_set_in_one_call() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let (genesis_config, _entries, data_sets) = build_partial_replay_slot(&blockstore);
+        let worker_pool = ReplayVerificationWorkerPool::new(1);
+        let expected = replay_whole_for_partial_tests(&genesis_config, &blockstore, &worker_pool);
+
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let live = LiveReplayEntries::default();
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        let starts = data_set_starts(&data_sets);
+        let poll = |progress: &mut ConfirmationProgress| {
+            confirm_slot_for_partial_tests(&blockstore, &bank, progress, Some(&live), &worker_pool)
+                .unwrap();
+        };
+
+        feed_partial_entries(&live, generation, starts[0], &data_sets[0], &mut || ());
+        poll(&mut progress);
+        let replayed_early = progress.partial_data_set_entries;
+        assert!(replayed_early > 0);
+
+        // One call drains the first data set (checked against what ran early,
+        // the rest replayed) and the second data set's leading entries, which
+        // start a new count and digest.
+        push_completed_data_set(&live, starts[0], &data_sets[0], false);
+        feed_partial_entries(&live, generation, starts[1], &data_sets[1], &mut || ());
+        poll(&mut progress);
+        assert_eq!(progress.num_shreds, u64::from(starts[1]));
+        assert!(progress.partial_data_set_entries > 0);
+
+        push_completed_data_set(&live, starts[1], &data_sets[1], false);
+        feed_partial_entries(&live, generation, starts[2], &data_sets[2], &mut || ());
+        push_completed_data_set(&live, starts[2], &data_sets[2], true);
+        poll(&mut progress);
+        assert_eq!(finish_partial_replay_bank(&bank, &mut progress), expected);
+    }
+
+    #[test]
+    fn test_partial_data_set_replay_rejects_a_different_completed_data_set() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let (genesis_config, entries, data_sets) = build_partial_replay_slot(&blockstore);
+        let worker_pool = ReplayVerificationWorkerPool::new(1);
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let live = LiveReplayEntries::default();
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        feed_partial_entries(&live, generation, 0, &data_sets[0], &mut || ());
+        confirm_slot_for_partial_tests(
+            &blockstore,
+            &bank,
+            &mut progress,
+            Some(&live),
+            &worker_pool,
+        )
+        .unwrap();
+        assert!(progress.partial_data_set_entries > 0);
+
+        // The completed data set keeps every entry's num_hashes and hash, but
+        // its first transaction differs: not the entries that ran.
+        let mut tampered = entries[0].clone();
+        tampered[0].transactions[0] = system_transaction::transfer(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            Hash::default(),
+        )
+        .into();
+        let component = solana_entry::block_component_parser::parse(
+            wincode::serialize(&BlockComponent::new_entry_batch(tampered).unwrap()).unwrap(),
+        )
+        .unwrap();
+        live.push(crate::live_replay_entries::LiveReplayMessage::Entries {
+            slot: 1,
+            indices: 0..data_sets[0].len() as u32,
+            component,
+            slot_full: false,
+        });
+        assert_matches!(
+            confirm_slot_for_partial_tests(
+                &blockstore,
+                &bank,
+                &mut progress,
+                Some(&live),
+                &worker_pool
+            ),
+            Err(BlockstoreProcessorError::InvalidBlock(
+                BlockError::InvalidEntryHash
+            ))
+        );
+        let _ = bank.wait_for_completed_scheduler();
+    }
+
+    #[test]
+    fn test_partial_data_set_replay_then_blockstore_fallback() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let (genesis_config, _entries, data_sets) = build_partial_replay_slot(&blockstore);
+        let worker_pool = ReplayVerificationWorkerPool::new(1);
+        let expected = replay_whole_for_partial_tests(&genesis_config, &blockstore, &worker_pool);
+
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let live = LiveReplayEntries::default();
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        feed_partial_entries(&live, generation, 0, &data_sets[0], &mut || ());
+        confirm_slot_for_partial_tests(
+            &blockstore,
+            &bank,
+            &mut progress,
+            Some(&live),
+            &worker_pool,
+        )
+        .unwrap();
+        assert!(progress.partial_data_set_entries > 0);
+
+        // The rest of the slot is read from the blockstore (e.g. after
+        // ReplayFromBlockstore): the first data set's early entries are
+        // checked and skipped there too.
+        confirm_slot_for_partial_tests(&blockstore, &bank, &mut progress, None, &worker_pool)
+            .unwrap();
+        assert_eq!(finish_partial_replay_bank(&bank, &mut progress), expected);
+    }
+
+    #[test]
+    fn test_partial_data_set_replay_restarted_bank_replays_whole_data_sets() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let (genesis_config, _entries, data_sets) = build_partial_replay_slot(&blockstore);
+        let worker_pool = ReplayVerificationWorkerPool::new(1);
+        let expected = replay_whole_for_partial_tests(&genesis_config, &blockstore, &worker_pool);
+
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let live = LiveReplayEntries::default();
+        {
+            // A bank runs the first data set's leading entries, then is
+            // discarded (e.g. an UpdateParent restart or a cleared slot that
+            // left the live queue alone).
+            let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+            let mut progress = ConfirmationProgress::new(parent_hash);
+            feed_partial_entries(&live, generation, 0, &data_sets[0], &mut || ());
+            confirm_slot_for_partial_tests(
+                &blockstore,
+                &bank,
+                &mut progress,
+                Some(&live),
+                &worker_pool,
+            )
+            .unwrap();
+            assert!(progress.partial_data_set_entries > 0);
+            let _ = bank.wait_for_completed_scheduler();
+            let _ = progress.wait_for_all_verification_results(&mut 0, &mut 0);
+        }
+
+        // The restarted bank starts from scratch: the queued entries that ran
+        // on the discarded bank are not handed to it, and it replays whole
+        // data sets (plus any new leading entries) to the same result.
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        confirm_slot_for_partial_tests(
+            &blockstore,
+            &bank,
+            &mut progress,
+            Some(&live),
+            &worker_pool,
+        )
+        .unwrap();
+        assert_eq!(progress.num_entries, 0);
+        let starts = data_set_starts(&data_sets);
+        push_completed_data_set(&live, 0, &data_sets[0], false);
+        for (i, (payloads, start)) in data_sets.iter().zip(starts).enumerate().skip(1) {
+            let mut poll = || {
+                confirm_slot_for_partial_tests(
+                    &blockstore,
+                    &bank,
+                    &mut progress,
+                    Some(&live),
+                    &worker_pool,
+                )
+                .unwrap();
+            };
+            feed_partial_entries(&live, generation, start, payloads, &mut poll);
+            push_completed_data_set(&live, start, payloads, i == data_sets.len() - 1);
+        }
+        confirm_slot_for_partial_tests(
+            &blockstore,
+            &bank,
+            &mut progress,
+            Some(&live),
+            &worker_pool,
+        )
+        .unwrap();
+        assert_eq!(finish_partial_replay_bank(&bank, &mut progress), expected);
     }
 }

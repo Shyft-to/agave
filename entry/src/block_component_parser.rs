@@ -15,20 +15,87 @@ use {
 
 /// Parses a [`ParsedBlockComponent`] from `bytes`, using the same wire format
 /// as [`BlockComponent`].
+///
+/// Built from [`parse_component_header`], [`parse_entry_header_at`] and
+/// [`parse_transaction_at`], which incremental decoders of partially received
+/// data sets also use, so both read exactly the same entries.
 pub fn parse<B: Into<Bytes>>(bytes: B) -> Result<ParsedBlockComponent, ParseError> {
     let bytes: Bytes = bytes.into();
 
-    let mut header: &[u8] = bytes.as_ref();
+    let (entry_count, mut offset) = match parse_component_header(&bytes)? {
+        ComponentHeader::BlockMarker => {
+            let remaining = &bytes[BlockComponent::ENTRY_COUNT_SIZE..];
+            let marker = wincode::deserialize::<VersionedBlockMarker>(remaining)
+                .map_err(ParseError::BlockMarker)?;
+            return Ok(ParsedBlockComponent::BlockMarker(marker));
+        }
+        ComponentHeader::EntryBatch {
+            entry_count,
+            entries_offset,
+        } => (entry_count, entries_offset),
+    };
+
+    // Safe to pre-allocate: entry_count already passed the preallocation-size check in
+    // `parse_component_header`.
+    let mut entry_views = Vec::with_capacity(entry_count);
+
+    for entry_index in 0..entry_count {
+        let (header, transactions_offset) = parse_entry_header_at(&bytes, offset, entry_index)?;
+        offset = transactions_offset;
+
+        // Safe to pre-allocate: tx_count already passed the preallocation-size check in
+        // `parse_entry_header_at`.
+        let mut transactions = Vec::with_capacity(header.tx_count);
+
+        for tx_index in 0..header.tx_count {
+            let (view, next_offset) = parse_transaction_at(&bytes, offset, entry_index, tx_index)?;
+            offset = next_offset;
+            transactions.push(view);
+        }
+
+        entry_views.push(EntryView {
+            num_hashes: header.num_hashes,
+            hash: header.hash,
+            transactions,
+        });
+    }
+
+    // Trailing bytes after the last entry are intentionally ignored, matching
+    // legacy `wincode::deserialize` behavior.
+    Ok(ParsedBlockComponent::EntryBatch(entry_views))
+}
+
+/// What a serialized component's leading entry count encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentHeader {
+    /// An entry count of zero: a [`VersionedBlockMarker`] follows.
+    BlockMarker,
+    /// An entry batch of `entry_count` entries, the first one at byte
+    /// `entries_offset`.
+    EntryBatch {
+        entry_count: usize,
+        entries_offset: usize,
+    },
+}
+
+/// The fixed-size fields that start every entry of an entry batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryHeader {
+    pub num_hashes: u64,
+    pub hash: Hash,
+    pub tx_count: usize,
+}
+
+/// Reads and validates a component's entry count, exactly as [`parse`] does.
+pub fn parse_component_header(bytes: &[u8]) -> Result<ComponentHeader, ParseError> {
+    let mut header: &[u8] = bytes;
     let entry_count =
         <u64 as SchemaRead<DefaultConfig>>::get(header.by_ref()).map_err(ParseError::EntryCount)?;
 
     // entry count of zero encodes a block marker
     let entry_count_encodes_block_marker = entry_count == 0;
     if entry_count_encodes_block_marker {
-        let remaining = &bytes[BlockComponent::ENTRY_COUNT_SIZE..];
-        let marker = wincode::deserialize::<VersionedBlockMarker>(remaining)
-            .map_err(ParseError::BlockMarker)?;
-        return Ok(ParsedBlockComponent::BlockMarker(marker));
+        return Ok(ComponentHeader::BlockMarker);
     }
 
     let entry_count = usize::try_from(entry_count)
@@ -51,82 +118,94 @@ pub fn parse<B: Into<Bytes>>(bytes: B) -> Result<ParsedBlockComponent, ParseErro
         }
     })?;
 
-    // Safe to pre-allocate: entry_count already passed the preallocation-size check above.
-    let mut entry_views = Vec::with_capacity(entry_count);
-    let mut offset = BlockComponent::ENTRY_COUNT_SIZE;
+    Ok(ComponentHeader::EntryBatch {
+        entry_count,
+        entries_offset: BlockComponent::ENTRY_COUNT_SIZE,
+    })
+}
 
-    for entry_index in 0..entry_count {
-        let mut cursor: &[u8] = &bytes[offset..];
+/// Reads and validates the header of entry `entry_index`, which starts at
+/// byte `offset`, exactly as [`parse`] does. Returns the header and the offset
+/// of the entry's first transaction. An `offset` past the end of `bytes` reads
+/// as no bytes and fails like a truncated header.
+pub fn parse_entry_header_at(
+    bytes: &[u8],
+    offset: usize,
+    entry_index: usize,
+) -> Result<(EntryHeader, usize), ParseError> {
+    let mut cursor: &[u8] = bytes.get(offset..).unwrap_or_default();
 
-        let num_hashes =
-            <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
-                ParseError::EntryHeader {
-                    entry_index,
-                    field: "num_hashes",
-                    source,
-                }
-            })?;
-        let hash = <Hash as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
+    let num_hashes =
+        <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
             ParseError::EntryHeader {
                 entry_index,
-                field: "hash",
+                field: "num_hashes",
                 source,
             }
         })?;
-        let tx_count =
-            <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
-                ParseError::EntryHeader {
-                    entry_index,
-                    field: "tx_count",
-                    source,
-                }
-            })?;
-
-        offset = bytes.len() - cursor.len();
-
-        let tx_count =
-            usize::try_from(tx_count).map_err(|_| ParseError::TransactionCountOverflow {
-                entry_index,
-                count: tx_count,
-            })?;
-        // Since the bytes are wincode serialization of [`BlockComponent::EntryBatch`] whose
-        // entries contain regular [`VersionedTransaction`]s, bound by VersionedTransaction's
-        // size to match wincode's prealloc check behavior for deserialization.
-        check_prealloc_limit::<VersionedTransaction>(tx_count).map_err(|needed| {
-            ParseError::TransactionCountPreallocLimit {
-                entry_index,
-                count: tx_count,
-                needed,
-                limit: MAX_DATA_SHREDS_SIZE,
-            }
-        })?;
-
-        // Safe to pre-allocate: tx_count already passed the preallocation-size check above.
-        let mut transactions = Vec::with_capacity(tx_count);
-
-        for tx_index in 0..tx_count {
-            let remaining_bytes = bytes.slice(offset..);
-            let (view, consumed_len) =
-                UnsanitizedTransactionView::try_new_unsanitized_from_prefix(remaining_bytes)
-                    .map_err(|error| ParseError::Transaction {
-                        entry_index,
-                        tx_index,
-                        error,
-                    })?;
-            offset += consumed_len;
-            transactions.push(view);
+    let hash = <Hash as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
+        ParseError::EntryHeader {
+            entry_index,
+            field: "hash",
+            source,
         }
+    })?;
+    let tx_count = <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
+        ParseError::EntryHeader {
+            entry_index,
+            field: "tx_count",
+            source,
+        }
+    })?;
 
-        entry_views.push(EntryView {
+    let transactions_offset = bytes.len() - cursor.len();
+
+    let tx_count = usize::try_from(tx_count).map_err(|_| ParseError::TransactionCountOverflow {
+        entry_index,
+        count: tx_count,
+    })?;
+    // Since the bytes are wincode serialization of [`BlockComponent::EntryBatch`] whose
+    // entries contain regular [`VersionedTransaction`]s, bound by VersionedTransaction's
+    // size to match wincode's prealloc check behavior for deserialization.
+    check_prealloc_limit::<VersionedTransaction>(tx_count).map_err(|needed| {
+        ParseError::TransactionCountPreallocLimit {
+            entry_index,
+            count: tx_count,
+            needed,
+            limit: MAX_DATA_SHREDS_SIZE,
+        }
+    })?;
+
+    Ok((
+        EntryHeader {
             num_hashes,
             hash,
-            transactions,
-        });
-    }
+            tx_count,
+        },
+        transactions_offset,
+    ))
+}
 
-    // Trailing bytes after the last entry are intentionally ignored, matching
-    // legacy `wincode::deserialize` behavior.
-    Ok(ParsedBlockComponent::EntryBatch(entry_views))
+/// Parses transaction `tx_index` of entry `entry_index`, which starts at byte
+/// `offset`, exactly as [`parse`] does. Returns the transaction view and the
+/// offset just past it. An `offset` past the end of `bytes` reads as no bytes
+/// and fails like a truncated transaction.
+pub fn parse_transaction_at(
+    bytes: &Bytes,
+    offset: usize,
+    entry_index: usize,
+    tx_index: usize,
+) -> Result<(UnsanitizedTransactionView<Bytes>, usize), ParseError> {
+    let remaining_bytes = bytes.slice(offset.min(bytes.len())..);
+    let (view, consumed_len) = UnsanitizedTransactionView::try_new_unsanitized_from_prefix(
+        remaining_bytes,
+    )
+    .map_err(|error| ParseError::Transaction {
+        entry_index,
+        tx_index,
+        error,
+    })?;
+    Ok((view, offset + consumed_len))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -518,6 +597,111 @@ mod tests {
             view_result,
             Err(ParseError::TransactionCountPreallocLimit { .. })
         ));
+    }
+
+    /// A serialized multi-entry batch mixing transaction entries and a tick.
+    fn sample_entry_batch_bytes() -> Vec<u8> {
+        let entries = vec![
+            entry_with_transactions(1, vec![transfer_transaction(1), transfer_transaction(2)]),
+            entry_with_transactions(2, vec![transfer_transaction(3)]),
+            Entry {
+                num_hashes: 3,
+                hash: Hash::new_unique(),
+                transactions: vec![],
+            },
+            entry_with_transactions(
+                4,
+                vec![
+                    transfer_transaction(4),
+                    transfer_transaction(5),
+                    transfer_transaction(6),
+                ],
+            ),
+        ];
+        wincode::serialize(&BlockComponent::new_entry_batch(entries).unwrap()).unwrap()
+    }
+
+    type WalkedEntry = (u64, Hash, Vec<Vec<u8>>, usize);
+
+    /// Walks `bytes` with the public helpers the way `parse` does, stopping at
+    /// the first error. Returns each complete entry's num_hashes, hash, raw
+    /// transaction bytes and end offset.
+    fn walk_with_helpers(bytes: &Bytes) -> Vec<WalkedEntry> {
+        let mut walked = vec![];
+        let Ok(ComponentHeader::EntryBatch {
+            entry_count,
+            entries_offset,
+        }) = parse_component_header(bytes)
+        else {
+            return walked;
+        };
+        let mut offset = entries_offset;
+        for entry_index in 0..entry_count {
+            let Ok((header, next_offset)) = parse_entry_header_at(bytes, offset, entry_index)
+            else {
+                return walked;
+            };
+            offset = next_offset;
+            let mut transactions = vec![];
+            for tx_index in 0..header.tx_count {
+                let Ok((view, next_offset)) =
+                    parse_transaction_at(bytes, offset, entry_index, tx_index)
+                else {
+                    return walked;
+                };
+                offset = next_offset;
+                transactions.push(view.data().to_vec());
+            }
+            walked.push((header.num_hashes, header.hash, transactions, offset));
+        }
+        walked
+    }
+
+    #[test]
+    fn helpers_reproduce_parse() {
+        let bytes = Bytes::from(sample_entry_batch_bytes());
+        let ParsedBlockComponent::EntryBatch(views) = parse(bytes.clone()).unwrap() else {
+            panic!("expected EntryBatch");
+        };
+        let walked = walk_with_helpers(&bytes);
+        assert_eq!(walked.len(), views.len());
+        for (view, (num_hashes, hash, transactions, _)) in views.iter().zip(&walked) {
+            assert_eq!(view.num_hashes, *num_hashes);
+            assert_eq!(view.hash, *hash);
+            let view_transactions: Vec<Vec<u8>> = view
+                .transactions
+                .iter()
+                .map(|tx| tx.data().to_vec())
+                .collect();
+            assert_eq!(&view_transactions, transactions);
+        }
+        assert_eq!(walked.last().unwrap().3, bytes.len());
+    }
+
+    #[test]
+    fn helpers_on_every_prefix_only_yield_entries_of_the_full_parse() {
+        let full = sample_entry_batch_bytes();
+        let full_walk = walk_with_helpers(&Bytes::from(full.clone()));
+        for len in 0..=full.len() {
+            let prefix_walk = walk_with_helpers(&Bytes::copy_from_slice(&full[..len]));
+            // Every entry read from a prefix, including transactions cut at
+            // the prefix boundary, is exactly the full parse's entry.
+            assert_eq!(
+                prefix_walk[..],
+                full_walk[..prefix_walk.len()],
+                "prefix len {len}"
+            );
+            // An entry is read from a prefix exactly when all its bytes are in it.
+            let complete = full_walk.iter().filter(|entry| entry.3 <= len).count();
+            assert_eq!(prefix_walk.len(), complete, "prefix len {len}");
+        }
+    }
+
+    #[test]
+    fn helpers_reject_offsets_past_the_end() {
+        let bytes = Bytes::from(sample_entry_batch_bytes());
+        assert!(parse_entry_header_at(&bytes, bytes.len() + 1, 0).is_err());
+        assert!(parse_transaction_at(&bytes, bytes.len() + 1, 0, 0).is_err());
     }
 
     const ENTRY_PREALLOC_LIMIT: usize = MAX_DATA_SHREDS_SIZE / size_of::<Entry>();

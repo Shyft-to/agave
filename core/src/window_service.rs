@@ -25,7 +25,7 @@ use {
         },
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
-        live_replay_entries::{LiveReplayMessage, LiveReplaySender},
+        live_replay_entries::{LiveReplayMessage, LiveReplaySender, PartialDataSetDecoder},
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -35,7 +35,7 @@ use {
     solana_streamer::evicting_sender::EvictingSender,
     std::{
         borrow::Cow,
-        collections::{HashMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
         net::UdpSocket,
         ops::Range,
         sync::{
@@ -211,15 +211,44 @@ struct ShredPayloadCache {
     slots: VecDeque<Slot>,
     max_slots: usize,
     payloads: HashMap<Slot, HashMap<u32, (shred::Payload, ShredOrigin)>>,
+    /// Partial data-set replay state per cached slot; `None` when
+    /// `AGAVE_PARTIAL_DATA_SET_REPLAY` is off.
+    partial: Option<HashMap<Slot, PartialSlotState>>,
+}
+
+/// Partial data-set replay state of one slot.
+#[derive(Default)]
+struct PartialSlotState {
+    /// Indices of cached data shreds that end a data set
+    /// (`DATA_COMPLETE_SHRED`); the next data set starts right after each.
+    data_set_ends: BTreeSet<u32>,
+    /// Decoders of incomplete data sets, by data-set start index.
+    decoders: HashMap<u32, PartialDecoder>,
+    /// The slot's `SlotMeta::first_shred_timestamp` when first seen. It
+    /// changes when the slot is cleared and received again.
+    generation: Option<u64>,
+    /// The slot was cleared and received again: no partial replay for it.
+    disabled: bool,
+}
+
+struct PartialDecoder {
+    decoder: PartialDataSetDecoder,
+    /// When this data set's first leading entries were sent to replay.
+    first_sent: Option<Instant>,
 }
 
 impl ShredPayloadCache {
-    fn new(max_slots: usize) -> Self {
+    fn new(max_slots: usize, partial_data_set_replay: bool) -> Self {
         Self {
             slots: VecDeque::with_capacity(max_slots),
             max_slots,
             payloads: HashMap::new(),
+            partial: partial_data_set_replay.then(HashMap::new),
         }
+    }
+
+    fn partial_data_set_replay(&self) -> bool {
+        self.partial.is_some()
     }
 
     fn insert(&mut self, slot: Slot, index: u32, payload: shred::Payload, origin: ShredOrigin) {
@@ -229,13 +258,141 @@ impl ShredPayloadCache {
             while self.slots.len() > self.max_slots {
                 if let Some(oldest) = self.slots.pop_front() {
                     self.payloads.remove(&oldest);
+                    if let Some(partial) = self.partial.as_mut() {
+                        partial.remove(&oldest);
+                    }
                 }
             }
+        }
+        if let Some(partial) = self.partial.as_mut()
+            && shred::wire::get_flags(&payload)
+                .is_ok_and(|flags| flags.contains(shred::ShredFlags::DATA_COMPLETE_SHRED))
+        {
+            partial.entry(slot).or_default().data_set_ends.insert(index);
         }
         self.payloads
             .get_mut(&slot)
             .unwrap()
             .insert(index, (payload, origin));
+    }
+
+    /// Partial data-set replay for `slot` after an insert call, outside the
+    /// blockstore's insert lock: sends the newly decodable leading entries of
+    /// the slot's incomplete data sets touched by this call's `accepted`
+    /// indices to replay. `completed` are the start indices of the data sets
+    /// this call completed (and sent whole). `generation` is the slot's
+    /// current `SlotMeta::first_shred_timestamp`.
+    fn send_partial_entries(
+        &mut self,
+        slot: Slot,
+        generation: Option<u64>,
+        accepted: &[u32],
+        completed: &[u32],
+        live_replay_sender: &LiveReplaySender,
+    ) {
+        let (Some(partial), Some(slot_payloads)) =
+            (self.partial.as_mut(), self.payloads.get_mut(&slot))
+        else {
+            return;
+        };
+        let Some(generation) = generation else {
+            return;
+        };
+        let state = partial.entry(slot).or_default();
+        let partial_metrics = &solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_TOTAL;
+        match state.generation {
+            None => state.generation = Some(generation),
+            Some(seen) if seen != generation && !state.disabled => {
+                // Cleared and received again: shreds cached before this call
+                // belong to the discarded version. Drop them, and don't replay
+                // this slot's data sets early at all.
+                state.disabled = true;
+                state.decoders.clear();
+                state.data_set_ends.clear();
+                slot_payloads.retain(|index, _| accepted.contains(index));
+                partial_metrics
+                    .with_label_values(&["slot_disabled_after_purge"])
+                    .inc();
+            }
+            Some(_) => (),
+        }
+        if state.disabled {
+            return;
+        }
+
+        for start in completed {
+            if let Some(PartialDecoder {
+                first_sent: Some(first_sent),
+                ..
+            }) = state.decoders.remove(start)
+            {
+                solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_LEAD_US
+                    .observe(first_sent.elapsed().as_micros() as f64);
+            }
+        }
+
+        // Start of the data set each accepted shred belongs to (as far as the
+        // cached data-set ends tell; a walk never crosses a missing end), and
+        // of the data set after each accepted data-set end.
+        let mut starts = BTreeSet::new();
+        for index in accepted {
+            let start = state
+                .data_set_ends
+                .range(..*index)
+                .next_back()
+                .map_or(0, |end| end.saturating_add(1));
+            starts.insert(start);
+            if state.data_set_ends.contains(index) {
+                starts.insert(index.saturating_add(1));
+            }
+        }
+        for start in starts {
+            if completed.contains(&start) {
+                continue;
+            }
+            let entry = state
+                .decoders
+                .entry(start)
+                .or_insert_with(|| PartialDecoder {
+                    decoder: PartialDataSetDecoder::new(start),
+                    first_sent: None,
+                });
+            if entry.decoder.is_stopped() {
+                continue;
+            }
+            loop {
+                let index = entry.decoder.next_index();
+                // The data set's last shred completes it; it is replayed whole.
+                if state.data_set_ends.contains(&index) {
+                    break;
+                }
+                let Some((payload, _)) = slot_payloads.get(&index) else {
+                    break;
+                };
+                if !entry.decoder.append(payload) {
+                    break;
+                }
+            }
+            if let Some((first_entry, entries)) = entry.decoder.take_new_entries() {
+                partial_metrics.with_label_values(&["chunk_sent"]).inc();
+                partial_metrics
+                    .with_label_values(&["entries_sent"])
+                    .inc_by(entries.len() as u64);
+                entry.first_sent.get_or_insert_with(Instant::now);
+                let _ = live_replay_sender.send(LiveReplayMessage::PartialEntries {
+                    slot,
+                    start,
+                    generation,
+                    first_entry,
+                    entries,
+                });
+            }
+            if entry.decoder.is_stopped() {
+                partial_metrics
+                    .with_label_values(&["decoder_stopped"])
+                    .inc();
+            }
+        }
     }
 
     /// Returns the raw wire bytes for `indices.start..indices.end`, in index
@@ -354,6 +511,13 @@ where
     // blockstore. This is the rare recovery path; the steady state is the
     // channel. It never marks a slot dead -- a genuinely corrupt data set
     // surfaces through the normal blockstore read path.
+    //
+    // With partial data-set replay on, this hook only records what it saw;
+    // the partial decoding runs after the insert call returns, outside the
+    // blockstore's insert lock.
+    let partial_data_set_replay = shred_payload_cache.partial_data_set_replay();
+    let mut partial_accepted: BTreeMap<Slot, Vec<u32>> = BTreeMap::new();
+    let mut partial_completed: HashMap<Slot, Vec<u32>> = HashMap::new();
     let mut before_write = |completed: &[CompletedDataSetInfo],
                             accepted: &[(Slot, u32, shred::Payload)]| {
         for (slot, index, payload) in accepted {
@@ -363,10 +527,19 @@ where
                 None => ShredOrigin::Recovered,
             };
             shred_payload_cache.insert(*slot, *index, payload.clone(), origin);
+            if partial_data_set_replay {
+                partial_accepted.entry(*slot).or_default().push(*index);
+            }
         }
         for info in completed {
             if info.location != BlockLocation::Original {
                 continue;
+            }
+            if partial_data_set_replay {
+                partial_completed
+                    .entry(info.slot)
+                    .or_default()
+                    .push(info.indices.start);
             }
             let decoded = shred_payload_cache
                 .get_contiguous(info.slot, &info.indices)
@@ -414,6 +587,29 @@ where
         metrics,
         Some(&mut before_write),
     )?;
+
+    for (slot, accepted) in &partial_accepted {
+        // Tags the chunks with the slot's current version; replay only takes
+        // chunks whose tag matches the blockstore's at that time.
+        // 0: the slot holds no shreds (e.g. just cleared), so no version.
+        let generation = blockstore
+            .meta(*slot)
+            .ok()
+            .flatten()
+            .map(|meta| meta.first_shred_timestamp)
+            .filter(|timestamp| *timestamp != 0);
+        let completed = partial_completed
+            .get(slot)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        shred_payload_cache.send_partial_entries(
+            *slot,
+            generation,
+            accepted,
+            completed,
+            live_replay_sender,
+        );
+    }
 
     let blockstore_store_us = &solana_metrics::pipeline_metrics::BLOCKSTORE_STORE_DURATION_US;
     blockstore_store_us
@@ -638,10 +834,23 @@ impl WindowService {
                 );
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
                 let mut write_batch = blockstore.get_write_batch();
+                // Partial data-set replay: replay a data set's leading entries
+                // before all its shreds arrive. Off unless explicitly enabled.
+                let partial_data_set_replay =
+                    std::env::var("AGAVE_PARTIAL_DATA_SET_REPLAY").is_ok_and(|value| value == "1");
+                solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_REPLAY_ENABLED
+                    .set(if partial_data_set_replay { 1.0 } else { 0.0 });
+                if partial_data_set_replay {
+                    warn!(
+                        "partial data-set replay enabled (AGAVE_PARTIAL_DATA_SET_REPLAY=1): \
+                         replay may start on a data set before all its shreds arrive. Keep \
+                         this off on voting nodes."
+                    );
+                }
                 // 64 slots is deliberately generous: this is the ONLY source live
                 // replay has for a completed data set's content, so a data set whose
                 // payloads are evicted before it completes gets its slot marked dead.
-                let mut shred_payload_cache = ShredPayloadCache::new(64);
+                let mut shred_payload_cache = ShredPayloadCache::new(64, partial_data_set_replay);
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
@@ -712,7 +921,10 @@ mod test {
         super::*,
         crossbeam_channel::bounded,
         rand::Rng,
-        solana_entry::entry::{Entry, create_ticks},
+        solana_entry::{
+            block_component::ParsedBlockComponent,
+            entry::{Entry, EntryView, create_ticks},
+        },
         solana_gossip::contact_info::ContactInfo,
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -766,7 +978,7 @@ mod test {
 
     #[test]
     fn test_shred_payload_cache_data_set_origin() {
-        let mut cache = ShredPayloadCache::new(2);
+        let mut cache = ShredPayloadCache::new(2, false);
         let payload = |byte: u8| shred::Payload::from(vec![byte]);
         cache.insert(5, 0, payload(0), ShredOrigin::Turbine);
         cache.insert(5, 1, payload(1), ShredOrigin::Repair);
@@ -843,7 +1055,7 @@ mod test {
         let mut pinnable_slice = blockstore.new_pinnable_slice();
         let mut write_batch = blockstore.get_write_batch();
         let (live_replay_sender, live_replay_receiver) = unbounded();
-        let mut shred_payload_cache = ShredPayloadCache::new(4);
+        let mut shred_payload_cache = ShredPayloadCache::new(4, false);
         run_insert(
             &thread_pool,
             &verified_receiver,
@@ -868,6 +1080,244 @@ mod test {
         }
         // The slot's data set completed in this call and went to replay.
         assert!(live_replay_receiver.try_iter().count() > 0);
+    }
+
+    /// Data shreds of one data set for slot 1: six entries of six transfers
+    /// each (so transactions span shred boundaries), then a tick.
+    fn transfer_data_set_shreds(keypair: &Keypair) -> Vec<Shred> {
+        let mut hash = Hash::new_unique();
+        let mut entries: Vec<Entry> = (0..6u64)
+            .map(|i| {
+                let transactions = (0..6u64)
+                    .map(|j| {
+                        solana_system_transaction::transfer(
+                            &Keypair::new(),
+                            &solana_pubkey::Pubkey::new_unique(),
+                            i * 10 + j + 1,
+                            Hash::default(),
+                        )
+                    })
+                    .collect();
+                solana_entry::entry::next_entry_mut(&mut hash, 1, transactions)
+            })
+            .collect();
+        entries.push(solana_entry::entry::next_entry_mut(&mut hash, 1, vec![]));
+        Shredder::new(1, 0, 0, 0)
+            .unwrap()
+            .entries_to_merkle_shreds_for_tests(
+                keypair,
+                &entries,
+                false, // is_last_in_slot
+                Hash::new_from_array(rand::rng().random()),
+                0, // next_shred_index
+                0, // next_code_index
+                &ReedSolomonCache::default(),
+                &mut ProcessShredsStats::default(),
+            )
+            .0
+    }
+
+    /// One `run_insert` call on `batch`, received through turbine.
+    fn run_insert_for_tests(
+        blockstore: &Blockstore,
+        bank_forks: &RwLock<BankForks>,
+        batch: &[Shred],
+        shred_payload_cache: &mut ShredPayloadCache,
+        live_replay_sender: &LiveReplaySender,
+    ) {
+        let (verified_sender, verified_receiver) = unbounded();
+        verified_sender
+            .send(
+                batch
+                    .iter()
+                    .map(|shred| (shred.payload().clone(), false, BlockLocation::Original))
+                    .collect(),
+            )
+            .unwrap();
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let (retransmit_sender, _retransmit_receiver) = EvictingSender::new_bounded(1024);
+        let mut shred_recovery_context = ShredRecoveryContext::new(
+            ReedSolomonCache::default(),
+            retransmit_sender,
+            bank_forks.read().unwrap().root_bank(),
+            0, // shred_version
+        );
+        let mut pinnable_slice = blockstore.new_pinnable_slice();
+        let mut write_batch = blockstore.get_write_batch();
+        run_insert(
+            &thread_pool,
+            &verified_receiver,
+            blockstore,
+            &mut shred_recovery_context,
+            &mut pinnable_slice,
+            &mut write_batch,
+            |_| {},
+            &mut BlockstoreInsertionMetrics::default(),
+            &mut WindowServiceMetrics::default(),
+            None,
+            live_replay_sender,
+            shred_payload_cache,
+        )
+        .unwrap();
+    }
+
+    fn entry_batch(component: ParsedBlockComponent) -> Vec<EntryView<bytes::Bytes>> {
+        match component {
+            ParsedBlockComponent::EntryBatch(entries) => entries,
+            ParsedBlockComponent::BlockMarker(_) => panic!("expected EntryBatch"),
+        }
+    }
+
+    #[test]
+    fn test_run_insert_sends_partial_entries_then_the_completed_data_set() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let shreds = transfer_data_set_shreds(&Keypair::new());
+        assert!(shreds.len() > 3);
+        let full = entry_batch(
+            Blockstore::decode_completed_data_set_from_payloads(
+                shreds.iter().map(|shred| shred.payload().clone()).collect(),
+            )
+            .unwrap(),
+        );
+
+        let (live_replay_sender, live_replay_receiver) = unbounded();
+        let mut cache = ShredPayloadCache::new(4, true);
+        // Every shred but the data set's last, one insert call each.
+        for shred in &shreds[..shreds.len() - 1] {
+            run_insert_for_tests(
+                &blockstore,
+                &bank_forks,
+                std::slice::from_ref(shred),
+                &mut cache,
+                &live_replay_sender,
+            );
+        }
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let mut partial = vec![];
+        for message in live_replay_receiver.try_iter() {
+            let LiveReplayMessage::PartialEntries {
+                slot,
+                start,
+                generation: message_generation,
+                first_entry,
+                entries,
+            } = message
+            else {
+                panic!("expected only partial entries before the data set completes");
+            };
+            assert_eq!(
+                (slot, start, message_generation, first_entry),
+                (1, 0, generation, partial.len())
+            );
+            partial.extend(entries);
+        }
+        assert!(!partial.is_empty());
+        assert!(partial.len() < full.len());
+        for (early, completed) in partial.iter().zip(&full) {
+            assert_eq!(early.num_hashes, completed.num_hashes);
+            assert_eq!(early.hash, completed.hash);
+            assert_eq!(early.transactions.len(), completed.transactions.len());
+            for (early_tx, completed_tx) in early.transactions.iter().zip(&completed.transactions) {
+                assert_eq!(early_tx.data(), completed_tx.data());
+            }
+        }
+
+        // The last shred completes the data set, which is sent whole.
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            std::slice::from_ref(shreds.last().unwrap()),
+            &mut cache,
+            &live_replay_sender,
+        );
+        let messages: Vec<_> = live_replay_receiver.try_iter().collect();
+        assert_eq!(messages.len(), 1);
+        let LiveReplayMessage::Entries {
+            slot: 1,
+            ref indices,
+            ..
+        } = messages[0]
+        else {
+            panic!("expected the completed data set");
+        };
+        assert_eq!(*indices, 0..shreds.len() as u32);
+        // The completed data set's decoder is gone (the next data set, which
+        // starts right after it, may already have one).
+        assert!(
+            !cache.partial.as_ref().unwrap()[&1]
+                .decoders
+                .contains_key(&0)
+        );
+    }
+
+    #[test]
+    fn test_run_insert_sends_no_partial_entries_when_disabled() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let shreds = transfer_data_set_shreds(&Keypair::new());
+        let (live_replay_sender, live_replay_receiver) = unbounded();
+        let mut cache = ShredPayloadCache::new(4, false);
+        for shred in &shreds[..shreds.len() - 1] {
+            run_insert_for_tests(
+                &blockstore,
+                &bank_forks,
+                std::slice::from_ref(shred),
+                &mut cache,
+                &live_replay_sender,
+            );
+        }
+        assert_eq!(live_replay_receiver.try_iter().count(), 0);
+        assert!(cache.partial.is_none());
+    }
+
+    #[test]
+    fn test_no_partial_entries_for_a_slot_cleared_and_received_again() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let version_a = transfer_data_set_shreds(&Keypair::new());
+        let version_b = transfer_data_set_shreds(&Keypair::new());
+        let (live_replay_sender, live_replay_receiver) = unbounded();
+        let mut cache = ShredPayloadCache::new(4, true);
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &version_a[..3],
+            &mut cache,
+            &live_replay_sender,
+        );
+        live_replay_receiver.try_iter().for_each(drop);
+
+        // Replay purges the slot (e.g. a duplicate block) and another version
+        // arrives. `first_shred_timestamp` has millisecond resolution.
+        blockstore.clear_unconfirmed_slot(1);
+        thread::sleep(Duration::from_millis(5));
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &version_b[..2],
+            &mut cache,
+            &live_replay_sender,
+        );
+        assert_eq!(live_replay_receiver.try_iter().count(), 0);
+        let state = &cache.partial.as_ref().unwrap()[&1];
+        assert!(state.disabled);
+        assert!(state.decoders.is_empty());
+        // Only the new version's shreds stay cached.
+        let cached = &cache.payloads[&1];
+        assert_eq!(cached.len(), 2);
+        for shred in &version_b[..2] {
+            assert_eq!(cached[&shred.index()].0, *shred.payload());
+        }
     }
 
     #[test]
