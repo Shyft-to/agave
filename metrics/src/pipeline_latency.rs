@@ -350,6 +350,12 @@ struct TxCheckpoints {
     start: Instant,
     ready: Option<Instant>,
     picked_up: Instant,
+    /// Replay thread handed the transaction's task to the unified scheduler.
+    scheduled: Option<Instant>,
+    /// A unified-scheduler handler thread started executing it.
+    exec_start: Option<Instant>,
+    /// SVM load-and-execute finished (before the pre-commit check and commit).
+    executed: Option<Instant>,
     enqueued: Option<Instant>,
     dequeued: Option<Instant>,
 }
@@ -443,10 +449,52 @@ impl TxPipelineLatencyTracker {
                     start: *start,
                     ready,
                     picked_up: Instant::now(),
+                    scheduled: None,
+                    exec_start: None,
+                    executed: None,
                     enqueued: None,
                     dequeued: None,
                 },
             );
+        }
+    }
+
+    /// Called on the replay thread right before the transaction's task is
+    /// sent to the unified scheduler (`PooledScheduler::schedule_execution`).
+    /// A no-op for untracked signatures.
+    pub fn mark_tx_scheduled(&self, signature: [u8; 64]) {
+        if let Some(mut checkpoints) = self.tx_started.get_mut(&signature) {
+            checkpoints.scheduled = Some(Instant::now());
+        }
+    }
+
+    /// Called on a unified-scheduler handler thread right before it executes
+    /// the transaction. `blocked` is whether the scheduler had buffered the
+    /// task behind an account-lock conflict (it arrived on the handlers'
+    /// blocked-task channel) rather than dispatching it as soon as it was
+    /// scheduled. Also observes `SCHEDULER_QUEUE_WAIT_DURATION_US` for it when
+    /// `mark_tx_scheduled` was recorded. A no-op for untracked signatures.
+    pub fn mark_tx_exec_started(&self, signature: [u8; 64], blocked: bool) {
+        let Some(mut checkpoints) = self.tx_started.get_mut(&signature) else {
+            return;
+        };
+        let now = Instant::now();
+        checkpoints.exec_start = Some(now);
+        let scheduled = checkpoints.scheduled;
+        drop(checkpoints);
+        if let Some(scheduled) = scheduled {
+            crate::pipeline_metrics::SCHEDULER_QUEUE_WAIT_DURATION_US
+                .with_label_values(&[if blocked { "blocked" } else { "unblocked" }])
+                .observe(now.saturating_duration_since(scheduled).as_micros() as f64);
+        }
+    }
+
+    /// Called right after the SVM finished loading and executing the batch
+    /// holding this transaction (`executed_at`), before its commit. A no-op
+    /// for untracked signatures.
+    pub fn mark_tx_executed(&self, signature: [u8; 64], executed_at: Instant) {
+        if let Some(mut checkpoints) = self.tx_started.get_mut(&signature) {
+            checkpoints.executed = Some(executed_at);
         }
     }
 
@@ -462,7 +510,13 @@ impl TxPipelineLatencyTracker {
 
     /// Observes `agave_end_to_end_duration_us{path="tx_pipeline"}` if a
     /// start was recorded for this signature, plus the per-segment
-    /// breakdown when every checkpoint was recorded, and removes the entry.
+    /// breakdown when the `ready`, `enqueued` and `dequeued` checkpoints were
+    /// recorded, and removes the entry. The replay part (pickup -> committed)
+    /// is split into four segments when `scheduled`, `exec_start` and
+    /// `executed` were all recorded; otherwise it is observed whole as
+    /// `replay_pickup_to_committed`, so a missing stamp shows up as that
+    /// segment's count instead of silently dropping the breakdown. Either way
+    /// the segments observed for one transaction sum to its `tx_pipeline`.
     /// A transaction that never reaches this (e.g. dropped before commit) is
     /// cleaned up later by age-based pruning instead, bounding memory.
     pub fn mark_tx_notified(&self, signature: [u8; 64]) {
@@ -478,18 +532,28 @@ impl TxPipelineLatencyTracker {
         else {
             return;
         };
-        let segments = [
-            ("fetch_to_data_set_ready", checkpoints.start, ready),
-            ("data_set_ready_to_replay_pickup", ready, checkpoints.picked_up),
-            ("replay_pickup_to_committed", checkpoints.picked_up, enqueued),
-            ("commit_to_status_dequeued", enqueued, dequeued),
-            ("status_dequeued_to_notified", dequeued, now),
-        ];
-        for (segment, from, to) in segments {
+        let observe = |segment: &str, from: Instant, to: Instant| {
             TX_PIPELINE_SEGMENT_DURATION_US
                 .with_label_values(&[segment])
                 .observe(to.saturating_duration_since(from).as_micros() as f64);
+        };
+        let picked_up = checkpoints.picked_up;
+        observe("fetch_to_data_set_ready", checkpoints.start, ready);
+        observe("data_set_ready_to_replay_pickup", ready, picked_up);
+        if let (Some(scheduled), Some(exec_start), Some(executed)) = (
+            checkpoints.scheduled,
+            checkpoints.exec_start,
+            checkpoints.executed,
+        ) {
+            observe("replay_pickup_to_scheduled", picked_up, scheduled);
+            observe("scheduled_to_exec_start", scheduled, exec_start);
+            observe("exec_start_to_executed", exec_start, executed);
+            observe("executed_to_committed", executed, enqueued);
+        } else {
+            observe("replay_pickup_to_committed", picked_up, enqueued);
         }
+        observe("commit_to_status_dequeued", enqueued, dequeued);
+        observe("status_dequeued_to_notified", dequeued, now);
     }
 
     fn maybe_prune(&self, slot: u64) {
@@ -518,6 +582,10 @@ mod test {
     /// `first_shred_to_parent_frozen` / `parent_frozen_to_created_bank`
     /// histograms, since one of them counts the samples it added.
     static PARENT_FROZEN_SPLIT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes the tests that count samples they add to the global
+    /// `TX_PIPELINE_SEGMENT_DURATION_US` / `SCHEDULER_QUEUE_WAIT_DURATION_US`.
+    static TX_PIPELINE_SEGMENT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_deshred_tracker_observes_only_after_start() {
@@ -692,26 +760,32 @@ mod test {
         assert!(!tracker.tx_started.contains_key(&[2u8; 64]));
     }
 
+    fn read_segments(names: &[&str]) -> Vec<(u64, f64)> {
+        names
+            .iter()
+            .map(|name| {
+                let h = TX_PIPELINE_SEGMENT_DURATION_US.with_label_values(&[name]);
+                (h.get_sample_count(), h.get_sample_sum())
+            })
+            .collect()
+    }
+
     #[test]
     fn test_tx_pipeline_segments_sum_to_total() {
         use std::{thread::sleep, time::Duration};
+        let _lock = TX_PIPELINE_SEGMENT_LOCK.lock().unwrap();
         let segment_names = [
             "fetch_to_data_set_ready",
             "data_set_ready_to_replay_pickup",
-            "replay_pickup_to_committed",
+            "replay_pickup_to_scheduled",
+            "scheduled_to_exec_start",
+            "exec_start_to_executed",
+            "executed_to_committed",
             "commit_to_status_dequeued",
             "status_dequeued_to_notified",
         ];
-        let read = || -> Vec<(u64, f64)> {
-            segment_names
-                .iter()
-                .map(|name| {
-                    let h = TX_PIPELINE_SEGMENT_DURATION_US.with_label_values(&[name]);
-                    (h.get_sample_count(), h.get_sample_sum())
-                })
-                .collect()
-        };
-        let before = read();
+        let before = read_segments(&segment_names);
+        let whole_before = read_segments(&["replay_pickup_to_committed"]);
 
         let tracker = TxPipelineLatencyTracker::new();
         let begin = Instant::now();
@@ -721,6 +795,12 @@ mod test {
         sleep(Duration::from_millis(2));
         tracker.mark_tx_data_set([7u8; 64], 9, 300);
         sleep(Duration::from_millis(2));
+        tracker.mark_tx_scheduled([7u8; 64]);
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_exec_started([7u8; 64], false);
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_executed([7u8; 64], Instant::now());
+        sleep(Duration::from_millis(2));
         let enqueued_at = Instant::now();
         sleep(Duration::from_millis(2));
         tracker.mark_tx_status_received([7u8; 64], enqueued_at);
@@ -728,7 +808,7 @@ mod test {
         tracker.mark_tx_notified([7u8; 64]);
         let elapsed_us = begin.elapsed().as_micros() as f64;
 
-        let after = read();
+        let after = read_segments(&segment_names);
         let mut total = 0.0;
         for ((count_before, sum_before), (count_after, sum_after)) in before.iter().zip(&after) {
             assert_eq!(count_after - count_before, 1);
@@ -738,7 +818,80 @@ mod test {
         }
         // The segments telescope: together they cover the whole span (minus
         // per-segment microsecond truncation).
-        assert!(total >= 10_000.0 && total <= elapsed_us, "{total} vs {elapsed_us}");
+        assert!(
+            (16_000.0..=elapsed_us).contains(&total),
+            "{total} vs {elapsed_us}"
+        );
+        // The unsplit replay segment is not observed when the split is.
+        assert_eq!(read_segments(&["replay_pickup_to_committed"]), whole_before);
+    }
+
+    #[test]
+    fn test_tx_pipeline_missing_scheduler_stamps_fall_back_to_whole_segment() {
+        let _lock = TX_PIPELINE_SEGMENT_LOCK.lock().unwrap();
+        let split = [
+            "replay_pickup_to_scheduled",
+            "scheduled_to_exec_start",
+            "exec_start_to_executed",
+            "executed_to_committed",
+        ];
+        let split_before = read_segments(&split);
+        let whole_before = read_segments(&["replay_pickup_to_committed"])[0].0;
+        let other_before = read_segments(&["commit_to_status_dequeued"])[0].0;
+
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(13, 0);
+        tracker.mark_data_set_ready(13, 0);
+        tracker.mark_tx_data_set([8u8; 64], 13, 0);
+        // Scheduled and executed, but the exec-start stamp is missing.
+        tracker.mark_tx_scheduled([8u8; 64]);
+        tracker.mark_tx_executed([8u8; 64], Instant::now());
+        tracker.mark_tx_status_received([8u8; 64], Instant::now());
+        tracker.mark_tx_notified([8u8; 64]);
+
+        assert_eq!(read_segments(&split), split_before);
+        assert_eq!(
+            read_segments(&["replay_pickup_to_committed"])[0].0 - whole_before,
+            1
+        );
+        assert_eq!(
+            read_segments(&["commit_to_status_dequeued"])[0].0 - other_before,
+            1
+        );
+    }
+
+    #[test]
+    fn test_scheduler_queue_wait_labels() {
+        use std::{thread::sleep, time::Duration};
+        let _lock = TX_PIPELINE_SEGMENT_LOCK.lock().unwrap();
+        let wait = &crate::pipeline_metrics::SCHEDULER_QUEUE_WAIT_DURATION_US;
+        let read = |task: &str| {
+            let h = wait.with_label_values(&[task]);
+            (h.get_sample_count(), h.get_sample_sum())
+        };
+        let (blocked_count, blocked_sum) = read("blocked");
+        let (unblocked_count, _) = read("unblocked");
+
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(14, 0);
+        tracker.mark_tx_data_set([9u8; 64], 14, 0);
+        tracker.mark_tx_data_set([10u8; 64], 14, 0);
+        tracker.mark_tx_scheduled([9u8; 64]);
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_exec_started([9u8; 64], true);
+        // Not scheduled: no queue-wait sample.
+        tracker.mark_tx_exec_started([10u8; 64], false);
+        // Untracked signature: no-op.
+        tracker.mark_tx_exec_started([11u8; 64], false);
+
+        let (blocked_count_after, blocked_sum_after) = read("blocked");
+        assert_eq!(blocked_count_after - blocked_count, 1);
+        assert!(blocked_sum_after - blocked_sum >= 2_000.0);
+        assert_eq!(read("unblocked").0, unblocked_count);
+        let not_scheduled = tracker.tx_started.get(&[10u8; 64]).unwrap();
+        assert!(not_scheduled.exec_start.is_some());
+        drop(not_scheduled);
+        assert!(!tracker.tx_started.contains_key(&[11u8; 64]));
     }
 
     #[test]

@@ -4854,9 +4854,20 @@ impl Bank {
         } else {
             Self::cancelled_load_and_execute_tx_batch(batch)
         };
+        let executed_at = std::time::Instant::now();
         solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
             .with_label_values(&["execute"])
-            .observe(execute_start.elapsed().as_micros() as f64);
+            .observe(
+                executed_at
+                    .saturating_duration_since(execute_start)
+                    .as_micros() as f64,
+            );
+        // Ends the `exec_start_to_executed` tx_pipeline segment; a no-op for
+        // transactions the tracker doesn't know (everything but replay).
+        for transaction in batch.sanitized_transactions() {
+            solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                .mark_tx_executed((*transaction.signature()).into(), executed_at);
+        }
         execute_timings_before.observe_deltas(&ExecuteTimingsSnapshot::capture(timings));
 
         if let Some(pre_commit_callback) = pre_commit_callback {

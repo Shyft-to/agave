@@ -40,7 +40,9 @@ use {
         },
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
-    solana_runtime_transaction::runtime_transaction::ReplayTransaction,
+    solana_runtime_transaction::{
+        runtime_transaction::ReplayTransaction, transaction_with_meta::TransactionWithMeta,
+    },
     solana_svm_timings::ExecuteTimings,
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     solana_unified_scheduler_logic::{
@@ -683,6 +685,12 @@ impl TaskHandler for DefaultTaskHandler {
         );
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
     }
+}
+
+/// The transaction's signature as the pipeline-latency tracker's key. Generic so the supertrait
+/// providing `signature()` is reachable through the bound without another dependency.
+fn signature_bytes(transaction: &impl TransactionWithMeta) -> [u8; 64] {
+    (*transaction.signature()).into()
 }
 
 struct ExecutedTask {
@@ -1619,20 +1627,23 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                 };
 
                 loop {
-                    let (task, sender) = select_biased! {
+                    // `blocked`: the task came through the main runnable channel, which only
+                    // carries tasks the scheduler buffered behind account-lock conflicts
+                    // (schedule_next_unblocked_task); never-blocked ones come through aux.
+                    let (task, sender, blocked) = select_biased! {
                         recv(runnable_task_receiver.for_select()) -> message => {
                             let Ok(message) = message else {
                                 break;
                             };
                             if let Some(task) = runnable_task_receiver.after_select(message) {
-                                (task, &finished_blocked_task_sender)
+                                (task, &finished_blocked_task_sender, true)
                             } else {
                                 continue;
                             }
                         },
                         recv(runnable_task_receiver.aux_for_select()) -> task => {
                             if let Ok(task) = task {
-                                (task, &finished_idle_task_sender)
+                                (task, &finished_idle_task_sender, false)
                             } else {
                                 runnable_task_receiver.never_receive_from_aux();
                                 continue;
@@ -1656,6 +1667,8 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                             warn!("failed to notify a panic from {current_thread:?}");
                         }
                     }
+                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+                        .mark_tx_exec_started(signature_bytes(task.transaction()), blocked);
                     let mut task = ExecutedTask::new_boxed(task);
                     Self::execute_task_with_handler(
                         runnable_task_receiver.context(),
@@ -1941,6 +1954,9 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
         let task = SchedulingStateMachine::create_task(transaction, task_id, &mut |pubkey| {
             self.inner.usage_queue_loader.load(pubkey)
         });
+        // Must precede send_task(): a handler can start the task right after.
+        solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
+            .mark_tx_scheduled(signature_bytes(task.transaction()));
         self.inner.thread_manager.send_task(task)
     }
 

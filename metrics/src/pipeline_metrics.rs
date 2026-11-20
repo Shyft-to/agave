@@ -301,8 +301,9 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// Decomposes `agave_end_to_end_duration_us{path="tx_pipeline"}` into
 /// consecutive, non-overlapping segments, labeled by `segment`. They are
 /// observed per transaction from the SAME start instant and chained
-/// timestamps, so for any transaction the five segment values sum exactly to
-/// that transaction's `tx_pipeline` value (up to per-segment microsecond
+/// timestamps, so for any transaction the segments observed for it (eight,
+/// or five with the fallback below) sum exactly to that transaction's
+/// `tx_pipeline` value (up to per-segment microsecond
 /// truncation). Because of that, compare MEANS, not percentiles, when
 /// checking that they add up: `rate(..._sum)/rate(..._count)` per segment
 /// should sum to the same expression on `path="tx_pipeline"` (percentiles
@@ -313,22 +314,71 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// - `data_set_ready_to_replay_pickup`: sent -> `confirm_slot` consumed it
 ///   (replay loop wake-up, waiting for the bank to exist and the previous
 ///   data set to be processed).
-/// - `replay_pickup_to_committed`: consumed -> the transaction's batch was
-///   committed and queued for tx-status (scheduler dispatch, execution,
-///   commit).
+/// - `replay_pickup_to_scheduled`: consumed -> the replay thread sent the
+///   transaction's task to the unified scheduler
+///   (`PooledScheduler::schedule_execution`): replay-thread work before it
+///   (block-component checks, tick/hash validation, verification prep, and
+///   scheduling the data set's earlier transactions).
+/// - `scheduled_to_exec_start`: the scheduler queue -- channel transit, the
+///   scheduler thread, waiting for account locks held by earlier conflicting
+///   transactions, and waiting for a free handler thread. Split by cause in
+///   `SCHEDULER_QUEUE_WAIT_DURATION_US`.
+/// - `exec_start_to_executed`: a handler thread executing it (batch setup and
+///   SVM load-and-execute).
+/// - `executed_to_committed`: pre-commit check, commit, block cost check,
+///   vote/priority-fee bookkeeping, and queueing the tx-status batch.
 /// - `commit_to_status_dequeued`: tx-status channel wait.
 /// - `status_dequeued_to_notified`: tx-status service work before this
 ///   transaction's Geyser notification returned.
 ///
-/// Only transactions for which every checkpoint was recorded are observed
-/// here (live-replay path, data set starting on a tracked FEC boundary);
-/// `path="tx_pipeline"` itself also covers the rest, so
-/// `_count` of the segments can be lower than the total's `_count`.
+/// The four middle segments replaced `replay_pickup_to_committed` (consumed ->
+/// committed and queued for tx-status), which is still observed, INSTEAD of
+/// them, for a transaction missing any of their three stamps. That should be
+/// rare: a sustained nonzero `replay_pickup_to_committed` rate means a stamp
+/// is not being recorded. A few samples can also come from the same
+/// transaction replayed on two forks at once (the tracker is keyed by
+/// signature only, so the second fork's pickup resets the first's stamps).
+///
+/// Only transactions for which the data-set-ready and tx-status checkpoints
+/// were recorded are observed here (live-replay path, data set starting on a
+/// tracked FEC boundary, not replayed early); `path="tx_pipeline"` itself
+/// also covers the rest, so `_count` of the segments can be lower than the
+/// total's `_count`.
 pub static TX_PIPELINE_SEGMENT_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_tx_pipeline_segment_duration_us",
         "Segments of the per-transaction tx_pipeline latency, in microseconds",
         &["segment"],
+    )
+});
+
+/// Per transaction: the replay thread sending its task to the unified
+/// scheduler -> a handler thread starting to execute it (the same span as the
+/// `scheduled_to_exec_start` segment above), labeled by `task`:
+/// - `blocked`: the scheduler buffered the task because an earlier
+///   transaction held one of its account locks, and dispatched it once
+///   unblocked. Its wait includes the lock wait plus the handler wait after.
+/// - `unblocked`: the task got its locks when it reached the scheduler and was
+///   dispatched at once. Its wait is the channel transit plus waiting for a
+///   free handler thread (or for the scheduler thread itself).
+///
+/// The label comes from the channel the handler received the task on: in
+/// block verification the scheduler sends unblocked-later tasks on the
+/// runnable channel's main side and immediately runnable ones on its aux
+/// side (`schedule_next_unblocked_task` vs `schedule_or_buffer_task` in
+/// unified-scheduler-pool). Observed for every tracked transaction, including
+/// ones replayed early, so `_count` can exceed the segment's.
+///
+/// Reading it: `unblocked` waits large -> handler threads (or the scheduler
+/// thread) are saturated; `blocked` share and wait large while `unblocked`
+/// stays small -> account-lock conflicts (ordering); both small -> the wait
+/// is not in the scheduler.
+pub static SCHEDULER_QUEUE_WAIT_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_scheduler_queue_wait_duration_us",
+        "Unified scheduler queue wait per transaction, scheduled to execution start, by whether \
+         it was blocked on account locks, in microseconds",
+        &["task"],
     )
 });
 
