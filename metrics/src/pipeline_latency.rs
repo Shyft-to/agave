@@ -7,8 +7,12 @@
 //! crate doesn't need to depend on it.
 
 use {
-    crate::pipeline_metrics::{END_TO_END_DURATION_US, TX_PIPELINE_SEGMENT_DURATION_US},
+    crate::pipeline_metrics::{
+        EARLY_TX_PIPELINE_SEGMENT_DURATION_US, END_TO_END_DURATION_US,
+        TX_PIPELINE_SEGMENT_DURATION_US,
+    },
     dashmap::DashMap,
+    prometheus::HistogramVec,
     std::{
         sync::{
             LazyLock,
@@ -338,6 +342,10 @@ pub struct TxPipelineLatencyTracker {
     /// `(slot, data set start index)` -> instant the decoded data set was
     /// sent to ReplayStage. Only populated on the live-replay path.
     data_set_ready: DashMap<(u64, u32), Instant>,
+    /// `(slot, data set start index)` -> `(first entry, send instant)` of each
+    /// early chunk (partial data-set replay) sent to ReplayStage, in send
+    /// order with strictly increasing first entry.
+    data_set_chunk_ready: DashMap<(u64, u32), Vec<(usize, Instant)>>,
     /// Signature bytes -> checkpoints. Slot is kept alongside purely for
     /// age-based pruning, since this map isn't keyed by slot directly like
     /// the others in this file.
@@ -358,6 +366,9 @@ struct TxCheckpoints {
     executed: Option<Instant>,
     enqueued: Option<Instant>,
     dequeued: Option<Instant>,
+    /// Replayed early from a partial chunk (`ready` is the chunk's send
+    /// instant); its segments go to `EARLY_TX_PIPELINE_SEGMENT_DURATION_US`.
+    early: bool,
 }
 
 impl TxPipelineLatencyTracker {
@@ -365,6 +376,7 @@ impl TxPipelineLatencyTracker {
         Self {
             data_set_started: DashMap::new(),
             data_set_ready: DashMap::new(),
+            data_set_chunk_ready: DashMap::new(),
             tx_started: DashMap::new(),
             max_slot_seen: AtomicU64::new(0),
         }
@@ -454,9 +466,89 @@ impl TxPipelineLatencyTracker {
                     executed: None,
                     enqueued: None,
                     dequeued: None,
+                    early: false,
                 },
             );
         }
+    }
+
+    /// Records that window_service sent an early chunk (partial data-set
+    /// replay) of the data set starting at `start_index` to ReplayStage at
+    /// `sent_at`, holding the data set's entries from `first_entry` on. A
+    /// chunk whose `first_entry` is not past the last recorded one (the data
+    /// set's decoder was recreated and re-sent from an earlier entry, which
+    /// replay drops as stale) is ignored, so each entry keeps the instant it
+    /// was first sent.
+    pub fn mark_data_set_chunk_ready(
+        &self,
+        slot: u64,
+        start_index: u32,
+        first_entry: usize,
+        sent_at: Instant,
+    ) {
+        let mut chunks = self
+            .data_set_chunk_ready
+            .entry((slot, start_index))
+            .or_default();
+        if chunks.last().is_none_or(|(last, _)| first_entry > *last) {
+            chunks.push((first_entry, sent_at));
+        }
+    }
+
+    /// Like `mark_tx_data_set`, for a transaction replayed early from a
+    /// partial chunk: `entry_index` is its entry's position in the data set
+    /// starting at `start_index`, and its `ready` checkpoint is the send
+    /// instant of the chunk holding that entry (the latest recorded chunk
+    /// starting at or before it). A no-op if no start was recorded for the
+    /// data set; `ready` stays unset (no segments) if no chunk was recorded.
+    pub fn mark_tx_early(
+        &self,
+        signature: [u8; 64],
+        slot: u64,
+        start_index: u32,
+        entry_index: usize,
+    ) {
+        let Some(start) = self
+            .data_set_started
+            .get(&(slot, start_index))
+            .map(|start| *start)
+        else {
+            return;
+        };
+        let ready = self
+            .data_set_chunk_ready
+            .get(&(slot, start_index))
+            .and_then(|chunks| {
+                chunks
+                    .iter()
+                    .rev()
+                    .find(|(first_entry, _)| *first_entry <= entry_index)
+                    .map(|(_, sent_at)| *sent_at)
+            });
+        self.tx_started.insert(
+            signature,
+            TxCheckpoints {
+                slot,
+                start,
+                ready,
+                picked_up: Instant::now(),
+                scheduled: None,
+                exec_start: None,
+                executed: None,
+                enqueued: None,
+                dequeued: None,
+                early: true,
+            },
+        );
+    }
+
+    /// The `ready` checkpoint and early flag recorded for a tracked
+    /// transaction; for tests in other crates.
+    #[doc(hidden)]
+    pub fn tx_ready_for_tests(&self, signature: [u8; 64]) -> Option<(Option<Instant>, bool)> {
+        self.tx_started
+            .get(&signature)
+            .map(|checkpoints| (checkpoints.ready, checkpoints.early))
     }
 
     /// Called on the replay thread right before the transaction's task is
@@ -532,8 +624,13 @@ impl TxPipelineLatencyTracker {
         else {
             return;
         };
+        let segments: &HistogramVec = if checkpoints.early {
+            &EARLY_TX_PIPELINE_SEGMENT_DURATION_US
+        } else {
+            &TX_PIPELINE_SEGMENT_DURATION_US
+        };
         let observe = |segment: &str, from: Instant, to: Instant| {
-            TX_PIPELINE_SEGMENT_DURATION_US
+            segments
                 .with_label_values(&[segment])
                 .observe(to.saturating_duration_since(from).as_micros() as f64);
         };
@@ -566,6 +663,8 @@ impl TxPipelineLatencyTracker {
             .retain(|(entry_slot, _), _| *entry_slot >= cutoff);
         self.data_set_ready
             .retain(|(entry_slot, _), _| *entry_slot >= cutoff);
+        self.data_set_chunk_ready
+            .retain(|(entry_slot, _), _| *entry_slot >= cutoff);
         self.tx_started
             .retain(|_, checkpoints| checkpoints.slot >= cutoff);
     }
@@ -584,7 +683,8 @@ mod test {
     static PARENT_FROZEN_SPLIT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Serializes the tests that count samples they add to the global
-    /// `TX_PIPELINE_SEGMENT_DURATION_US` / `SCHEDULER_QUEUE_WAIT_DURATION_US`.
+    /// `TX_PIPELINE_SEGMENT_DURATION_US` / `EARLY_TX_PIPELINE_SEGMENT_DURATION_US`
+    /// / `SCHEDULER_QUEUE_WAIT_DURATION_US`.
     static TX_PIPELINE_SEGMENT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -858,6 +958,86 @@ mod test {
             read_segments(&["commit_to_status_dequeued"])[0].0 - other_before,
             1
         );
+    }
+
+    #[test]
+    fn test_tx_pipeline_early_ready_is_its_chunks_send_instant() {
+        use std::time::Duration;
+        let tracker = TxPipelineLatencyTracker::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1);
+        let t2 = t0 + Duration::from_millis(2);
+        tracker.mark_data_set_started(15, 32);
+        // Chunk A holds entries 0..3, chunk B entries 3.. of the data set.
+        tracker.mark_data_set_chunk_ready(15, 32, 0, t0);
+        tracker.mark_data_set_chunk_ready(15, 32, 3, t1);
+        // A re-sent chunk from an earlier entry keeps the first send instants.
+        tracker.mark_data_set_chunk_ready(15, 32, 0, t2);
+        for (signature, entry_index, ready) in [
+            ([20u8; 64], 0, t0),
+            ([21u8; 64], 2, t0),
+            ([22u8; 64], 3, t1),
+            ([23u8; 64], 7, t1),
+        ] {
+            tracker.mark_tx_early(signature, 15, 32, entry_index);
+            assert_eq!(
+                tracker.tx_ready_for_tests(signature),
+                Some((Some(ready), true)),
+                "entry {entry_index}"
+            );
+        }
+        // No chunk recorded for the data set: tracked, but without `ready`.
+        tracker.mark_data_set_started(15, 64);
+        tracker.mark_tx_early([24u8; 64], 15, 64, 0);
+        assert_eq!(tracker.tx_ready_for_tests([24u8; 64]), Some((None, true)));
+        // No start for the data set: not tracked.
+        tracker.mark_tx_early([25u8; 64], 15, 96, 0);
+        assert_eq!(tracker.tx_ready_for_tests([25u8; 64]), None);
+        // The whole-data-set path is not early.
+        tracker.mark_tx_data_set([26u8; 64], 15, 32);
+        assert_eq!(tracker.tx_ready_for_tests([26u8; 64]), Some((None, false)));
+    }
+
+    #[test]
+    fn test_tx_pipeline_early_segments_go_to_early_histogram() {
+        let _lock = TX_PIPELINE_SEGMENT_LOCK.lock().unwrap();
+        let segment_names = [
+            "fetch_to_data_set_ready",
+            "data_set_ready_to_replay_pickup",
+            "replay_pickup_to_scheduled",
+            "scheduled_to_exec_start",
+            "exec_start_to_executed",
+            "executed_to_committed",
+            "commit_to_status_dequeued",
+            "status_dequeued_to_notified",
+        ];
+        let read_early = || -> Vec<u64> {
+            segment_names
+                .iter()
+                .map(|name| {
+                    EARLY_TX_PIPELINE_SEGMENT_DURATION_US
+                        .with_label_values(&[name])
+                        .get_sample_count()
+                })
+                .collect()
+        };
+        let early_before = read_early();
+        let whole_before = read_segments(&segment_names);
+
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(16, 0);
+        tracker.mark_data_set_chunk_ready(16, 0, 0, Instant::now());
+        tracker.mark_tx_early([27u8; 64], 16, 0, 1);
+        tracker.mark_tx_scheduled([27u8; 64]);
+        tracker.mark_tx_exec_started([27u8; 64], false);
+        tracker.mark_tx_executed([27u8; 64], Instant::now());
+        tracker.mark_tx_status_received([27u8; 64], Instant::now());
+        tracker.mark_tx_notified([27u8; 64]);
+
+        for (before, after) in early_before.iter().zip(read_early()) {
+            assert_eq!(after - before, 1);
+        }
+        assert_eq!(read_segments(&segment_names), whole_before);
     }
 
     #[test]

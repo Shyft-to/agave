@@ -1411,6 +1411,14 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         // consistent. Note that unified scheduler will go
                         // into busy looping to seek lowest latency eventually. However, not now,
                         // to measure _actual_ cpu usage easily with the select approach.
+                        //
+                        // Arm order: finished blocked tasks, unblocked-task dispatch, finished idle
+                        // tasks, then new tasks. finished_idle sits above new_task so that the
+                        // completion of a conflict chain's first (idle) task is not queued behind a
+                        // burst of new tasks before its dependents are unblocked. Both finished arms
+                        // dispatch the tasks their completion unblocked right away (Ok results only;
+                        // an Err aborts below), so the unblocked-dispatch arm is now only a fallback
+                        // for anything left in the unblocked queue.
                         select_biased! {
                             recv(finished_blocked_task_receiver) -> receiver_result => {
                                 let handler_result = receiver_result.expect("alive handler");
@@ -1418,6 +1426,15 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                     break 'nonaborted_main_loop;
                                 };
                                 state_machine.deschedule_task(&executed_task.task);
+                                if executed_task.result_with_timings.0.is_ok() {
+                                    // Dispatch the tasks this completion unblocked before the
+                                    // result accounting and the task drop below, so they reach the
+                                    // handlers one step earlier. On Err nothing is dispatched here
+                                    // (the scheduler aborts right below, as before).
+                                    while let Some(task) = state_machine.schedule_next_unblocked_task() {
+                                        runnable_task_sender.send_payload(task).unwrap();
+                                    }
+                                }
 
                                 if Self::abort_or_accumulate_result_with_timings(
                                     &mut result_with_timings,
@@ -1433,6 +1450,26 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                     .schedule_next_unblocked_task()
                                     .expect("unblocked task");
                                 runnable_task_sender.send_payload(task).unwrap();
+                            },
+                            recv(finished_idle_task_receiver) -> receiver_result => {
+                                let handler_result = receiver_result.expect("alive handler");
+                                let Ok(executed_task) = handler_result else {
+                                    break 'nonaborted_main_loop;
+                                };
+                                state_machine.deschedule_task(&executed_task.task);
+                                if executed_task.result_with_timings.0.is_ok() {
+                                    // Same early dispatch as the finished_blocked arm above.
+                                    while let Some(task) = state_machine.schedule_next_unblocked_task() {
+                                        runnable_task_sender.send_payload(task).unwrap();
+                                    }
+                                }
+
+                                if Self::abort_or_accumulate_result_with_timings(
+                                    &mut result_with_timings,
+                                    executed_task,
+                                ) {
+                                    break 'nonaborted_main_loop;
+                                }
                             },
                             recv(new_task_receiver) -> message => {
                                 assert!(!session_ending);
@@ -1464,20 +1501,6 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                         // This short-circuiting is tested with test_scheduler_drop_short_circuiting.
                                         break 'nonaborted_main_loop;
                                     }
-                                }
-                            },
-                            recv(finished_idle_task_receiver) -> receiver_result => {
-                                let handler_result = receiver_result.expect("alive handler");
-                                let Ok(executed_task) = handler_result else {
-                                    break 'nonaborted_main_loop;
-                                };
-                                state_machine.deschedule_task(&executed_task.task);
-
-                                if Self::abort_or_accumulate_result_with_timings(
-                                    &mut result_with_timings,
-                                    executed_task,
-                                ) {
-                                    break 'nonaborted_main_loop;
                                 }
                             },
                         };

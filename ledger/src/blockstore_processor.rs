@@ -1746,17 +1746,22 @@ pub fn confirm_slot(
     }
     if slot != 0 && !slot_full && !partial_entries.is_empty() {
         let data_set_start = progress.num_shreds as u32;
+        // Data-set entry number of `partial_entries[0]`: `drain_ready` hands out
+        // partial entries only from here, the same numbering window_service's
+        // chunks (`first_entry`) use.
+        let first_entry = progress.partial_data_set_entries;
         let mut digest = progress.partial_data_set_digest;
         let mut num_txs = 0;
-        for entry in &partial_entries {
+        for (position, entry) in partial_entries.iter().enumerate() {
             digest = fold_entry_digest(digest, entry);
             num_txs += entry.transactions.len();
             for tx in &entry.transactions {
                 if let Some(signature) = tx.signatures().first() {
-                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY.mark_tx_data_set(
+                    solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY.mark_tx_early(
                         (*signature).into(),
                         slot,
                         data_set_start,
+                        first_entry + position,
                     );
                 }
             }
@@ -6998,6 +7003,124 @@ pub mod tests {
         assert!(most_replayed_early > 0);
         assert_eq!(progress.partial_data_set_entries, 0);
         assert_eq!(finish_partial_replay_bank(&bank, &mut progress), expected);
+    }
+
+    /// Each early-replayed transaction's tx_pipeline `ready` checkpoint is the
+    /// send instant of the window_service chunk that held it: replay numbers
+    /// partial entries from `progress.partial_data_set_entries` the same way
+    /// window_service numbers chunks (`first_entry`). Covers a chunk drained
+    /// in the same replay call as the previous data set's completion (the
+    /// count is reset within that call), and several chunks drained together.
+    #[test]
+    fn test_partial_data_set_replay_marks_early_txs_with_their_chunk() {
+        use {
+            crate::live_replay_entries::{LiveReplayMessage, PartialDataSetDecoder},
+            solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY,
+            std::{
+                thread::sleep,
+                time::{Duration, Instant},
+            },
+        };
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let (genesis_config, data_set_entries, data_sets) = build_partial_replay_slot(&blockstore);
+        let worker_pool = ReplayVerificationWorkerPool::new(1);
+        let generation = blockstore.meta(1).unwrap().unwrap().first_shred_timestamp;
+        let live = LiveReplayEntries::default();
+        let (bank, parent_hash, _pool) = new_partial_replay_bank(&genesis_config);
+        let mut progress = ConfirmationProgress::new(parent_hash);
+        let starts = data_set_starts(&data_sets);
+        let poll = |progress: &mut ConfirmationProgress| {
+            confirm_slot_for_partial_tests(&blockstore, &bank, progress, Some(&live), &worker_pool)
+                .unwrap();
+        };
+        // Asserts every tx of the given (data set, first entry, entries, sent)
+        // chunks got its own chunk's instant; returns how many txs it checked.
+        let check = |chunks: &[(usize, usize, usize, Instant)]| -> usize {
+            let mut checked = 0;
+            for &(i, first_entry, num_entries, sent_at) in chunks {
+                for entry in &data_set_entries[i][first_entry..first_entry + num_entries] {
+                    for tx in &entry.transactions {
+                        assert_eq!(
+                            TX_PIPELINE_LATENCY.tx_ready_for_tests(tx.signatures[0].into()),
+                            Some((Some(sent_at), true)),
+                            "data set {i}, chunk from entry {first_entry}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            checked
+        };
+
+        let mut checked_after_completion_same_call = 0;
+        let mut checked_chunk_groups = 0;
+        for (i, (payloads, start)) in data_sets.iter().zip(starts.iter().copied()).enumerate() {
+            // Payers are fresh keypairs, so these signatures are this test's
+            // own in the global tracker.
+            TX_PIPELINE_LATENCY.mark_data_set_started(1, start);
+            let mut decoder = PartialDataSetDecoder::new(start);
+            let mut chunks = vec![];
+            for payload in &payloads[..payloads.len() - 1] {
+                decoder.append(payload);
+                let Some((first_entry, entries)) = decoder.take_new_entries() else {
+                    continue;
+                };
+                // Distinct send instants per chunk.
+                sleep(Duration::from_micros(50));
+                let sent_at = Instant::now();
+                TX_PIPELINE_LATENCY.mark_data_set_chunk_ready(1, start, first_entry, sent_at);
+                chunks.push((i, first_entry, entries, sent_at));
+            }
+            let mut chunks = chunks.into_iter().map(|(i, first_entry, entries, sent_at)| {
+                let num_entries = entries.len();
+                live.push(LiveReplayMessage::PartialEntries {
+                    slot: 1,
+                    start,
+                    generation,
+                    first_entry,
+                    entries,
+                });
+                (i, first_entry, num_entries, sent_at)
+            });
+            // The previous data set's completion and this data set's first
+            // chunk are drained by the same replay call.
+            if i > 0 {
+                push_completed_data_set(&live, starts[i - 1], &data_sets[i - 1], false);
+            }
+            if let Some(first_chunk) = chunks.next() {
+                poll(&mut progress);
+                let checked = check(&[first_chunk]);
+                if i > 0 {
+                    checked_after_completion_same_call += checked;
+                }
+            } else if i > 0 {
+                poll(&mut progress);
+            }
+            // The rest are all queued (collecting pushes them), then drained by
+            // one replay call.
+            let rest: Vec<_> = chunks.collect();
+            if !rest.is_empty() {
+                poll(&mut progress);
+                check(&rest);
+                if rest.len() >= 2 {
+                    checked_chunk_groups += 1;
+                }
+            }
+        }
+        let last = data_sets.len() - 1;
+        push_completed_data_set(&live, starts[last], &data_sets[last], true);
+        poll(&mut progress);
+
+        assert!(
+            checked_after_completion_same_call > 0,
+            "no chunk drained with the previous data set's completion"
+        );
+        assert!(
+            checked_chunk_groups > 0,
+            "no data set had two chunks drained by one call"
+        );
+        finish_partial_replay_bank(&bank, &mut progress);
     }
 
     #[test]

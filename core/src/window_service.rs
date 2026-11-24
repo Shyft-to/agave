@@ -379,6 +379,14 @@ impl ShredPayloadCache {
                     .with_label_values(&["entries_sent"])
                     .inc_by(entries.len() as u64);
                 entry.first_sent.get_or_insert_with(Instant::now);
+                // `ready` point of the early-replayed txs in this chunk (taken
+                // before the send, so it never follows replay's pickup).
+                solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY.mark_data_set_chunk_ready(
+                    slot,
+                    start,
+                    first_entry,
+                    Instant::now(),
+                );
                 let _ = live_replay_sender.send(LiveReplayMessage::PartialEntries {
                     slot,
                     start,

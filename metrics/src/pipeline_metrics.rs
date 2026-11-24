@@ -341,13 +341,40 @@ pub static END_TO_END_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
 ///
 /// Only transactions for which the data-set-ready and tx-status checkpoints
 /// were recorded are observed here (live-replay path, data set starting on a
-/// tracked FEC boundary, not replayed early); `path="tx_pipeline"` itself
-/// also covers the rest, so `_count` of the segments can be lower than the
-/// total's `_count`.
+/// tracked FEC boundary, replayed with their whole data set);
+/// `path="tx_pipeline"` itself also covers the rest, so `_count` of the
+/// segments can be lower than the total's `_count`. Transactions replayed
+/// early (partial data-set replay) are observed in
+/// `EARLY_TX_PIPELINE_SEGMENT_DURATION_US` instead, never here.
 pub static TX_PIPELINE_SEGMENT_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec(
         "agave_tx_pipeline_segment_duration_us",
         "Segments of the per-transaction tx_pipeline latency, in microseconds",
+        &["segment"],
+    )
+});
+
+/// The same per-transaction segments as `TX_PIPELINE_SEGMENT_DURATION_US`,
+/// for transactions replayed early (partial data-set replay,
+/// `AGAVE_PARTIAL_DATA_SET_REPLAY=1`): their entries were sent to replay in a
+/// chunk before the data set completed. The difference is the `ready` point:
+/// - `fetch_to_data_set_ready`: data set's first shred fetched -> window_service
+///   sent the early chunk holding this transaction to ReplayStage;
+/// - `data_set_ready_to_replay_pickup`: that chunk sent -> `confirm_slot`
+///   replayed it.
+///
+/// All later segments are as in `TX_PIPELINE_SEGMENT_DURATION_US`, and the
+/// segments still sum to the transaction's `tx_pipeline` value. Same coverage
+/// rule as the whole path: only transactions whose data set starts on a
+/// tracked FEC boundary have a start, so early transactions in a data set
+/// starting mid-FEC-set get no segments. The two histograms' counts add up to
+/// the transactions with a full breakdown; combine their `_sum`/`_count` for
+/// the mean over all transactions.
+pub static EARLY_TX_PIPELINE_SEGMENT_DURATION_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_tx_pipeline_early_segment_duration_us",
+        "Segments of the per-transaction tx_pipeline latency for transactions replayed early \
+         (partial data-set replay), in microseconds",
         &["segment"],
     )
 });
