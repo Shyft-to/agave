@@ -4885,9 +4885,17 @@ impl Bank {
         } else {
             Self::create_commit_results(processing_results)
         };
+        let committed_at = std::time::Instant::now();
         solana_metrics::pipeline_metrics::REPLAY_STAGE_DURATION_US
             .with_label_values(&["commit"])
-            .observe(commit_start.elapsed().as_micros() as f64);
+            .observe(
+                committed_at
+                    .saturating_duration_since(commit_start)
+                    .as_micros() as f64,
+            );
+        // Read back by the unified scheduler handler on this same thread
+        // (`agave_scheduler_blocked_wait_split_us`).
+        solana_metrics::pipeline_latency::set_committed_on_this_thread(committed_at);
         drop(execution_guard);
         Ok((commit_results, balance_collector))
     }

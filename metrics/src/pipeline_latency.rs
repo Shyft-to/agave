@@ -9,10 +9,10 @@
 use {
     crate::pipeline_metrics::{
         EARLY_TX_PIPELINE_SEGMENT_DURATION_US, END_TO_END_DURATION_US,
-        TX_PIPELINE_SEGMENT_DURATION_US,
+        SCHEDULER_BLOCKED_WAIT_SPLIT_US, TX_PIPELINE_SEGMENT_DURATION_US,
     },
     dashmap::DashMap,
-    prometheus::HistogramVec,
+    prometheus::{Histogram, HistogramVec},
     std::{
         sync::{
             LazyLock,
@@ -21,6 +21,19 @@ use {
         time::Instant,
     },
 };
+
+/// `SCHEDULER_BLOCKED_WAIT_SPLIT_US` children in telescoping order, resolved
+/// once: they are observed on the handler thread right before execution, so
+/// per-call label lookups would delay the next transaction in a conflict chain.
+static BLOCKED_WAIT_SPLIT_PARTS: LazyLock<[Histogram; 4]> = LazyLock::new(|| {
+    [
+        "predecessor_running",
+        "post_commit",
+        "return_hop",
+        "dispatch",
+    ]
+    .map(|part| SCHEDULER_BLOCKED_WAIT_SPLIT_US.with_label_values(&[part]))
+});
 
 /// Tracked start timestamps for slots more than this many slots behind the
 /// highest slot seen are dropped, so forks/dead slots don't leak memory.
@@ -567,17 +580,50 @@ impl TxPipelineLatencyTracker {
     /// scheduled. Also observes `SCHEDULER_QUEUE_WAIT_DURATION_US` for it when
     /// `mark_tx_scheduled` was recorded. A no-op for untracked signatures.
     pub fn mark_tx_exec_started(&self, signature: [u8; 64], blocked: bool) {
+        self.mark_tx_exec_started_with_handoff(signature, blocked, None);
+    }
+
+    /// Like `mark_tx_exec_started`, plus, for a blocked transaction whose
+    /// unblocking predecessor's stamps arrived with it (`handoff`), observes
+    /// `SCHEDULER_BLOCKED_WAIT_SPLIT_US`: the queue wait split into
+    /// `predecessor_running`, `post_commit`, `return_hop` and `dispatch`,
+    /// each boundary clamped between the previous one and this execution
+    /// start, so the parts telescope to the queue-wait sample observed here.
+    pub fn mark_tx_exec_started_with_handoff(
+        &self,
+        signature: [u8; 64],
+        blocked: bool,
+        handoff: Option<PredecessorHandoff>,
+    ) {
         let Some(mut checkpoints) = self.tx_started.get_mut(&signature) else {
             return;
         };
         let now = Instant::now();
         checkpoints.exec_start = Some(now);
         let scheduled = checkpoints.scheduled;
+        // Never hold this guard while observing or touching other entries.
         drop(checkpoints);
-        if let Some(scheduled) = scheduled {
-            crate::pipeline_metrics::SCHEDULER_QUEUE_WAIT_DURATION_US
-                .with_label_values(&[if blocked { "blocked" } else { "unblocked" }])
-                .observe(now.saturating_duration_since(scheduled).as_micros() as f64);
+        let Some(scheduled) = scheduled else {
+            return;
+        };
+        crate::pipeline_metrics::SCHEDULER_QUEUE_WAIT_DURATION_US
+            .with_label_values(&[if blocked { "blocked" } else { "unblocked" }])
+            .observe(now.saturating_duration_since(scheduled).as_micros() as f64);
+        if blocked
+            && let Some(handoff) = handoff
+            && let Some(committed) = handoff.committed
+        {
+            let mut previous = scheduled;
+            for (histogram, at) in BLOCKED_WAIT_SPLIT_PARTS.iter().zip([
+                committed,
+                handoff.handed_back,
+                handoff.unblocked,
+                now,
+            ]) {
+                let at = at.max(previous).min(now);
+                histogram.observe(at.saturating_duration_since(previous).as_micros() as f64);
+                previous = at;
+            }
         }
     }
 
@@ -672,6 +718,37 @@ impl TxPipelineLatencyTracker {
 
 pub static TX_PIPELINE_LATENCY: LazyLock<TxPipelineLatencyTracker> =
     LazyLock::new(TxPipelineLatencyTracker::new);
+
+/// Stamps of the transaction that just unblocked a blocked one, carried by
+/// the unified scheduler from the predecessor's completion to the blocked
+/// transaction's handler (see `SCHEDULER_BLOCKED_WAIT_SPLIT_US`).
+#[derive(Clone, Copy, Debug)]
+pub struct PredecessorHandoff {
+    /// The predecessor's commit finished (`None` if not stamped).
+    pub committed: Option<Instant>,
+    /// The predecessor's handler sent its task back to the scheduler.
+    pub handed_back: Instant,
+    /// The scheduler thread unblocked the successor.
+    pub unblocked: Instant,
+}
+
+thread_local! {
+    static COMMITTED_ON_THIS_THREAD: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Records when the batch being executed on this thread finished its commit.
+/// Set by the bank's execute-and-commit path, read back by the unified
+/// scheduler handler on the same thread right after execution, so it never
+/// races with the tracker entry being removed elsewhere.
+pub fn set_committed_on_this_thread(at: Instant) {
+    COMMITTED_ON_THIS_THREAD.with(|committed| committed.set(Some(at)));
+}
+
+/// Takes (and clears) the commit instant recorded on this thread.
+pub fn take_committed_on_this_thread() -> Option<Instant> {
+    COMMITTED_ON_THIS_THREAD.with(|committed| committed.take())
+}
 
 #[cfg(test)]
 mod test {
@@ -1072,6 +1149,135 @@ mod test {
         assert!(not_scheduled.exec_start.is_some());
         drop(not_scheduled);
         assert!(!tracker.tx_started.contains_key(&[11u8; 64]));
+    }
+
+    const BLOCKED_SPLIT_PARTS: [&str; 4] = [
+        "predecessor_running",
+        "post_commit",
+        "return_hop",
+        "dispatch",
+    ];
+
+    fn read_blocked_split() -> Vec<(u64, f64)> {
+        BLOCKED_SPLIT_PARTS
+            .iter()
+            .map(|part| {
+                let h = crate::pipeline_metrics::SCHEDULER_BLOCKED_WAIT_SPLIT_US
+                    .with_label_values(&[part]);
+                (h.get_sample_count(), h.get_sample_sum())
+            })
+            .collect()
+    }
+
+    fn read_blocked_wait() -> (u64, f64) {
+        let h = crate::pipeline_metrics::SCHEDULER_QUEUE_WAIT_DURATION_US
+            .with_label_values(&["blocked"]);
+        (h.get_sample_count(), h.get_sample_sum())
+    }
+
+    #[test]
+    fn test_blocked_wait_split_telescopes_to_the_queue_wait() {
+        use std::{thread::sleep, time::Duration};
+        let _lock = TX_PIPELINE_SEGMENT_LOCK.lock().unwrap();
+        let split_before = read_blocked_split();
+        let (wait_count_before, wait_sum_before) = read_blocked_wait();
+
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(17, 0);
+        tracker.mark_tx_data_set([30u8; 64], 17, 0);
+        tracker.mark_tx_scheduled([30u8; 64]);
+        sleep(Duration::from_millis(2));
+        let committed = Instant::now();
+        sleep(Duration::from_millis(2));
+        let handed_back = Instant::now();
+        sleep(Duration::from_millis(2));
+        let unblocked = Instant::now();
+        sleep(Duration::from_millis(2));
+        tracker.mark_tx_exec_started_with_handoff(
+            [30u8; 64],
+            true,
+            Some(PredecessorHandoff {
+                committed: Some(committed),
+                handed_back,
+                unblocked,
+            }),
+        );
+
+        let split_after = read_blocked_split();
+        let mut split_total = 0.0;
+        for ((count_before, sum_before), (count_after, sum_after)) in
+            split_before.iter().zip(&split_after)
+        {
+            assert_eq!(count_after - count_before, 1);
+            let delta = sum_after - sum_before;
+            assert!(delta >= 2_000.0, "each part spans a 2ms sleep: {delta}");
+            split_total += delta;
+        }
+        let (wait_count_after, wait_sum_after) = read_blocked_wait();
+        assert_eq!(wait_count_after - wait_count_before, 1);
+        let wait = wait_sum_after - wait_sum_before;
+        // Same end instant; only per-part microsecond truncation differs.
+        assert!((wait - split_total).abs() <= 4.0, "{split_total} vs {wait}");
+    }
+
+    #[test]
+    fn test_blocked_wait_split_clamps_and_skips() {
+        let _lock = TX_PIPELINE_SEGMENT_LOCK.lock().unwrap();
+        let tracker = TxPipelineLatencyTracker::new();
+        tracker.mark_data_set_started(18, 0);
+        for signature in [[31u8; 64], [32u8; 64], [33u8; 64], [34u8; 64]] {
+            tracker.mark_tx_data_set(signature, 18, 0);
+        }
+        // Predecessor stamps older than this tx's own scheduled stamp: all
+        // but the last part are clamped to 0, and the parts still telescope.
+        let stale = Instant::now();
+        let handoff = PredecessorHandoff {
+            committed: Some(stale),
+            handed_back: stale,
+            unblocked: stale,
+        };
+        tracker.mark_tx_scheduled([31u8; 64]);
+        let before = read_blocked_split();
+        tracker.mark_tx_exec_started_with_handoff([31u8; 64], true, Some(handoff));
+        let after = read_blocked_split();
+        for (part, (before, after)) in BLOCKED_SPLIT_PARTS.iter().zip(before.iter().zip(&after)) {
+            assert_eq!(after.0 - before.0, 1, "{part}");
+            if *part != "dispatch" {
+                assert_eq!(after.1 - before.1, 0.0, "{part} clamped to 0");
+            }
+        }
+
+        // No split: not blocked, no handoff, or no predecessor commit stamp.
+        let before = read_blocked_split();
+        tracker.mark_tx_scheduled([32u8; 64]);
+        tracker.mark_tx_exec_started_with_handoff([32u8; 64], false, Some(handoff));
+        tracker.mark_tx_scheduled([33u8; 64]);
+        tracker.mark_tx_exec_started_with_handoff([33u8; 64], true, None);
+        tracker.mark_tx_scheduled([34u8; 64]);
+        tracker.mark_tx_exec_started_with_handoff(
+            [34u8; 64],
+            true,
+            Some(PredecessorHandoff {
+                committed: None,
+                ..handoff
+            }),
+        );
+        assert_eq!(read_blocked_split(), before);
+    }
+
+    #[test]
+    fn test_committed_on_this_thread_is_taken_once() {
+        assert_eq!(take_committed_on_this_thread(), None);
+        let at = Instant::now();
+        set_committed_on_this_thread(at);
+        assert_eq!(take_committed_on_this_thread(), Some(at));
+        assert_eq!(take_committed_on_this_thread(), None);
+        // Thread-local: another thread doesn't see it.
+        set_committed_on_this_thread(at);
+        std::thread::spawn(|| assert_eq!(take_committed_on_this_thread(), None))
+            .join()
+            .unwrap();
+        assert_eq!(take_committed_on_this_thread(), Some(at));
     }
 
     #[test]

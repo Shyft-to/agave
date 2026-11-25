@@ -409,6 +409,35 @@ pub static SCHEDULER_QUEUE_WAIT_DURATION_US: LazyLock<HistogramVec> = LazyLock::
     )
 });
 
+/// Splits a BLOCKED transaction's `SCHEDULER_QUEUE_WAIT_DURATION_US` sample at
+/// the predecessor whose completion unblocked it (the last conflicting
+/// transaction ahead of it), labeled by `part`, in order:
+/// - `predecessor_running`: scheduled -> that predecessor's commit finished
+///   (it, and anything it waited for, was still running);
+/// - `post_commit`: -> the predecessor's handler handed its task back to the
+///   scheduler (block cost check, vote send, priority-fee cache update,
+///   building and sending the transaction-status batch: what an earlier
+///   hand-back would remove);
+/// - `return_hop`: -> the scheduler thread unblocked this transaction
+///   (handler -> scheduler channel, scheduler wake-up, `deschedule_task`);
+/// - `dispatch`: -> a handler thread started executing it (runnable channel,
+///   handler wake-up).
+///
+/// Each boundary is clamped to lie between the previous one and the
+/// execution start, starting from the transaction's own scheduled stamp, so
+/// for one transaction the four parts sum to its blocked queue wait (up to
+/// microsecond truncation, at most a few us). Observed only for tracked
+/// transactions whose predecessor's commit stamp was taken; compare `_count`
+/// with the blocked queue-wait `_count` for coverage.
+pub static SCHEDULER_BLOCKED_WAIT_SPLIT_US: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec(
+        "agave_scheduler_blocked_wait_split_us",
+        "Blocked transaction's scheduler queue wait split at the predecessor that unblocked it, \
+         in microseconds",
+        &["part"],
+    )
+});
+
 /// Splits the `fetch_to_data_set_ready` span per DATA SET (one observation
 /// per data set handed to replay, not per transaction), labeled by `phase`
 /// and `origin`. For a data set the two phases sum to its

@@ -27,6 +27,7 @@ use {
     log::*,
     scopeguard::defer,
     solana_clock::Slot,
+    solana_metrics::pipeline_latency::PredecessorHandoff,
     solana_pubkey::Pubkey,
     solana_runtime::{
         installed_scheduler_pool::{
@@ -696,6 +697,10 @@ fn signature_bytes(transaction: &impl TransactionWithMeta) -> [u8; 64] {
 struct ExecutedTask {
     task: Task,
     result_with_timings: ResultWithTimings,
+    /// When this task's commit finished, on the handler (metrics only).
+    committed: Option<Instant>,
+    /// When the handler sent this task back to the scheduler (metrics only).
+    handed_back: Option<Instant>,
 }
 
 impl ExecutedTask {
@@ -703,6 +708,8 @@ impl ExecutedTask {
         Box::new(Self {
             task,
             result_with_timings: initialized_result_with_timings(),
+            committed: None,
+            handed_back: None,
         })
     }
 
@@ -1167,6 +1174,28 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         session_ending && state_machine.has_no_active_task()
     }
 
+    /// The finished `executed_task`'s stamps, to send with the tasks its completion just unblocked
+    /// (metrics only, `agave_scheduler_blocked_wait_split_us`). Takes one clock read on the
+    /// scheduler thread, and only when something was unblocked. `had_unblocked_task` is the
+    /// queue state before `deschedule_task`: if tasks were already waiting there (not unblocked by
+    /// this completion), nothing gets a handoff rather than being credited to this predecessor.
+    fn predecessor_handoff(
+        state_machine: &SchedulingStateMachine,
+        had_unblocked_task: bool,
+        executed_task: &ExecutedTask,
+    ) -> Option<PredecessorHandoff> {
+        if had_unblocked_task || !state_machine.has_unblocked_task() {
+            return None;
+        }
+        executed_task
+            .handed_back
+            .map(|handed_back| PredecessorHandoff {
+                committed: executed_task.committed,
+                handed_back,
+                unblocked: Instant::now(),
+            })
+    }
+
     /// Returns `true` if the caller should abort.
     #[must_use]
     fn abort_or_accumulate_result_with_timings(
@@ -1304,8 +1333,12 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         // another blocking new task is arriving to finalize the tentatively extended
         // prioritization further. Consequently, this also contributes to alleviate the known
         // heuristic's caveat for the first task of linearized runs, which is described above.
-        let (mut runnable_task_sender, runnable_task_receiver) =
-            chained_channel::unbounded::<Task, SchedulingContext>(context);
+        // Each runnable task carries, when it was unblocked by a completion, that predecessor's
+        // stamps for `agave_scheduler_blocked_wait_split_us` (metrics only).
+        let (mut runnable_task_sender, runnable_task_receiver) = chained_channel::unbounded::<
+            (Task, Option<PredecessorHandoff>),
+            SchedulingContext,
+        >(context);
         // Create two handler-to-scheduler channels to prioritize the finishing of blocked tasks,
         // because it is more likely that a blocked task will have more blocked tasks behind it,
         // which should be scheduled while minimizing the delay to clear buffered linearized runs
@@ -1425,14 +1458,16 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let Ok(executed_task) = handler_result else {
                                     break 'nonaborted_main_loop;
                                 };
+                                let had_unblocked_task = state_machine.has_unblocked_task();
                                 state_machine.deschedule_task(&executed_task.task);
                                 if executed_task.result_with_timings.0.is_ok() {
                                     // Dispatch the tasks this completion unblocked before the
                                     // result accounting and the task drop below, so they reach the
                                     // handlers one step earlier. On Err nothing is dispatched here
                                     // (the scheduler aborts right below, as before).
+                                    let handoff = Self::predecessor_handoff(&state_machine, had_unblocked_task, &executed_task);
                                     while let Some(task) = state_machine.schedule_next_unblocked_task() {
-                                        runnable_task_sender.send_payload(task).unwrap();
+                                        runnable_task_sender.send_payload((task, handoff)).unwrap();
                                     }
                                 }
 
@@ -1449,18 +1484,20 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let task = state_machine
                                     .schedule_next_unblocked_task()
                                     .expect("unblocked task");
-                                runnable_task_sender.send_payload(task).unwrap();
+                                runnable_task_sender.send_payload((task, None)).unwrap();
                             },
                             recv(finished_idle_task_receiver) -> receiver_result => {
                                 let handler_result = receiver_result.expect("alive handler");
                                 let Ok(executed_task) = handler_result else {
                                     break 'nonaborted_main_loop;
                                 };
+                                let had_unblocked_task = state_machine.has_unblocked_task();
                                 state_machine.deschedule_task(&executed_task.task);
                                 if executed_task.result_with_timings.0.is_ok() {
                                     // Same early dispatch as the finished_blocked arm above.
+                                    let handoff = Self::predecessor_handoff(&state_machine, had_unblocked_task, &executed_task);
                                     while let Some(task) = state_machine.schedule_next_unblocked_task() {
-                                        runnable_task_sender.send_payload(task).unwrap();
+                                        runnable_task_sender.send_payload((task, handoff)).unwrap();
                                     }
                                 }
 
@@ -1480,7 +1517,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                         sleepless_testing::at(CheckPoint::NewTask(task_id));
 
                                         if let Some(task) = state_machine.schedule_or_buffer_task(task, session_ending) {
-                                            runnable_task_sender.send_aux_payload(task).unwrap();
+                                            runnable_task_sender.send_aux_payload((task, None)).unwrap();
                                         } else {
                                             sleepless_testing::at(CheckPoint::BufferedOrDroppedTask(task_id));
                                         }
@@ -1653,20 +1690,20 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                     // `blocked`: the task came through the main runnable channel, which only
                     // carries tasks the scheduler buffered behind account-lock conflicts
                     // (schedule_next_unblocked_task); never-blocked ones come through aux.
-                    let (task, sender, blocked) = select_biased! {
+                    let ((task, handoff), sender, blocked) = select_biased! {
                         recv(runnable_task_receiver.for_select()) -> message => {
                             let Ok(message) = message else {
                                 break;
                             };
-                            if let Some(task) = runnable_task_receiver.after_select(message) {
-                                (task, &finished_blocked_task_sender, true)
+                            if let Some(payload) = runnable_task_receiver.after_select(message) {
+                                (payload, &finished_blocked_task_sender, true)
                             } else {
                                 continue;
                             }
                         },
-                        recv(runnable_task_receiver.aux_for_select()) -> task => {
-                            if let Ok(task) = task {
-                                (task, &finished_idle_task_sender, false)
+                        recv(runnable_task_receiver.aux_for_select()) -> payload => {
+                            if let Ok(payload) = payload {
+                                (payload, &finished_idle_task_sender, false)
                             } else {
                                 runnable_task_receiver.never_receive_from_aux();
                                 continue;
@@ -1691,13 +1728,23 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         }
                     }
                     solana_metrics::pipeline_latency::TX_PIPELINE_LATENCY
-                        .mark_tx_exec_started(signature_bytes(task.transaction()), blocked);
+                        .mark_tx_exec_started_with_handoff(
+                            signature_bytes(task.transaction()),
+                            blocked,
+                            handoff,
+                        );
                     let mut task = ExecutedTask::new_boxed(task);
+                    // Drop any stale commit stamp (e.g. from a task that failed before its
+                    // commit) so only this task's commit is read below.
+                    let _ = solana_metrics::pipeline_latency::take_committed_on_this_thread();
                     Self::execute_task_with_handler(
                         runnable_task_receiver.context(),
                         &mut task,
                         &handler_context,
                     );
+                    task.committed =
+                        solana_metrics::pipeline_latency::take_committed_on_this_thread();
+                    task.handed_back = Some(Instant::now());
                     if sender.send(Ok(task)).is_err() {
                         warn!("handler_thread: scheduler thread aborted...");
                         break;
