@@ -113,7 +113,13 @@ pub fn get_mock_program_runtime_environment() -> ProgramRuntimeEnvironment {
         .clone()
 }
 
-pub const MAX_LOADED_ENTRY_COUNT: usize = 1024;
+/// Maximum number of verified and compiled (`Loaded`) entries kept in the
+/// global cache; eviction shrinks it to 90% of this after a batch loads a
+/// missing program. Raised from 1024 to fit more of the programs in use on
+/// mainnet, so fewer get recompiled on the replay path. It bounds entries, not
+/// bytes: watch the process RSS when changing it. Also sets the length of the
+/// epoch-boundary recompilation window (`min(this, slots_in_epoch) / 2`).
+pub const MAX_LOADED_ENTRY_COUNT: usize = 4096;
 pub const MAX_TOMBSTONE_AGE_IN_SLOTS: u64 = 2250; // 15 Minutes at 400ms slot time
 
 /// A percentage, expected to be in the range `0..=100`.
@@ -157,9 +163,9 @@ pub struct EpochBoundaryPreparation {
     /// Anticipated replacement for `environments` at the next epoch
     ///
     /// This is only `Some` around the boundaries when a changed environment is
-    /// actually coming. It starts with the cache preparation phase a few
-    /// hundred slots before the epoch boundary, and it ends with the first
-    /// rerooting after the epoch boundary.
+    /// actually coming. It starts with the cache preparation phase
+    /// `min(MAX_LOADED_ENTRY_COUNT, slots_in_epoch) / 2` slots before the epoch
+    /// boundary, and it ends with the first rerooting after the epoch boundary.
     pub upcoming_environment: Option<ProgramRuntimeEnvironment>,
     /// List of loaded programs which should be recompiled before the next epoch (but don't have to).
     pub programs_to_recompile: Vec<(Pubkey, Arc<ProgramCacheEntry>)>,
@@ -960,9 +966,10 @@ pub(crate) mod tests {
     use {
         crate::{
             loaded_programs::{
-                BlockRelation, ForkGraph, IndexImplementation, MAX_TOMBSTONE_AGE_IN_SLOTS, Percent,
-                ProgramCache, ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramToLoad,
-                get_mock_program_runtime_environment,
+                BlockRelation, ForkGraph, IndexImplementation, MAX_LOADED_ENTRY_COUNT,
+                MAX_TOMBSTONE_AGE_IN_SLOTS, Percent, ProgramCache, ProgramCacheForTxBatch,
+                ProgramRuntimeEnvironment, ProgramToLoad, get_mock_program_runtime_environment,
+                percent_of_max_entries,
             },
             program_cache_entry::{
                 ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
@@ -1146,6 +1153,58 @@ pub(crate) mod tests {
         }
     }
 
+    /// Adds `count` loaded programs, each at its own address, with a usage
+    /// count far above the programs the eviction tests deploy, so a shrink to a
+    /// percentage of `MAX_LOADED_ENTRY_COUNT` evicts a fixed number of the test's
+    /// own entries whatever the capacity is.
+    fn add_filler_loaded_programs(cache: &mut ProgramCache<TestForkGraph>, count: usize) {
+        let env = get_mock_program_runtime_environment();
+        for _ in 0..count {
+            let stats = ProgramStatistics {
+                uses: 1_000_000.into(),
+                ..Default::default()
+            };
+            cache.assign_program(
+                &env,
+                Pubkey::new_unique(),
+                0,
+                new_test_entry_with_usage(0, stats),
+            );
+        }
+    }
+
+    /// Fillers needed so that shrinking to `eviction_pct` unloads exactly 3
+    /// loaded entries (13 deployed by the eviction tests plus the fillers).
+    /// `sort_and_unload` then unloads the 3 lowest-usage test entries; random
+    /// eviction may pick fillers too, so its test only checks the counts.
+    fn num_fillers_to_evict_three(eviction_pct: Percent) -> usize {
+        percent_of_max_entries(eviction_pct)
+            .saturating_add(3)
+            .saturating_sub(13)
+    }
+
+    #[test]
+    fn test_random_eviction_at_capacity() {
+        let mut cache = ProgramCache::<TestForkGraph>::new(0);
+        let num_loaded = MAX_LOADED_ENTRY_COUNT.saturating_add(10);
+        add_filler_loaded_programs(&mut cache, num_loaded);
+
+        cache.evict_using_random_selection(90, 0);
+
+        let num_loaded_after = num_matching_entries(&cache, |program_type| {
+            matches!(program_type, ProgramCacheEntryType::Loaded(_))
+        });
+        assert_eq!(num_loaded_after, percent_of_max_entries(90));
+        assert_eq!(
+            cache.stats.water_level.load(Ordering::Relaxed),
+            num_loaded as u64
+        );
+        assert_eq!(
+            cache.stats.evictions.values().sum::<u64>(),
+            num_loaded.saturating_sub(percent_of_max_entries(90)) as u64
+        );
+    }
+
     #[test]
     fn test_random_eviction() {
         let mut programs = vec![];
@@ -1182,8 +1241,14 @@ pub(crate) mod tests {
             &mut programs,
         );
 
-        // 1 for each deployment slot
-        let num_loaded_expected = 13;
+        // Enough high-usage fillers that shrinking to 1% of the capacity
+        // unloads exactly 3 entries.
+        let eviction_pct: Percent = 1;
+        let num_fillers = num_fillers_to_evict_three(eviction_pct);
+        add_filler_loaded_programs(&mut cache, num_fillers);
+
+        // 1 for each deployment slot, plus the fillers
+        let num_loaded_expected = 13usize.saturating_add(num_fillers);
         // 10 for each program
         let num_unloaded_expected = 30;
         // 10 for each program
@@ -1212,7 +1277,6 @@ pub(crate) mod tests {
         assert_eq!(num_tombstones, num_tombstones_expected);
 
         // Evict entries from the cache
-        let eviction_pct: Percent = 1;
 
         let num_loaded_expected = crate::loaded_programs::percent_of_max_entries(eviction_pct);
         let num_unloaded_expected = num_unloaded_expected + num_loaded - num_loaded_expected;
@@ -1269,8 +1333,14 @@ pub(crate) mod tests {
             &mut programs,
         );
 
-        // 1 for each deployment slot
-        let num_loaded_expected = 13;
+        // Enough high-usage fillers that shrinking to 1% of the capacity
+        // unloads exactly 3 entries.
+        let eviction_pct: Percent = 1;
+        let num_fillers = num_fillers_to_evict_three(eviction_pct);
+        add_filler_loaded_programs(&mut cache, num_fillers);
+
+        // 1 for each deployment slot, plus the fillers
+        let num_loaded_expected = 13usize.saturating_add(num_fillers);
         // 10 for each program
         let num_unloaded_expected = 30;
         // 10 for each program
@@ -1294,7 +1364,6 @@ pub(crate) mod tests {
         assert_eq!(num_tombstones, num_tombstones_expected);
 
         // Evict entries from the cache
-        let eviction_pct: Percent = 1;
 
         let num_loaded_expected = crate::loaded_programs::percent_of_max_entries(eviction_pct);
         let num_unloaded_expected = num_unloaded_expected + num_loaded - num_loaded_expected;

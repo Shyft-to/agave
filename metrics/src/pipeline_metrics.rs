@@ -669,3 +669,51 @@ pub static REPLAY_VERIFICATION_QUEUE_FULL_TOTAL: LazyLock<IntCounter> = LazyLock
         "Replay waits for verification results because the result channel was full",
     )
 });
+
+/// Global program (JIT) cache events, from the cache's own `ProgramCacheStats`
+/// counters, which are taken and reset at each bank creation and added here.
+/// Labeled by `event`:
+/// - `hit` / `miss`: a transaction batch found / did not find a program it
+///   needs in the cache (a miss loads, verifies and JIT-compiles it on the
+///   handler thread);
+/// - `eviction`: a compiled program was unloaded to make room;
+/// - `reload`: an unloaded (evicted) program was loaded again, i.e. a
+///   recompile caused by eviction;
+/// - `insertion`: a program was loaded or un/re/deployed into a new slot;
+/// - `lost_insertion`: loaded but no longer visible on its own fork;
+/// - `replacement`: an unexpected replacement of a cached entry (should stay 0);
+/// - `one_hit_wonder`: an evicted program had been used only once;
+/// - `prune_stale` / `prune_orphan` / `prune_environment`: entries removed at
+///   rooting (stale tombstones or unloaded entries, orphan forks, or the
+///   previous epoch's runtime environment);
+/// - `empty_entry`: a program address left with no entries was removed.
+pub static PROGRAM_CACHE_EVENTS_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_program_cache_events_total",
+        "Global program cache events (hits, misses, evictions, reloads, prunes)",
+        &["event"],
+    )
+});
+
+/// Compiled (`Loaded`) entries in the global program cache, sampled at the
+/// most recent eviction pass (the cache's `water_level`, taken before that
+/// pass unloads anything). Updated only when a pass ran since the previous
+/// bank creation, so treat it as a sample, not live occupancy. Compare with
+/// `MAX_LOADED_ENTRY_COUNT` (passes shrink to 90% of it).
+pub static PROGRAM_CACHE_LOADED_ENTRIES: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_gauge(
+        "agave_program_cache_loaded_entries",
+        "Compiled entries in the global program cache at its latest eviction pass",
+    )
+});
+
+/// Resident set size of the validator process, in bytes, sampled about every
+/// 64 slots at bank creation (Linux only: `/proc/self/statm` resident pages
+/// times the page size). Added to watch the memory effect of the program
+/// cache capacity.
+pub static PROCESS_RESIDENT_MEMORY_BYTES: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_gauge(
+        "agave_process_resident_memory_bytes",
+        "Resident set size of the validator process, in bytes",
+    )
+});

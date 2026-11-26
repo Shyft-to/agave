@@ -1654,21 +1654,26 @@ impl Bank {
             },
         );
 
-        report_loaded_programs_stats(
-            &parent
+        #[cfg(feature = "dev-context-only-utils")]
+        parent
+            .transaction_processor
+            .global_program_cache
+            .read()
+            .unwrap()
+            .output_entry_stats();
+        // Take the global program cache's statistics and reset them under one write lock (the
+        // parent and `new` share the cache), so bank creations on other threads can neither
+        // report the same counts again nor lose increments made in between, then report them
+        // with the lock released.
+        let program_cache_stats = std::mem::take(
+            &mut parent
                 .transaction_processor
                 .global_program_cache
-                .read()
-                .unwrap(),
-            parent.slot(),
+                .write()
+                .unwrap()
+                .stats,
         );
-
-        new.transaction_processor
-            .global_program_cache
-            .write()
-            .unwrap()
-            .stats
-            .reset();
+        report_loaded_programs_stats(&program_cache_stats, parent.slot());
 
         new
     }
