@@ -17,6 +17,7 @@ use {
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     rayon::{ThreadPool, prelude::*},
     solana_clock::Slot,
+    solana_entry::block_component::ParsedBlockComponent,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
         blockstore::{
@@ -25,7 +26,9 @@ use {
         },
         blockstore_db::{DBPinnableSlice, WriteBatch},
         blockstore_meta::BlockLocation,
-        live_replay_entries::{LiveReplayMessage, LiveReplaySender, PartialDataSetDecoder},
+        live_replay_entries::{
+            LiveReplayMessage, LiveReplaySender, PartialDataSetDecoder, PartialDecoderStop,
+        },
         shred::{self, ReedSolomonCache, Shred, filter::ShredRecoveryContext},
     },
     solana_measure::measure::Measure,
@@ -35,7 +38,7 @@ use {
     solana_streamer::evicting_sender::EvictingSender,
     std::{
         borrow::Cow,
-        collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
         net::UdpSocket,
         ops::Range,
         sync::{
@@ -214,6 +217,9 @@ struct ShredPayloadCache {
     /// Partial data-set replay state per cached slot; `None` when
     /// `AGAVE_PARTIAL_DATA_SET_REPLAY` is off.
     partial: Option<HashMap<Slot, PartialSlotState>>,
+    /// Every completed data set's classification, by (slot, start), in order.
+    #[cfg(test)]
+    classified_for_tests: Vec<(Slot, u32, DataSetClassification)>,
 }
 
 /// Partial data-set replay state of one slot.
@@ -237,6 +243,152 @@ struct PartialDecoder {
     first_sent: Option<Instant>,
 }
 
+/// A data set an insert call completed, as partial replay's metrics need it.
+struct CompletedDataSet {
+    indices: Range<u32>,
+    contents: CompletedContents,
+}
+
+enum CompletedContents {
+    /// Transactions per entry.
+    Entries(Vec<usize>),
+    BlockMarker,
+    /// Could not be decoded from memory (sent as `ReplayFromBlockstore`).
+    NotDecoded,
+}
+
+/// A completed data set's decoder as it was before the completing call.
+#[derive(Clone, Copy)]
+struct DecoderSummary {
+    next_index: u32,
+    entries_returned: usize,
+    stop_reason: Option<PartialDecoderStop>,
+}
+
+impl DecoderSummary {
+    fn of(decoder: &PartialDataSetDecoder) -> Self {
+        Self {
+            next_index: decoder.next_index(),
+            entries_returned: decoder.entries_returned(),
+            stop_reason: decoder.stop_reason(),
+        }
+    }
+}
+
+/// Labels of `agave_partial_data_set_outcome_total` and
+/// `agave_partial_txs_total` for one completed data set.
+#[derive(Debug, PartialEq, Eq)]
+struct DataSetClassification {
+    outcome: &'static str,
+    /// Transactions per class, in first-seen order; classes with none are
+    /// left out.
+    txs: Vec<(&'static str, u64)>,
+}
+
+impl DataSetClassification {
+    fn add_txs(&mut self, class: &'static str, txs: usize) {
+        if txs == 0 {
+            return;
+        }
+        let txs = txs as u64;
+        match self.txs.iter_mut().find(|(seen, _)| *seen == class) {
+            Some((_, total)) => *total = total.saturating_add(txs),
+            None => self.txs.push((class, txs)),
+        }
+    }
+
+    fn record(&self) {
+        solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_OUTCOME_TOTAL
+            .with_label_values(&[self.outcome])
+            .inc();
+        let txs_total = &solana_metrics::pipeline_metrics::PARTIAL_TXS_TOTAL;
+        for (class, txs) in &self.txs {
+            txs_total.with_label_values(&[class]).inc_by(*txs);
+        }
+    }
+}
+
+/// Why partial replay did or didn't send the completed data set `set`'s
+/// transactions early (see `agave_partial_data_set_outcome_total` and
+/// `agave_partial_txs_total` for the labels). `decoder` is its decoder before
+/// the completing call, if it had one; `cached_before(index)` tells whether
+/// the slot's shred `index` was cached before that call. Metrics only; the
+/// counts come from leader data, so nothing here may index by them.
+fn classify_completed_data_set(
+    set: &CompletedDataSet,
+    decoder: Option<DecoderSummary>,
+    cached_before: impl Fn(u32) -> bool,
+) -> DataSetClassification {
+    let tx_counts = match &set.contents {
+        CompletedContents::Entries(tx_counts) => tx_counts,
+        CompletedContents::BlockMarker => {
+            return DataSetClassification {
+                outcome: "marker",
+                txs: vec![],
+            };
+        }
+        CompletedContents::NotDecoded => {
+            return DataSetClassification {
+                outcome: "not_decoded",
+                txs: vec![],
+            };
+        }
+    };
+    let entries_returned = decoder
+        .map_or(0, |decoder| decoder.entries_returned)
+        .min(tx_counts.len());
+    let outcome = if entries_returned > 0 {
+        "early"
+    } else if !set.indices.clone().any(&cached_before) {
+        // Checked before the decoder: one is created for a data set as soon
+        // as the previous one's last shred arrives, with nothing appended.
+        "same_call"
+    } else {
+        match decoder {
+            None => "no_decoder",
+            Some(decoder) => match decoder.stop_reason {
+                Some(PartialDecoderStop::Tick) => "first_entry_tick",
+                Some(PartialDecoderStop::LastEntry) => "single_entry",
+                Some(_) => "stopped",
+                None if (decoder.next_index..set.indices.end).any(&cached_before) => "gap",
+                None => "incomplete_entry",
+            },
+        }
+    };
+    let mut classification = DataSetClassification {
+        outcome,
+        txs: vec![],
+    };
+    if matches!(outcome, "same_call" | "no_decoder") {
+        classification.add_txs(outcome, tx_counts.iter().sum());
+        return classification;
+    }
+    let not_sent = match decoder.and_then(|decoder| decoder.stop_reason) {
+        None | Some(PartialDecoderStop::Tick | PartialDecoderStop::LastEntry) => "not_reached",
+        Some(_) => "stopped",
+    };
+    let first_tick = tx_counts.iter().position(|txs| *txs == 0);
+    let last = tx_counts.len().saturating_sub(1);
+    for (index, txs) in tx_counts.iter().enumerate() {
+        let after_tick = first_tick.is_some_and(|tick| index > tick);
+        let class = if index < entries_returned {
+            "early"
+        } else if index == last {
+            if after_tick {
+                "last_entry_after_tick"
+            } else {
+                "last_entry"
+            }
+        } else if after_tick {
+            "after_tick"
+        } else {
+            not_sent
+        };
+        classification.add_txs(class, *txs);
+    }
+    classification
+}
+
 impl ShredPayloadCache {
     fn new(max_slots: usize, partial_data_set_replay: bool) -> Self {
         Self {
@@ -244,6 +396,8 @@ impl ShredPayloadCache {
             max_slots,
             payloads: HashMap::new(),
             partial: partial_data_set_replay.then(HashMap::new),
+            #[cfg(test)]
+            classified_for_tests: Vec::new(),
         }
     }
 
@@ -279,15 +433,16 @@ impl ShredPayloadCache {
     /// Partial data-set replay for `slot` after an insert call, outside the
     /// blockstore's insert lock: sends the newly decodable leading entries of
     /// the slot's incomplete data sets touched by this call's `accepted`
-    /// indices to replay. `completed` are the start indices of the data sets
-    /// this call completed (and sent whole). `generation` is the slot's
-    /// current `SlotMeta::first_shred_timestamp`.
+    /// indices to replay. `completed` are the data sets this call completed
+    /// (and sent whole, or as `ReplayFromBlockstore`); each is classified for
+    /// the partial replay metrics here. `generation` is the slot's current
+    /// `SlotMeta::first_shred_timestamp`.
     fn send_partial_entries(
         &mut self,
         slot: Slot,
         generation: Option<u64>,
         accepted: &[u32],
-        completed: &[u32],
+        completed: &[CompletedDataSet],
         live_replay_sender: &LiveReplaySender,
     ) {
         let (Some(partial), Some(slot_payloads)) =
@@ -320,15 +475,33 @@ impl ShredPayloadCache {
             return;
         }
 
-        for start in completed {
+        // Shreds of this call, to tell what was cached before it.
+        let accepted_in_call: HashSet<u32> = if completed.is_empty() {
+            HashSet::new()
+        } else {
+            accepted.iter().copied().collect()
+        };
+        for set in completed {
+            let removed = state.decoders.remove(&set.indices.start);
             if let Some(PartialDecoder {
                 first_sent: Some(first_sent),
                 ..
-            }) = state.decoders.remove(start)
+            }) = &removed
             {
                 solana_metrics::pipeline_metrics::PARTIAL_DATA_SET_LEAD_US
                     .observe(first_sent.elapsed().as_micros() as f64);
             }
+            let classification = classify_completed_data_set(
+                set,
+                removed
+                    .as_ref()
+                    .map(|removed| DecoderSummary::of(&removed.decoder)),
+                |index| slot_payloads.contains_key(&index) && !accepted_in_call.contains(&index),
+            );
+            classification.record();
+            #[cfg(test)]
+            self.classified_for_tests
+                .push((slot, set.indices.start, classification));
         }
 
         // Start of the data set each accepted shred belongs to (as far as the
@@ -347,7 +520,7 @@ impl ShredPayloadCache {
             }
         }
         for start in starts {
-            if completed.contains(&start) {
+            if completed.iter().any(|set| set.indices.start == start) {
                 continue;
             }
             let entry = state
@@ -399,6 +572,11 @@ impl ShredPayloadCache {
                 partial_metrics
                     .with_label_values(&["decoder_stopped"])
                     .inc();
+                if let Some(reason) = entry.decoder.stop_reason() {
+                    solana_metrics::pipeline_metrics::PARTIAL_DECODER_STOP_TOTAL
+                        .with_label_values(&[reason.as_label()])
+                        .inc();
+                }
             }
         }
     }
@@ -525,7 +703,7 @@ where
     // blockstore's insert lock.
     let partial_data_set_replay = shred_payload_cache.partial_data_set_replay();
     let mut partial_accepted: BTreeMap<Slot, Vec<u32>> = BTreeMap::new();
-    let mut partial_completed: HashMap<Slot, Vec<u32>> = HashMap::new();
+    let mut partial_completed: HashMap<Slot, Vec<CompletedDataSet>> = HashMap::new();
     let mut before_write = |completed: &[CompletedDataSetInfo],
                             accepted: &[(Slot, u32, shred::Payload)]| {
         for (slot, index, payload) in accepted {
@@ -543,18 +721,35 @@ where
             if info.location != BlockLocation::Original {
                 continue;
             }
-            if partial_data_set_replay {
-                partial_completed
-                    .entry(info.slot)
-                    .or_default()
-                    .push(info.indices.start);
-            }
             let decoded = shred_payload_cache
                 .get_contiguous(info.slot, &info.indices)
                 .and_then(|(payloads, origin)| {
                     Blockstore::decode_completed_data_set_from_payloads(payloads)
                         .map(|component| (component, origin))
                 });
+            if partial_data_set_replay {
+                let contents = match &decoded {
+                    Some((ParsedBlockComponent::EntryBatch(entries), _)) => {
+                        CompletedContents::Entries(
+                            entries
+                                .iter()
+                                .map(|entry| entry.transactions.len())
+                                .collect(),
+                        )
+                    }
+                    Some((ParsedBlockComponent::BlockMarker(_), _)) => {
+                        CompletedContents::BlockMarker
+                    }
+                    None => CompletedContents::NotDecoded,
+                };
+                partial_completed
+                    .entry(info.slot)
+                    .or_default()
+                    .push(CompletedDataSet {
+                        indices: info.indices.clone(),
+                        contents,
+                    });
+            }
             match decoded {
                 Some((component, origin)) => {
                     let _ = live_replay_sender.send(LiveReplayMessage::Entries {
@@ -1261,6 +1456,253 @@ mod test {
             !cache.partial.as_ref().unwrap()[&1]
                 .decoders
                 .contains_key(&0)
+        );
+
+        // Its classification: the early txs are exactly those sent, and the
+        // classes sum to all its txs.
+        let early_txs: usize = partial.iter().map(|entry| entry.transactions.len()).sum();
+        let total_txs: usize = full.iter().map(|entry| entry.transactions.len()).sum();
+        let [(1, 0, classification)] = &cache.classified_for_tests[..] else {
+            panic!("expected one classified data set");
+        };
+        assert_eq!(classification.outcome, "early");
+        assert_eq!(classified_txs(classification, "early"), early_txs as u64);
+        assert_eq!(classified_total(classification), total_txs as u64);
+        // The last entry is the data set's only tick, so the rest wasn't
+        // reached yet.
+        assert_eq!(
+            classified_txs(classification, "not_reached"),
+            (total_txs - early_txs) as u64
+        );
+    }
+
+    fn classified_txs(classification: &DataSetClassification, class: &str) -> u64 {
+        classification
+            .txs
+            .iter()
+            .find(|(seen, _)| *seen == class)
+            .map_or(0, |(_, txs)| *txs)
+    }
+
+    fn classified_total(classification: &DataSetClassification) -> u64 {
+        classification.txs.iter().map(|(_, txs)| txs).sum()
+    }
+
+    #[test]
+    fn test_run_insert_classifies_a_data_set_completed_in_one_call() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let shreds = transfer_data_set_shreds(&Keypair::new());
+        let (live_replay_sender, _live_replay_receiver) = unbounded();
+        let mut cache = ShredPayloadCache::new(4, true);
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &shreds,
+            &mut cache,
+            &live_replay_sender,
+        );
+        assert_eq!(
+            cache.classified_for_tests,
+            vec![(
+                1,
+                0,
+                DataSetClassification {
+                    outcome: "same_call",
+                    txs: vec![("same_call", 36)],
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_run_insert_classifies_a_data_set_whose_first_shred_came_last() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let shreds = transfer_data_set_shreds(&Keypair::new());
+        assert!(shreds.len() > 3);
+        let (live_replay_sender, _live_replay_receiver) = unbounded();
+        let mut cache = ShredPayloadCache::new(4, true);
+        // Everything but the first and last shreds, then those two.
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &shreds[1..shreds.len() - 1],
+            &mut cache,
+            &live_replay_sender,
+        );
+        assert!(cache.classified_for_tests.is_empty());
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &[shreds[0].clone(), shreds.last().unwrap().clone()],
+            &mut cache,
+            &live_replay_sender,
+        );
+        assert_eq!(
+            cache.classified_for_tests,
+            vec![(
+                1,
+                0,
+                DataSetClassification {
+                    outcome: "gap",
+                    txs: vec![("not_reached", 36)],
+                }
+            )]
+        );
+    }
+
+    fn entries_set(tx_counts: &[usize]) -> CompletedDataSet {
+        CompletedDataSet {
+            indices: 10..20,
+            contents: CompletedContents::Entries(tx_counts.to_vec()),
+        }
+    }
+
+    fn summary(
+        next_index: u32,
+        entries_returned: usize,
+        stop_reason: Option<PartialDecoderStop>,
+    ) -> Option<DecoderSummary> {
+        Some(DecoderSummary {
+            next_index,
+            entries_returned,
+            stop_reason,
+        })
+    }
+
+    fn classified(outcome: &'static str, txs: &[(&'static str, u64)]) -> DataSetClassification {
+        DataSetClassification {
+            outcome,
+            txs: txs.to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_classify_completed_data_set_outcomes() {
+        let all_cached = |_| true;
+        let none_cached = |_| false;
+        // Nothing cached before the call wins over a decoder created, with
+        // nothing appended, when the previous data set's last shred arrived.
+        assert_eq!(
+            classify_completed_data_set(&entries_set(&[2, 3]), summary(10, 0, None), none_cached),
+            classified("same_call", &[("same_call", 5)])
+        );
+        assert_eq!(
+            classify_completed_data_set(&entries_set(&[2, 3]), None, all_cached),
+            classified("no_decoder", &[("no_decoder", 5)])
+        );
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[0, 4, 1]),
+                summary(11, 0, Some(PartialDecoderStop::Tick)),
+                all_cached
+            ),
+            classified(
+                "first_entry_tick",
+                &[("after_tick", 4), ("last_entry_after_tick", 1)]
+            )
+        );
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[7]),
+                summary(13, 0, Some(PartialDecoderStop::LastEntry)),
+                all_cached
+            ),
+            classified("single_entry", &[("last_entry", 7)])
+        );
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[2, 3, 0]),
+                summary(12, 0, Some(PartialDecoderStop::Chain)),
+                all_cached
+            ),
+            classified("stopped", &[("stopped", 5)])
+        );
+        // Waiting at shred 12: a gap if a later shred had arrived, else an
+        // incomplete entry.
+        assert_eq!(
+            classify_completed_data_set(&entries_set(&[2, 3, 0]), summary(12, 0, None), |index| {
+                index == 15
+            }),
+            classified("gap", &[("not_reached", 5)])
+        );
+        assert_eq!(
+            classify_completed_data_set(&entries_set(&[2, 3, 0]), summary(12, 0, None), |index| {
+                index < 12
+            }),
+            classified("incomplete_entry", &[("not_reached", 5)])
+        );
+        let marker = CompletedDataSet {
+            indices: 10..11,
+            contents: CompletedContents::BlockMarker,
+        };
+        assert_eq!(
+            classify_completed_data_set(&marker, None, none_cached),
+            classified("marker", &[])
+        );
+        let not_decoded = CompletedDataSet {
+            indices: 10..11,
+            contents: CompletedContents::NotDecoded,
+        };
+        assert_eq!(
+            classify_completed_data_set(&not_decoded, None, all_cached),
+            classified("not_decoded", &[])
+        );
+    }
+
+    #[test]
+    fn test_classify_completed_data_set_tx_classes() {
+        let all_cached = |_| true;
+        // Two entries early, one not reached, a tick, one after it, and the
+        // last entry after the tick.
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[1, 2, 4, 0, 8, 16]),
+                summary(15, 2, None),
+                all_cached
+            ),
+            classified(
+                "early",
+                &[
+                    ("early", 3),
+                    ("not_reached", 4),
+                    ("after_tick", 8),
+                    ("last_entry_after_tick", 16)
+                ]
+            )
+        );
+        // No tick: everything but the last entry was sent.
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[1, 2, 4]),
+                summary(15, 2, Some(PartialDecoderStop::LastEntry)),
+                all_cached
+            ),
+            classified("early", &[("early", 3), ("last_entry", 4)])
+        );
+        // Stopped for another reason after an early chunk.
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[1, 2, 4]),
+                summary(15, 1, Some(PartialDecoderStop::Invalid)),
+                all_cached
+            ),
+            classified("early", &[("early", 1), ("stopped", 2), ("last_entry", 4)])
+        );
+        // A decoder claiming more entries than the data set has can't panic.
+        assert_eq!(
+            classify_completed_data_set(&entries_set(&[1, 2]), summary(15, 9, None), all_cached),
+            classified("early", &[("early", 3)])
+        );
+        // Nor can an empty entry batch.
+        assert_eq!(
+            classify_completed_data_set(&entries_set(&[]), summary(15, 0, None), all_cached),
+            classified("gap", &[])
         );
     }
 

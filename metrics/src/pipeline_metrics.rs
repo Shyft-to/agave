@@ -633,11 +633,105 @@ pub static LIVE_REPLAY_ENTRIES_TOTAL: LazyLock<prometheus::IntCounterVec> = Lazy
 ///   completed data set did not start with exactly the entries that ran
 ///   early; the slot is marked dead -- must stay 0), and `tick_deferred` (a
 ///   chunk held a tick; the rest of that data set replays whole).
+///
+/// `decoder_stopped` is split by reason in `PARTIAL_DECODER_STOP_TOTAL`.
 pub static PARTIAL_DATA_SET_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     crate::prometheus_metrics::register_int_counter_vec(
         "agave_partial_data_set_total",
         "Partial data-set replay events",
         &["event"],
+    )
+});
+
+/// Partial data-set replay: why a data set's decoder stopped, counted once per
+/// decoder where `PARTIAL_DATA_SET_TOTAL{event="decoder_stopped"}` is (so the
+/// reasons sum to it). Labeled by `reason`:
+/// - `last_entry`: everything but the data set's last entry was parsed (the
+///   normal finish; also single-entry data sets);
+/// - `tick`: a tick (nothing from it on is sent early);
+/// - `marker`: a block-marker data set spanning more than one shred (a
+///   one-shred marker never reaches the decoder);
+/// - `chain`: a shred of another version (merkle root mismatch within an FEC
+///   set, or an FEC set not chaining to the previous root);
+/// - `shred`: not the run's next data shred (wrong index, coding shred or
+///   unparseable shred variant, the data set's last shred). window_service
+///   only ever hands the decoder the
+///   cached shred at its next index and stops before a data set's last
+///   shred, so this should read ~0 in production;
+/// - `invalid`: unparseable shred fields (a missing chained merkle root counts
+///   here, not as `chain`), shred data, data-set header or entry header;
+/// - `overflow`: too much data without a complete transaction (only reachable
+///   on invalid data).
+pub static PARTIAL_DECODER_STOP_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_partial_decoder_stop_total",
+        "Partial data-set replay decoders stopped, by reason",
+        &["reason"],
+    )
+});
+
+/// Partial data-set replay: one per completed data set (live-replay path),
+/// labeled by `outcome`, checked in this order:
+/// - `not_decoded`: the completed data set could not be decoded from memory
+///   (the `ReplayFromBlockstore` fallback), whether or not early chunks were
+///   sent for it (its transactions are unknown, so none are counted);
+/// - `marker`: a block marker (never early);
+/// - `early`: at least one early chunk was sent for it;
+///
+/// otherwise why none was:
+/// - `same_call`: none of its shreds was cached before the insert call that
+///   completed it;
+/// - `no_decoder`: some were, but it had no decoder (the previous data set's
+///   last shred was not cached yet, so its start was unknown);
+/// - `first_entry_tick` / `single_entry`: its decoder stopped at a tick at
+///   entry 0, or the data set has only one entry;
+/// - `stopped`: its decoder stopped for another reason (see
+///   `PARTIAL_DECODER_STOP_TOTAL`);
+/// - `gap`: its decoder was waiting for a missing shred while a later shred of
+///   the data set was already cached;
+/// - `incomplete_entry`: every cached shred was appended but the first entry
+///   was still incomplete.
+///
+/// Not counted: data sets of slots whose partial state is off (cleared and
+/// received again), whose blockstore meta was missing, or whose cached
+/// payloads were evicted. For coverage, compare the sum without
+/// `outcome="not_decoded"` with `agave_data_set_completions_total` (which
+/// doesn't count `ReplayFromBlockstore` data sets).
+pub static PARTIAL_DATA_SET_OUTCOME_TOTAL: LazyLock<prometheus::IntCounterVec> =
+    LazyLock::new(|| {
+        crate::prometheus_metrics::register_int_counter_vec(
+            "agave_partial_data_set_outcome_total",
+            "Completed data sets by whether an early chunk was sent for them, or why not",
+            &["outcome"],
+        )
+    });
+
+/// Partial data-set replay: transactions of each completed data set counted
+/// in `PARTIAL_DATA_SET_OUTCOME_TOTAL` (none for `marker`/`not_decoded`),
+/// labeled by `class`; for a data set the classes sum to its transactions:
+/// - `early`: in an entry sent early (not necessarily replayed early: a chunk
+///   can still be dropped as stale; ~99% are replayed);
+/// - `same_call` / `no_decoder`: the data set's outcome, for all its txs;
+/// - `last_entry`: the data set's last entry (never sent early), no tick
+///   before it;
+/// - `after_tick`: after the data set's first tick, not the last entry;
+/// - `last_entry_after_tick`: the last entry, after a tick (blocked by both
+///   rules);
+/// - `stopped`: before any tick, not reached because the decoder stopped for
+///   another reason (chain/shred/invalid/overflow, or marker when the decoder
+///   read a marker header but the completed data set decoded as entries);
+/// - `not_reached`: before any tick, not the last entry, and the decoder was
+///   still waiting (a missing shred or an incomplete entry).
+///
+/// `last_entry`, `after_tick` and `last_entry_after_tick` are by position
+/// only: the decoder never parses past a tick or into the last entry, so it is
+/// unknown whether those bytes had arrived before the completing call. They
+/// are upper bounds on what relaxing that rule could send early.
+pub static PARTIAL_TXS_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    crate::prometheus_metrics::register_int_counter_vec(
+        "agave_partial_txs_total",
+        "Transactions of completed data sets by whether partial replay sent them early, or why not",
+        &["class"],
     )
 });
 
@@ -717,3 +811,24 @@ pub static PROCESS_RESIDENT_MEMORY_BYTES: LazyLock<prometheus::Gauge> = LazyLock
         "Resident set size of the validator process, in bytes",
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registering a duplicate name or using the wrong label count panics; do
+    /// it here rather than on first use in the validator.
+    #[test]
+    fn pipeline_metrics_partial_replay_statics_register() {
+        PARTIAL_DATA_SET_TOTAL.with_label_values(&["chunk_sent"]);
+        PARTIAL_DATA_SET_LEAD_US.observe(0.0);
+        PARTIAL_DATA_SET_REPLAY_ENABLED.get();
+        PARTIAL_DECODER_STOP_TOTAL
+            .with_label_values(&["last_entry"])
+            .inc();
+        PARTIAL_DATA_SET_OUTCOME_TOTAL
+            .with_label_values(&["early"])
+            .inc();
+        PARTIAL_TXS_TOTAL.with_label_values(&["early"]).inc();
+    }
+}

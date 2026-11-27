@@ -322,6 +322,45 @@ const MAX_PREALLOCATED_TXS: usize = 64;
 const ENTRY_COUNT_SIZE: usize = size_of::<u64>();
 const ENTRY_HEADER_SIZE: usize = 2 * size_of::<u64>() + size_of::<Hash>();
 
+/// Why a [`PartialDataSetDecoder`] stopped (metrics only; stopping works the
+/// same whatever the reason).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartialDecoderStop {
+    /// Everything but the data set's last entry was parsed (the normal
+    /// finish; also a data set of a single entry).
+    LastEntry,
+    /// A tick: neither it nor anything after it is returned.
+    Tick,
+    /// The data set is a block marker.
+    Marker,
+    /// A shred of another version of the block: a different merkle root within
+    /// an FEC set, or an FEC set that doesn't chain to the previous one.
+    Chain,
+    /// A shred that isn't the run's next data shred: wrong index, a coding
+    /// shred (or any shred whose flags don't parse), or the data set's last
+    /// (`DATA_COMPLETE_SHRED`) shred.
+    Shred,
+    /// Unparseable shred fields (including a missing chained merkle root),
+    /// shred data, data-set header or entry header.
+    Invalid,
+    /// More than `MAX_UNPARSED_BYTES` without a complete transaction.
+    Overflow,
+}
+
+impl PartialDecoderStop {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::LastEntry => "last_entry",
+            Self::Tick => "tick",
+            Self::Marker => "marker",
+            Self::Chain => "chain",
+            Self::Shred => "shred",
+            Self::Invalid => "invalid",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
 /// Decodes the leading entries of a data set from its shreds as they arrive,
 /// in index order from the data set's first shred, for partial data-set
 /// replay.
@@ -357,7 +396,8 @@ pub struct PartialDataSetDecoder {
     /// Data was appended since the last parse; parsing again without new
     /// data could not make progress.
     appended_since_parse: bool,
-    stopped: bool,
+    /// Set once the decoder stops for good.
+    stop_reason: Option<PartialDecoderStop>,
 }
 
 impl PartialDataSetDecoder {
@@ -372,7 +412,7 @@ impl PartialDataSetDecoder {
             ready: Vec::new(),
             entries_returned: 0,
             appended_since_parse: false,
-            stopped: false,
+            stop_reason: None,
         }
     }
 
@@ -383,18 +423,32 @@ impl PartialDataSetDecoder {
 
     /// Whether this decoder will return no more entries.
     pub fn is_stopped(&self) -> bool {
-        self.stopped
+        self.stop_reason.is_some()
+    }
+
+    /// Why this decoder stopped, if it did.
+    pub fn stop_reason(&self) -> Option<PartialDecoderStop> {
+        self.stop_reason
+    }
+
+    /// Entries returned by `take_new_entries` so far: the data set's leading
+    /// entries `0..entries_returned()`.
+    pub fn entries_returned(&self) -> usize {
+        self.entries_returned
     }
 
     /// Appends the data of shred `next_index()`. Returns false, and stops the
     /// decoder, if `payload` doesn't continue the run (see the type docs).
     pub fn append(&mut self, payload: &[u8]) -> bool {
-        if self.stopped {
+        if self.is_stopped() {
             return false;
         }
-        let Some((fec_set_index, merkle_root, data)) = self.checked_data(payload) else {
-            self.stop();
-            return false;
+        let (fec_set_index, merkle_root, data) = match self.checked_data(payload) {
+            Ok(checked) => checked,
+            Err(reason) => {
+                self.stop(reason);
+                return false;
+            }
         };
         self.unparsed.extend_from_slice(data);
         self.appended_since_parse = true;
@@ -416,23 +470,27 @@ impl PartialDataSetDecoder {
         Some((first_entry, entries))
     }
 
-    fn stop(&mut self) {
-        self.stopped = true;
+    fn stop(&mut self, reason: PartialDecoderStop) {
+        self.stop_reason = Some(reason);
         self.unparsed = Vec::new();
         self.current = None;
     }
 
-    fn checked_data<'a>(&self, payload: &'a [u8]) -> Option<(u32, Hash, &'a [u8])> {
-        if wire::get_index(payload)? != self.next_index {
-            return None;
+    fn checked_data<'a>(
+        &self,
+        payload: &'a [u8],
+    ) -> Result<(u32, Hash, &'a [u8]), PartialDecoderStop> {
+        use PartialDecoderStop::{Chain, Invalid, Shred};
+        if wire::get_index(payload).ok_or(Invalid)? != self.next_index {
+            return Err(Shred);
         }
         // Errs for coding shreds.
-        let flags = wire::get_flags(payload).ok()?;
+        let flags = wire::get_flags(payload).map_err(|_| Shred)?;
         if flags.contains(ShredFlags::DATA_COMPLETE_SHRED) {
-            return None;
+            return Err(Shred);
         }
-        let fec_set_index = wire::get_fec_set_index(payload)?;
-        let merkle_root = wire::get_merkle_root(payload)?;
+        let fec_set_index = wire::get_fec_set_index(payload).ok_or(Invalid)?;
+        let merkle_root = wire::get_merkle_root(payload).ok_or(Invalid)?;
         if let Some((last_fec_set_index, last_merkle_root)) = self.last_merkle_root {
             let continues = if last_fec_set_index == fec_set_index {
                 // Same FEC set: same merkle root.
@@ -440,18 +498,18 @@ impl PartialDataSetDecoder {
             } else {
                 // Next FEC set: starts here and chains to the previous root.
                 fec_set_index == self.next_index
-                    && wire::get_chained_merkle_root(payload)? == last_merkle_root
+                    && wire::get_chained_merkle_root(payload).ok_or(Invalid)? == last_merkle_root
             };
             if !continues {
-                return None;
+                return Err(Chain);
             }
         }
-        let data = wire::get_data(payload).ok()?;
-        Some((fec_set_index, merkle_root, data))
+        let data = wire::get_data(payload).map_err(|_| Invalid)?;
+        Ok((fec_set_index, merkle_root, data))
     }
 
     fn parse_available(&mut self) {
-        if self.stopped || !mem::take(&mut self.appended_since_parse) {
+        if self.is_stopped() || !mem::take(&mut self.appended_since_parse) {
             return;
         }
         // Views keep slices of this copy alive; only the not yet consumed
@@ -474,8 +532,12 @@ impl PartialDataSetDecoder {
                         entry_count
                     }
                     // Block markers are never replayed early.
-                    Ok(ComponentHeader::BlockMarker) | Err(_) => {
-                        self.stop();
+                    Ok(ComponentHeader::BlockMarker) => {
+                        self.stop(PartialDecoderStop::Marker);
+                        return;
+                    }
+                    Err(_) => {
+                        self.stop(PartialDecoderStop::Invalid);
                         return;
                     }
                 }
@@ -490,7 +552,7 @@ impl PartialDataSetDecoder {
                     Ok((header, transactions_offset)) => {
                         if header.tx_count == 0 {
                             // A tick: never replayed early, nor anything after it.
-                            self.stop();
+                            self.stop(PartialDecoderStop::Tick);
                             return;
                         }
                         offset = transactions_offset;
@@ -504,7 +566,7 @@ impl PartialDataSetDecoder {
                     Err(_) => {
                         if bytes.len().saturating_sub(offset) >= ENTRY_HEADER_SIZE {
                             // A complete but invalid header.
-                            self.stop();
+                            self.stop(PartialDecoderStop::Invalid);
                             return;
                         }
                         break 'entries;
@@ -536,12 +598,12 @@ impl PartialDataSetDecoder {
             }
         }
         if self.entries_parsed.saturating_add(1) >= entry_count {
-            self.stop();
+            self.stop(PartialDecoderStop::LastEntry);
             return;
         }
         self.unparsed.drain(..offset);
         if self.unparsed.len() > MAX_UNPARSED_BYTES {
-            self.stop();
+            self.stop(PartialDecoderStop::Overflow);
         }
     }
 }
@@ -917,10 +979,17 @@ mod tests {
                 assert_eq!(first_entry, decoded.len());
                 decoded.extend(entry_bytes(&chunk));
             }
+            assert_eq!(decoder.entries_returned(), decoded.len());
         }
         // The completed data set's last shred is never part of a partial run.
         assert!(!decoder.append(payloads.last().unwrap()));
         assert!(decoder.is_stopped());
+        // Whichever came first: everything but the last entry (here the
+        // tick) was parsed, or the run hit the data set's last shred.
+        assert!(matches!(
+            decoder.stop_reason(),
+            Some(PartialDecoderStop::LastEntry | PartialDecoderStop::Shred)
+        ));
 
         assert!(!decoded.is_empty());
         // Never the data set's last entry (here also its only tick).
@@ -946,6 +1015,37 @@ mod tests {
         }
         assert!(decoded.len() <= 1);
         assert!(decoder.is_stopped());
+        assert_eq!(decoder.stop_reason(), Some(PartialDecoderStop::Tick));
+        assert_eq!(decoder.entries_returned(), decoded.len());
+    }
+
+    /// Feeds every data shred but the last; returns the decoder.
+    fn decoder_after_all_but_last_shred(entries: &[Entry]) -> PartialDataSetDecoder {
+        let shreds = data_shreds(entries, &Keypair::new());
+        let mut decoder = PartialDataSetDecoder::new(0);
+        for shred in &shreds[..shreds.len() - 1] {
+            decoder.append(shred.payload());
+            decoder.take_new_entries();
+        }
+        decoder
+    }
+
+    #[test]
+    fn decoder_stop_reason_for_a_first_tick_or_a_single_entry() {
+        // A tick first: nothing returned.
+        let mut entries = test_entries(3, 10);
+        let tick = entries.pop().unwrap();
+        entries.insert(0, tick);
+        let decoder = decoder_after_all_but_last_shred(&entries);
+        assert_eq!(decoder.stop_reason(), Some(PartialDecoderStop::Tick));
+        assert_eq!(decoder.entries_returned(), 0);
+
+        // A single entry (spanning several shreds) is the data set's last.
+        let mut entries = test_entries(1, 40);
+        entries.pop();
+        let decoder = decoder_after_all_but_last_shred(&entries);
+        assert_eq!(decoder.stop_reason(), Some(PartialDecoderStop::LastEntry));
+        assert_eq!(decoder.entries_returned(), 0);
     }
 
     #[test]
@@ -958,6 +1058,7 @@ mod tests {
         // Same index and content but a different leader signature/merkle root.
         assert!(!decoder.append(version_b[1].payload()));
         assert!(decoder.is_stopped());
+        assert_eq!(decoder.stop_reason(), Some(PartialDecoderStop::Chain));
         assert!(decoder.take_new_entries().is_none());
     }
 
@@ -969,6 +1070,7 @@ mod tests {
         let mut decoder = PartialDataSetDecoder::new(0);
         assert!(!decoder.append(shreds[1].payload()));
         assert!(decoder.is_stopped());
+        assert_eq!(decoder.stop_reason(), Some(PartialDecoderStop::Shred));
 
         let coding = Shredder::new(1, 0, 0, 0)
             .unwrap()
@@ -987,5 +1089,6 @@ mod tests {
             .unwrap();
         let mut decoder = PartialDataSetDecoder::new(coding.index());
         assert!(!decoder.append(coding.payload()));
+        assert_eq!(decoder.stop_reason(), Some(PartialDecoderStop::Shred));
     }
 }
