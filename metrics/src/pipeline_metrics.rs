@@ -720,13 +720,25 @@ pub static PARTIAL_DATA_SET_OUTCOME_TOTAL: LazyLock<prometheus::IntCounterVec> =
 /// - `stopped`: before any tick, not reached because the decoder stopped for
 ///   another reason (chain/shred/invalid/overflow, or marker when the decoder
 ///   read a marker header but the completed data set decoded as entries);
-/// - `not_reached`: before any tick, not the last entry, and the decoder was
-///   still waiting (a missing shred or an incomplete entry).
+/// - `not_reached_gap`: before any tick, not the last entry, and the decoder was
+///   still waiting at a missing shred while a later shred of the data set had
+///   already arrived (out-of-order arrival, or a shred rebuilt by erasure
+///   recovery only in the completing call);
+/// - `not_reached_incomplete_entry`: likewise, but every shred that had
+///   arrived was appended; the rest of the data set arrived in the completing
+///   call;
+/// - `not_reached`: fallback for an unsent entry before the first tick when
+///   the decoder stopped at a tick or the last entry (only on inconsistent
+///   data; should stay 0).
 ///
 /// `last_entry`, `after_tick` and `last_entry_after_tick` are by position
 /// only: the decoder never parses past a tick or into the last entry, so it is
 /// unknown whether those bytes had arrived before the completing call. They
 /// are upper bounds on what relaxing that rule could send early.
+/// `not_reached_incomplete_entry` is likewise an upper bound for sending
+/// partially received entries: it also covers whole entries whose shreds all
+/// arrived in the completing call, and entries reaching into the data set's
+/// last shred, which the decoder never appends.
 pub static PARTIAL_TXS_TOTAL: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     crate::prometheus_metrics::register_int_counter_vec(
         "agave_partial_txs_total",

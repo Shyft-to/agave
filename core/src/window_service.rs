@@ -337,6 +337,16 @@ fn classify_completed_data_set(
     let entries_returned = decoder
         .map_or(0, |decoder| decoder.entries_returned)
         .min(tx_counts.len());
+    // For a decoder still waiting (no stop reason): whether a shred of the data
+    // set past the one it waits for had already arrived (a gap), as opposed to
+    // every cached shred being appended (the rest arrived in the completing
+    // call).
+    let waiting_on_gap = decoder.and_then(|decoder| {
+        decoder
+            .stop_reason
+            .is_none()
+            .then(|| (decoder.next_index..set.indices.end).any(&cached_before))
+    });
     let outcome = if entries_returned > 0 {
         "early"
     } else if !set.indices.clone().any(&cached_before) {
@@ -350,7 +360,7 @@ fn classify_completed_data_set(
                 Some(PartialDecoderStop::Tick) => "first_entry_tick",
                 Some(PartialDecoderStop::LastEntry) => "single_entry",
                 Some(_) => "stopped",
-                None if (decoder.next_index..set.indices.end).any(&cached_before) => "gap",
+                None if waiting_on_gap == Some(true) => "gap",
                 None => "incomplete_entry",
             },
         }
@@ -363,9 +373,15 @@ fn classify_completed_data_set(
         classification.add_txs(outcome, tx_counts.iter().sum());
         return classification;
     }
-    let not_sent = match decoder.and_then(|decoder| decoder.stop_reason) {
-        None | Some(PartialDecoderStop::Tick | PartialDecoderStop::LastEntry) => "not_reached",
-        Some(_) => "stopped",
+    let not_sent = match (
+        decoder.and_then(|decoder| decoder.stop_reason),
+        waiting_on_gap,
+    ) {
+        (None, Some(true)) => "not_reached_gap",
+        (None, _) => "not_reached_incomplete_entry",
+        // Leaves no unsent entry before a tick except on inconsistent data.
+        (Some(PartialDecoderStop::Tick | PartialDecoderStop::LastEntry), _) => "not_reached",
+        (Some(_), _) => "stopped",
     };
     let first_tick = tx_counts.iter().position(|txs| *txs == 0);
     let last = tx_counts.len().saturating_sub(1);
@@ -1468,12 +1484,71 @@ mod test {
         assert_eq!(classification.outcome, "early");
         assert_eq!(classified_txs(classification, "early"), early_txs as u64);
         assert_eq!(classified_total(classification), total_txs as u64);
-        // The last entry is the data set's only tick, so the rest wasn't
-        // reached yet.
+        // The last entry is the data set's only tick, and the shreds arrived
+        // in order, so the rest was waiting on an incomplete entry.
         assert_eq!(
-            classified_txs(classification, "not_reached"),
+            classified_txs(classification, "not_reached_incomplete_entry"),
             (total_txs - early_txs) as u64
         );
+        assert!(
+            classification
+                .txs
+                .iter()
+                .all(|(class, _)| ["early", "not_reached_incomplete_entry"].contains(class))
+        );
+    }
+
+    #[test]
+    fn test_run_insert_classifies_an_early_data_set_waiting_on_a_gap() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let shreds = transfer_data_set_shreds(&Keypair::new());
+        assert!(shreds.len() >= 6);
+        let missing = 3;
+        let (live_replay_sender, _live_replay_receiver) = unbounded();
+        let mut cache = ShredPayloadCache::new(4, true);
+        // The first shreds in order, one call each (so leading entries are
+        // sent early), then everything after a missing shred but the last.
+        for shred in &shreds[..missing] {
+            run_insert_for_tests(
+                &blockstore,
+                &bank_forks,
+                std::slice::from_ref(shred),
+                &mut cache,
+                &live_replay_sender,
+            );
+        }
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &shreds[missing + 1..shreds.len() - 1],
+            &mut cache,
+            &live_replay_sender,
+        );
+        assert!(cache.classified_for_tests.is_empty());
+        // The missing shred and the last one complete the data set.
+        run_insert_for_tests(
+            &blockstore,
+            &bank_forks,
+            &[shreds[missing].clone(), shreds.last().unwrap().clone()],
+            &mut cache,
+            &live_replay_sender,
+        );
+        let [(1, 0, classification)] = &cache.classified_for_tests[..] else {
+            panic!("expected one classified data set");
+        };
+        assert_eq!(classification.outcome, "early");
+        assert!(classified_txs(classification, "early") > 0);
+        assert!(classified_txs(classification, "not_reached_gap") > 0);
+        assert!(
+            classification
+                .txs
+                .iter()
+                .all(|(class, _)| ["early", "not_reached_gap"].contains(class))
+        );
+        assert_eq!(classified_total(classification), 36);
     }
 
     fn classified_txs(classification: &DataSetClassification, class: &str) -> u64 {
@@ -1550,7 +1625,7 @@ mod test {
                 0,
                 DataSetClassification {
                     outcome: "gap",
-                    txs: vec![("not_reached", 36)],
+                    txs: vec![("not_reached_gap", 36)],
                 }
             )]
         );
@@ -1629,13 +1704,13 @@ mod test {
             classify_completed_data_set(&entries_set(&[2, 3, 0]), summary(12, 0, None), |index| {
                 index == 15
             }),
-            classified("gap", &[("not_reached", 5)])
+            classified("gap", &[("not_reached_gap", 5)])
         );
         assert_eq!(
             classify_completed_data_set(&entries_set(&[2, 3, 0]), summary(12, 0, None), |index| {
                 index < 12
             }),
-            classified("incomplete_entry", &[("not_reached", 5)])
+            classified("incomplete_entry", &[("not_reached_incomplete_entry", 5)])
         );
         let marker = CompletedDataSet {
             indices: 10..11,
@@ -1658,8 +1733,8 @@ mod test {
     #[test]
     fn test_classify_completed_data_set_tx_classes() {
         let all_cached = |_| true;
-        // Two entries early, one not reached, a tick, one after it, and the
-        // last entry after the tick.
+        // Two entries early, one not reached (a later shred had arrived: a
+        // gap), a tick, one after it, and the last entry after the tick.
         assert_eq!(
             classify_completed_data_set(
                 &entries_set(&[1, 2, 4, 0, 8, 16]),
@@ -1670,9 +1745,43 @@ mod test {
                 "early",
                 &[
                     ("early", 3),
-                    ("not_reached", 4),
+                    ("not_reached_gap", 4),
                     ("after_tick", 8),
                     ("last_entry_after_tick", 16)
+                ]
+            )
+        );
+        // The same with nothing cached past the shred the decoder waits for.
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[1, 2, 4, 0, 8, 16]),
+                summary(15, 2, None),
+                |index| index < 15
+            ),
+            classified(
+                "early",
+                &[
+                    ("early", 3),
+                    ("not_reached_incomplete_entry", 4),
+                    ("after_tick", 8),
+                    ("last_entry_after_tick", 16)
+                ]
+            )
+        );
+        // Inconsistent data: stopped at a tick, yet an unsent entry before the
+        // data set's first tick. Counted as the not_reached fallback.
+        assert_eq!(
+            classify_completed_data_set(
+                &entries_set(&[1, 2, 0, 4]),
+                summary(15, 1, Some(PartialDecoderStop::Tick)),
+                all_cached
+            ),
+            classified(
+                "early",
+                &[
+                    ("early", 1),
+                    ("not_reached", 2),
+                    ("last_entry_after_tick", 4)
                 ]
             )
         );
